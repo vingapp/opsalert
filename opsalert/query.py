@@ -8,7 +8,7 @@ Next-fix: Highest-priority group with aggregated debugging data
 import json
 from typing import TYPE_CHECKING
 
-from sqlalchemy import select, func, desc, case, delete, and_
+from sqlalchemy import select, func, desc, case, delete
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -43,33 +43,18 @@ async def query_categories(
 ) -> list[dict]:
     """Level 1: GROUP BY category, returns summary per category.
 
-    Performance fix: uses ROW_NUMBER() window function CTE instead of
-    correlated subquery for latest_message. Single pass over the data.
+    The previous implementation used a ROW_NUMBER() OVER (PARTITION BY
+    category) window function CTE that MySQL materialised over the entire
+    ``opsalert`` table; on a busy instance that overflowed the server's
+    tmpdir ("table '#sql...' is full"). The aggregation CTE is bounded by
+    the number of categories (small), and the latest message per category
+    comes from a correlated scalar subquery that rides the
+    ``(category, created)`` index — O(K log N) instead of an O(N) sort+spill.
 
     Returns list of dicts with: category, severity (worst), source, count,
     latest_message, latest_created.
     """
-    # CTE: rank alerts within each category by recency
-    ranked = (
-        select(
-            Alert.category,
-            Alert.message,
-            Alert.created,
-            func.row_number()
-            .over(partition_by=Alert.category, order_by=Alert.created.desc())
-            .label("rn"),
-        )
-    )
-    if severity:
-        ranked = ranked.where(Alert.severity == severity)
-    if source:
-        ranked = ranked.where(Alert.source == source)
-    if search:
-        ranked = ranked.where(Alert.message.ilike(f"%{search}%"))
-
-    ranked_cte = ranked.cte("ranked")
-
-    # Main aggregation query
+    # Aggregation: one row per category. Filters apply here.
     agg_query = select(
         Alert.category,
         func.max(_SEVERITY_RANK).label("severity_rank"),
@@ -87,22 +72,30 @@ async def query_categories(
 
     agg_cte = agg_query.cte("agg")
 
-    # Join: get latest_message from ranked CTE where rn=1
+    # Latest message per category — correlated scalar subquery. Filters
+    # are mirrored so the message reflects what passed the filter set.
+    latest_msg_subq = (
+        select(Alert.message)
+        .where(Alert.category == agg_cte.c.category)
+    )
+    if severity:
+        latest_msg_subq = latest_msg_subq.where(Alert.severity == severity)
+    if source:
+        latest_msg_subq = latest_msg_subq.where(Alert.source == source)
+    if search:
+        latest_msg_subq = latest_msg_subq.where(Alert.message.ilike(f"%{search}%"))
+    latest_msg_subq = (
+        latest_msg_subq.order_by(Alert.created.desc()).limit(1).scalar_subquery()
+    )
+
     final = (
         select(
             agg_cte.c.category,
             agg_cte.c.severity_rank,
             agg_cte.c.source,
             agg_cte.c.count,
-            ranked_cte.c.message.label("latest_message"),
+            latest_msg_subq.label("latest_message"),
             agg_cte.c.latest_created,
-        )
-        .join(
-            ranked_cte,
-            and_(
-                agg_cte.c.category == ranked_cte.c.category,
-                ranked_cte.c.rn == 1,
-            ),
         )
         .order_by(desc(agg_cte.c.latest_created))
     )
