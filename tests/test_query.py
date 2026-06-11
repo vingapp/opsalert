@@ -1,13 +1,10 @@
 """Tests for query API — dashboard selectors, next-fix, aggregates, delete."""
-import json
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
-import pytest
 from sqlalchemy import select
 
 from opsalert.model import Alert
 from opsalert.store import fire_alert
-from opsalert.types import AlertSeverity
 from opsalert.query import (
     query_categories,
     query_messages,
@@ -140,8 +137,9 @@ class TestQueryMessages:
             {"severity": "error", "category": "sendgrid", "message": "429"},
         ])
 
-        msgs = await query_messages(session, category="sendgrid")
+        msgs, total = await query_messages(session, category="sendgrid")
         assert len(msgs) == 2
+        assert total == 2
 
         by_msg = {m["message"]: m for m in msgs}
         assert by_msg["500"]["count"] == 2
@@ -154,8 +152,9 @@ class TestQueryMessages:
             {"severity": "error", "category": "cat", "message": "b"},
         ])
 
-        msgs = await query_messages(session, category="cat", severity="error")
+        msgs, total = await query_messages(session, category="cat", severity="error")
         assert len(msgs) == 1
+        assert total == 1
         assert msgs[0]["message"] == "b"
 
     async def test_other_categories_excluded(self, session):
@@ -165,9 +164,31 @@ class TestQueryMessages:
             {"severity": "warn", "category": "cat_b", "message": "b"},
         ])
 
-        msgs = await query_messages(session, category="cat_a")
+        msgs, total = await query_messages(session, category="cat_a")
         assert len(msgs) == 1
+        assert total == 1
         assert msgs[0]["message"] == "a"
+
+    async def test_pagination_bounds_groups(self, session):
+        """limit/offset paginate the message groups; total is the full count.
+
+        Regression for #orphan-flood: a category whose messages embed unique
+        ids produced one group per occurrence, and an unbounded GROUP BY
+        returned tens of thousands of rows. Pagination must bound the page
+        while still reporting the true distinct-message total.
+        """
+        await _seed_alerts(session, [
+            {"severity": "warn", "category": "flood", "message": f"task-{i}"}
+            for i in range(25)
+        ])
+
+        page, total = await query_messages(session, category="flood", limit=10, offset=0)
+        assert len(page) == 10
+        assert total == 25
+
+        page2, total2 = await query_messages(session, category="flood", limit=10, offset=20)
+        assert len(page2) == 5
+        assert total2 == 25
 
 
 # ---------------------------------------------------------------------------

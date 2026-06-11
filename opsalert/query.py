@@ -120,29 +120,49 @@ async def query_messages(
     category: str,
     severity: str | None = None,
     search: str | None = None,
-) -> list[dict]:
+    limit: int = 100,
+    offset: int = 0,
+) -> tuple[list[dict], int]:
     """Level 2: GROUP BY message within a category.
 
-    Returns list of dicts with: message, count, latest_created.
+    Returns (items, total_groups). Items are dicts with: message, count,
+    latest_created — paginated by ``limit``/``offset``. ``total_groups`` is
+    the number of distinct messages matching the filters (the full,
+    unpaginated group count).
+
+    Pagination is mandatory here: a category whose messages embed unique
+    identifiers (e.g. task ids) produces one group per occurrence, so an
+    unbounded GROUP BY can return tens of thousands of rows and stall the
+    endpoint. See the #orphan-flood incident.
     """
+    base_filters = [Alert.category == category]
+    if severity:
+        base_filters.append(Alert.severity == severity)
+    if search:
+        base_filters.append(Alert.message.ilike(f"%{search}%"))
+
+    # Total number of distinct messages (groups) matching the filters.
+    count_query = select(func.count(func.distinct(Alert.message)))
+    for f in base_filters:
+        count_query = count_query.where(f)
+    total = (await session.execute(count_query)).scalar() or 0
+
+    query = select(
+        Alert.message,
+        func.count(Alert.id).label("count"),
+        func.max(Alert.created).label("latest_created"),
+    )
+    for f in base_filters:
+        query = query.where(f)
     query = (
-        select(
-            Alert.message,
-            func.count(Alert.id).label("count"),
-            func.max(Alert.created).label("latest_created"),
-        )
-        .where(Alert.category == category)
-        .group_by(Alert.message)
+        query.group_by(Alert.message)
         .order_by(desc("latest_created"))
+        .offset(offset)
+        .limit(limit)
     )
 
-    if severity:
-        query = query.where(Alert.severity == severity)
-    if search:
-        query = query.where(Alert.message.ilike(f"%{search}%"))
-
     result = await session.execute(query)
-    return [
+    items = [
         {
             "message": row.message,
             "count": row.count,
@@ -150,6 +170,7 @@ async def query_messages(
         }
         for row in result.all()
     ]
+    return items, total
 
 
 async def query_occurrences(
