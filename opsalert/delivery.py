@@ -11,14 +11,13 @@ This module provides plain async functions — no scheduler dependency.
 The host app wraps these in whatever scheduler it uses.
 """
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import select, update, func, case, and_
-from sqlalchemy.orm import aliased
+from sqlalchemy import and_, case, func, select, update
 
-from opsalert._config import get_config, _resolve_setting
+from opsalert._config import _resolve_setting, get_config
 from opsalert.model import Alert
-from opsalert.types import AlertSeverity, AlertMessage, IMMEDIATE_SEVERITIES, DIGEST_SEVERITIES
+from opsalert.types import DIGEST_SEVERITIES, IMMEDIATE_SEVERITIES, AlertMessage, AlertSeverity
 
 logger = logging.getLogger(__name__)
 
@@ -92,7 +91,7 @@ async def _deliver_immediate(
         return stats
 
     immediate_severities = [s.value for s in IMMEDIATE_SEVERITIES]
-    throttle_cutoff = datetime.now(timezone.utc) - timedelta(minutes=throttle_minutes)
+    throttle_cutoff = datetime.now(UTC) - timedelta(minutes=throttle_minutes)
 
     # Subquery: latest notified alert per category (for throttle check)
     last_notified = (
@@ -100,7 +99,7 @@ async def _deliver_immediate(
             Alert.category.label("cat"),
             func.max(Alert.created).label("last_notified_at"),
         )
-        .where(Alert.notified == True, Alert.severity.in_(immediate_severities))
+        .where(Alert.notified.is_(True), Alert.severity.in_(immediate_severities))
         .group_by(Alert.category)
         .subquery("last_notified")
     )
@@ -114,7 +113,7 @@ async def _deliver_immediate(
             .over(partition_by=Alert.category, order_by=Alert.created.desc())
             .label("rn"),
         )
-        .where(Alert.notified == False, Alert.severity.in_(immediate_severities))
+        .where(Alert.notified.is_(False), Alert.severity.in_(immediate_severities))
         .cte("ranked")
     )
 
@@ -127,7 +126,7 @@ async def _deliver_immediate(
             ranked.c.message.label("latest_message"),
             last_notified.c.last_notified_at,
         )
-        .where(Alert.notified == False, Alert.severity.in_(immediate_severities))
+        .where(Alert.notified.is_(False), Alert.severity.in_(immediate_severities))
         .outerjoin(last_notified, Alert.category == last_notified.c.cat)
         .outerjoin(
             ranked,
@@ -167,7 +166,10 @@ async def _deliver_immediate(
         message = AlertMessage(
             subject=subject,
             html_body=html,
-            text_body=f"{worst_severity.upper()} — {row.category}: {latest_msg} ({row.count} occurrences)",
+            text_body=(
+                f"{worst_severity.upper()} — {row.category}: "
+                f"{latest_msg} ({row.count} occurrences)"
+            ),
             severity=worst_severity,
             category=row.category,
             alert_count=row.count,
@@ -181,7 +183,7 @@ async def _deliver_immediate(
                 .where(
                     Alert.category == row.category,
                     Alert.severity.in_(immediate_severities),
-                    Alert.notified == False,
+                    Alert.notified.is_(False),
                 )
                 .values(notified=True)
             )
@@ -211,7 +213,7 @@ async def _deliver_digest(
             .over(partition_by=Alert.category, order_by=Alert.created.desc())
             .label("rn"),
         )
-        .where(Alert.notified == False, Alert.severity.in_(digest_severities))
+        .where(Alert.notified.is_(False), Alert.severity.in_(digest_severities))
         .cte("ranked_digest")
     )
 
@@ -222,7 +224,7 @@ async def _deliver_digest(
             func.count(Alert.id).label("count"),
             ranked.c.message.label("latest_message"),
         )
-        .where(Alert.notified == False, Alert.severity.in_(digest_severities))
+        .where(Alert.notified.is_(False), Alert.severity.in_(digest_severities))
         .outerjoin(
             ranked,
             and_(Alert.category == ranked.c.category, ranked.c.rn == 1),
@@ -256,7 +258,7 @@ async def _deliver_digest(
             update(Alert)
             .where(
                 Alert.severity.in_(digest_severities),
-                Alert.notified == False,
+                Alert.notified.is_(False),
             )
             .values(notified=True)
         )
@@ -289,13 +291,14 @@ def _render_immediate_email(
 def _render_digest_email(categories) -> str:
     """Render HTML for a digest email containing multiple warning categories."""
     rows = ""
+    cell = "padding: 8px; border-bottom: 1px solid #eee;"
     for row in categories:
         msg = (row.latest_message or "")[:80]
         rows += f"""
         <tr>
-            <td style="padding: 8px; border-bottom: 1px solid #eee;">{row.category}</td>
-            <td style="padding: 8px; border-bottom: 1px solid #eee;">{msg}</td>
-            <td style="padding: 8px; border-bottom: 1px solid #eee; text-align: center;">{row.count}</td>
+            <td style="{cell}">{row.category}</td>
+            <td style="{cell}">{msg}</td>
+            <td style="{cell} text-align: center;">{row.count}</td>
         </tr>
         """
 

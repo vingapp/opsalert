@@ -4,7 +4,7 @@ Plain async function — no scheduler dependency. The host app wraps
 this in whatever scheduler it uses.
 """
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import delete
 
@@ -21,7 +21,7 @@ async def cleanup_alerts(session) -> dict:
     """
     max_age_days = _resolve_setting("retention_max_age_days", 90)
 
-    cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+    cutoff = datetime.now(UTC) - timedelta(days=max_age_days)
     result = await session.execute(
         delete(Alert).where(Alert.created < cutoff)
     )

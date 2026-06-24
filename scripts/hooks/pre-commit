@@ -1,0 +1,62 @@
+#!/bin/sh
+# Pre-commit gate (mirrors vingapi's): lint staged files, type-check, run tests.
+# Each step skips gracefully if its tool isn't installed in .venv, so the hook
+# works whether or not a given clone has the full toolchain. Install with:
+#     sh scripts/install-hooks.sh
+# Bypass in a genuine emergency with `git commit --no-verify` (avoid it).
+
+RUFF=".venv/bin/ruff"
+MYPY=".venv/bin/mypy"
+UPTAKE_LINT=".venv/bin/uptake-lint"
+PYTEST=".venv/bin/pytest"
+
+STAGED_PY=$(git diff --cached --name-only --diff-filter=ACMR -- '*.py')
+[ -z "$STAGED_PY" ] && exit 0
+
+# Step 0: ruff on STAGED files (staged-scoped so an in-progress cleanup can
+# commit fixed files without being blocked by unrelated not-yet-clean files).
+if [ -x "$RUFF" ]; then
+    echo "pre-commit: ruff (staged)..."
+    if ! echo "$STAGED_PY" | xargs "$RUFF" check; then
+        echo "pre-commit: ruff found issues. Fix (ruff check --fix) or use --no-verify."
+        exit 1
+    fi
+else
+    echo "pre-commit: ruff not found at $RUFF, skipping"
+fi
+
+# Step 1: mypy type check (src/ layout if present, else the repo root).
+if [ -x "$MYPY" ]; then
+    echo "pre-commit: mypy..."
+    if [ -d src ]; then MYPY_TARGET="src"; else MYPY_TARGET="."; fi
+    if ! $MYPY "$MYPY_TARGET" --incremental; then
+        echo "pre-commit: mypy found type errors. Fix them or use --no-verify."
+        exit 1
+    fi
+else
+    echo "pre-commit: mypy not found at $MYPY, skipping"
+fi
+
+# Step 2: uptake-lint on staged files (secrets, debug leftovers, weak tests, ...).
+if [ -x "$UPTAKE_LINT" ]; then
+    echo "pre-commit: uptake-lint (staged)..."
+    if ! $UPTAKE_LINT --staged; then
+        echo "pre-commit: uptake-lint found blocking issues. Fix them or use --no-verify."
+        exit 1
+    fi
+else
+    echo "pre-commit: uptake-lint not found at $UPTAKE_LINT, skipping"
+fi
+
+# Step 3: run the test suite (fast for these libraries; stop on first failure).
+if [ -x "$PYTEST" ]; then
+    echo "pre-commit: pytest..."
+    if ! $PYTEST tests/ -x -q; then
+        echo "pre-commit: tests failed. Fix them or use --no-verify."
+        exit 1
+    fi
+else
+    echo "pre-commit: pytest not found at $PYTEST, skipping"
+fi
+
+exit 0

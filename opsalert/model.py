@@ -1,8 +1,7 @@
 """Alert model — single table owned entirely by the package."""
-from datetime import datetime, timezone
-from typing import Optional
+from datetime import UTC, datetime
 
-from sqlalchemy import String, Boolean, Text, Index, DateTime
+from sqlalchemy import Boolean, DateTime, Index, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -46,11 +45,11 @@ class Alert(OpsAlertBase):
     # Classification
     severity: Mapped[str] = mapped_column(String(10), nullable=False)
     category: Mapped[str] = mapped_column(String(100), nullable=False)
-    source: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    source: Mapped[str | None] = mapped_column(String(100), nullable=True)
     message: Mapped[str] = mapped_column(String(500), nullable=False)
 
     # Structured context (JSON string, per-occurrence variable data)
-    context_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    context_json: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # Email delivery tracking
     notified: Mapped[bool] = mapped_column(
@@ -60,7 +59,7 @@ class Alert(OpsAlertBase):
     # Timestamps — no host-app mixin dependency
     created: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
-        default=lambda: datetime.now(timezone.utc),
+        default=lambda: datetime.now(UTC),
         nullable=False,
     )
 

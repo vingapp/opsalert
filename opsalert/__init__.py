@@ -15,23 +15,23 @@ Usage::
     opsalert.critical("startup_failure", message="DB pool exhausted")
 """
 from opsalert._config import configure, get_config, reset_config
-from opsalert._dispatch import warn, error, critical
+from opsalert._dispatch import critical, error, warn
+from opsalert.cleanup import cleanup_alerts
+from opsalert.delivery import deliver_alerts
 from opsalert.model import Alert, OpsAlertBase
-from opsalert.store import fire_alert
 from opsalert.query import (
-    query_categories,
-    query_messages,
-    query_occurrences,
-    query_by_trace_id,
-    query_aggregates,
-    query_next_fix,
     delete_by_category,
     delete_by_id,
+    query_aggregates,
+    query_by_trace_id,
+    query_categories,
+    query_messages,
+    query_next_fix,
+    query_occurrences,
 )
-from opsalert.delivery import deliver_alerts
-from opsalert.cleanup import cleanup_alerts
-from opsalert.transport import Transport, CallableTransport, LogTransport, WebhookTransport
-from opsalert.types import AlertSeverity, AlertMessage, IMMEDIATE_SEVERITIES, DIGEST_SEVERITIES
+from opsalert.store import fire_alert
+from opsalert.transport import CallableTransport, LogTransport, Transport, WebhookTransport
+from opsalert.types import DIGEST_SEVERITIES, IMMEDIATE_SEVERITIES, AlertMessage, AlertSeverity
 
 
 def ensure_tables(engine) -> None:

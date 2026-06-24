@@ -8,14 +8,13 @@ Next-fix: Highest-priority group with aggregated debugging data
 import json
 from typing import TYPE_CHECKING
 
-from sqlalchemy import select, func, desc, case, delete
+from sqlalchemy import case, delete, desc, func, select
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
 from opsalert.model import Alert
 from opsalert.types import AlertSeverity
-
 
 # Map severity strings to numeric rank for proper MAX ordering.
 # func.max() on strings is lexicographic — 'warn' > 'error' > 'critical'.
