@@ -20,6 +20,7 @@ from opsalert.cleanup import cleanup_alerts
 from opsalert.delivery import deliver_alerts
 from opsalert.model import Alert, OpsAlertBase
 from opsalert.query import (
+    delete_batch,
     delete_by_category,
     delete_by_id,
     query_aggregates,
@@ -63,6 +64,7 @@ __all__ = [
     "query_aggregates",
     "query_next_fix",
     # Delete API
+    "delete_batch",
     "delete_by_category",
     "delete_by_id",
     # Sweeper entry points

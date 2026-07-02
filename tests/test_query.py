@@ -1,21 +1,21 @@
 """Tests for query API — dashboard selectors, next-fix, aggregates, delete."""
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from sqlalchemy import select
 
 from opsalert.model import Alert
-from opsalert.store import fire_alert
 from opsalert.query import (
-    query_categories,
-    query_messages,
-    query_occurrences,
-    query_by_trace_id,
-    query_aggregates,
-    query_next_fix,
+    delete_batch,
     delete_by_category,
     delete_by_id,
+    query_aggregates,
+    query_by_trace_id,
+    query_categories,
+    query_messages,
+    query_next_fix,
+    query_occurrences,
 )
-
+from opsalert.store import fire_alert
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -70,11 +70,11 @@ class TestQueryCategories:
         """Returns the message from the most recent alert in each category."""
         a1 = Alert(
             severity="warn", category="cat", message="old",
-            created=datetime(2024, 1, 1, tzinfo=timezone.utc),
+            created=datetime(2024, 1, 1, tzinfo=UTC),
         )
         a2 = Alert(
             severity="warn", category="cat", message="new",
-            created=datetime(2024, 6, 1, tzinfo=timezone.utc),
+            created=datetime(2024, 6, 1, tzinfo=UTC),
         )
         session.add_all([a1, a2])
         await session.commit()
@@ -233,11 +233,11 @@ class TestQueryOccurrences:
         """sort=created returns oldest first."""
         a1 = Alert(
             severity="warn", category="cat", message="old",
-            created=datetime(2024, 1, 1, tzinfo=timezone.utc),
+            created=datetime(2024, 1, 1, tzinfo=UTC),
         )
         a2 = Alert(
             severity="warn", category="cat", message="new",
-            created=datetime(2024, 6, 1, tzinfo=timezone.utc),
+            created=datetime(2024, 6, 1, tzinfo=UTC),
         )
         session.add_all([a1, a2])
         await session.commit()
@@ -249,11 +249,11 @@ class TestQueryOccurrences:
         """sort=-created returns newest first (default)."""
         a1 = Alert(
             severity="warn", category="cat", message="old",
-            created=datetime(2024, 1, 1, tzinfo=timezone.utc),
+            created=datetime(2024, 1, 1, tzinfo=UTC),
         )
         a2 = Alert(
             severity="warn", category="cat", message="new",
-            created=datetime(2024, 6, 1, tzinfo=timezone.utc),
+            created=datetime(2024, 6, 1, tzinfo=UTC),
         )
         session.add_all([a1, a2])
         await session.commit()
@@ -520,6 +520,65 @@ class TestDeleteByCategory:
     async def test_returns_zero_for_nonexistent(self, session):
         """Returns 0 when category doesn't exist."""
         count = await delete_by_category(session, category="nonexistent")
+        assert count == 0
+
+
+# ---------------------------------------------------------------------------
+# delete_batch
+# ---------------------------------------------------------------------------
+
+
+class TestDeleteBatch:
+    """Bounded exact-match delete of one identical-alert batch."""
+
+    async def test_deletes_only_exact_category_and_message(self, session):
+        """Neither a same-category sibling message nor a same-message other
+        category is touched — the batch key is the exact pair."""
+        rows = await _seed_alerts(session, [
+            {"severity": "warn", "category": "cat", "message": "boom"},
+            {"severity": "warn", "category": "cat", "message": "boom"},
+            {"severity": "warn", "category": "cat", "message": "boom again"},
+            {"severity": "warn", "category": "other", "message": "boom"},
+        ])
+
+        count = await delete_batch(
+            session, category="cat", message="boom", before_id=rows[-1].id
+        )
+        await session.commit()
+        assert count == 2
+
+        remaining = (await session.execute(select(Alert))).scalars().all()
+        assert sorted((a.category, a.message) for a in remaining) == [
+            ("cat", "boom again"),
+            ("other", "boom"),
+        ]
+
+    async def test_before_id_bound_spares_later_occurrences(self, session):
+        """Occurrences past the bound survive — a recurrence that lands after
+        the caller inspected the batch is not swallowed by the cleanup."""
+        rows = await _seed_alerts(session, [
+            {"severity": "error", "category": "cat", "message": "boom"},
+            {"severity": "error", "category": "cat", "message": "boom"},
+            {"severity": "error", "category": "cat", "message": "boom"},
+        ])
+
+        count = await delete_batch(
+            session, category="cat", message="boom", before_id=rows[1].id
+        )
+        await session.commit()
+        assert count == 2
+
+        remaining = (await session.execute(select(Alert))).scalars().all()
+        assert [a.id for a in remaining] == [rows[2].id]
+
+    async def test_returns_zero_for_nonexistent_batch(self, session):
+        await _seed_alerts(session, [
+            {"severity": "warn", "category": "cat", "message": "boom"},
+        ])
+
+        count = await delete_batch(
+            session, category="cat", message="no such message", before_id=10_000
+        )
         assert count == 0
 
 

@@ -422,6 +422,34 @@ async def delete_by_category(
     return result.rowcount
 
 
+async def delete_batch(
+    session: "AsyncSession",
+    *,
+    category: str,
+    message: str,
+    before_id: int,
+) -> int:
+    """Delete one batch of identical alerts: exact category + message, id <= before_id.
+
+    The narrow cousin of :func:`delete_by_category` for callers holding a
+    scoped clear-batch permission rather than full delete rights: ``message``
+    is required (no category-wide sweeps) and matched exactly (no patterns),
+    and the ``before_id`` bound restricts the delete to occurrences the caller
+    actually inspected — rows that arrive after the caller looked survive, so
+    a live recurrence is never silently swallowed by its own cleanup.
+
+    Returns the number of rows deleted.
+    """
+    result = await session.execute(
+        delete(Alert).where(
+            Alert.category == category,
+            Alert.message == message,
+            Alert.id <= before_id,
+        )
+    )
+    return result.rowcount
+
+
 async def delete_by_id(session: "AsyncSession", *, alert_id: int) -> bool:
     """Delete a single alert by ID. Returns True if found and deleted."""
     result = await session.execute(
