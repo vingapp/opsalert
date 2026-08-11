@@ -14,6 +14,52 @@ from typing import Any
 _SKIP_MODULES = frozenset({__name__, "opsalert._dispatch", "opsalert"})
 
 
+_TRACEBACK_BUDGET = 2000
+
+
+def _bounded_traceback(tb: Any, budget: int = _TRACEBACK_BUDGET) -> str:
+    """Format a traceback within a size budget, keeping BOTH ends.
+
+    Keeping only the tail (what a plain ``[-budget:]`` does) is the wrong half.
+    A failure deep inside a library — SQLAlchemy, greenlet, a DB dialect —
+    buries the application frames under thousands of characters of third-party
+    frames, so a tail-only cap stores a stack that names none of our own code.
+    That is precisely the case where the traceback is the only thing that says
+    which endpoint or operation was running.
+
+    The outermost frames say where the request entered; the innermost say where
+    it blew up. Keep both, elide the middle, and label the elision so nobody
+    reads a truncated stack as a complete one.
+    """
+    frames = tb_module.format_tb(tb)
+    joined = "".join(frames)
+    if len(joined) <= budget:
+        return joined
+
+    half = budget // 2
+    head: list[str] = []
+    size = 0
+    for frame in frames:
+        if size + len(frame) > half:
+            break
+        head.append(frame)
+        size += len(frame)
+
+    tail: list[str] = []
+    size = 0
+    for frame in reversed(frames[len(head) :]):
+        if size + len(frame) > half:
+            break
+        tail.append(frame)
+        size += len(frame)
+    tail.reverse()
+
+    elided = len(frames) - len(head) - len(tail)
+    if elided <= 0:
+        return joined[:budget]
+    return "".join(head) + f"  ... {elided} frames elided ...\n" + "".join(tail)
+
+
 def enrich_context(context: dict[str, Any] | None) -> dict[str, Any]:
     """Auto-capture runtime debugging info into alert context."""
     enriched = dict(context) if context else {}
@@ -40,9 +86,7 @@ def enrich_context(context: dict[str, Any] | None) -> dict[str, Any]:
         enriched["_exc_type"] = type(exc_info[1]).__name__
         enriched["_exc_message"] = str(exc_info[1])[:500]
         if exc_info[2]:
-            enriched["_traceback"] = "".join(
-                tb_module.format_tb(exc_info[2])
-            )[-2000:]
+            enriched["_traceback"] = _bounded_traceback(exc_info[2])
 
     # --- Celery task ---
     try:

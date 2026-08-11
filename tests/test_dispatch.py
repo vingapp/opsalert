@@ -3,9 +3,9 @@ import pytest
 from sqlalchemy import select
 
 import opsalert
+from opsalert._dispatch import _fire
 from opsalert.model import Alert
 from opsalert.types import AlertSeverity
-from opsalert._dispatch import _fire
 
 
 class TestFireAPI:
@@ -15,7 +15,9 @@ class TestFireAPI:
         """opsalert.warn() creates an alert row with WARN severity."""
         opsalert.configure(session_factory=session_factory)
 
-        await _fire(AlertSeverity.WARN, "test_category", "test message", "test_source", {"key": "value"})
+        await _fire(
+            AlertSeverity.WARN, "test_category", "test message", "test_source", {"key": "value"}
+        )
 
         result = await session.execute(select(Alert))
         alert = result.scalar_one()
@@ -100,7 +102,9 @@ class TestConfigTraceProvider:
 
     def test_configure_stores_trace_provider(self, session_factory):
         """configure(trace_provider=fn) stores the callable on config."""
-        provider = lambda: ("id", "origin")
+        def provider():
+            return ("id", "origin")
+
         opsalert.configure(session_factory=session_factory, trace_provider=provider)
 
         cfg = opsalert.get_config()
@@ -153,6 +157,49 @@ class TestEnrichment:
         assert ctx["_exc_type"] == "ValueError"
         assert "test boom" in ctx["_exc_message"]
         assert "_traceback" in ctx
+
+    def test_traceback_keeps_the_application_frames(self):
+        """A truncated traceback must keep the frames that name OUR code.
+
+        Regression: the traceback was capped with ``[-2000:]``, keeping the
+        TAIL. A failure deep inside a library (SQLAlchemy, greenlet, the MySQL
+        dialect) produces thousands of characters of library frames below the
+        application frames, so the cap discarded every frame naming our code and
+        stored only third-party internals.
+
+        Real cost (vingapi staging 2026-08-03, alert ids 31115-31120): a
+        MissingGreenlet on a lazy relationship load stored six tracebacks that
+        were 100% site-packages, naming no endpoint, operation or presenter.
+        """
+        try:
+            _application_frame_marker(_deep_library_stack)
+        except ValueError:
+            ctx = opsalert._dispatch.enrich_context(None)
+
+        tb = ctx["_traceback"]
+        assert len(tb) > 2000 or "_frame_00" in tb, "fixture stack was too short to truncate"
+        assert "_application_frame_marker" in tb, (
+            "the outermost (application) frames were truncated away"
+        )
+        assert "_frame_59" in tb, "the innermost (raising) frames were truncated away"
+
+    def test_traceback_stays_within_its_budget(self):
+        """Keeping both ends must not mean storing an unbounded traceback."""
+        try:
+            _application_frame_marker(_deep_library_stack)
+        except ValueError:
+            ctx = opsalert._dispatch.enrich_context(None)
+
+        assert len(ctx["_traceback"]) <= 2200
+
+    def test_truncated_traceback_says_it_was_truncated(self):
+        """A reader must not mistake an elided middle for the whole stack."""
+        try:
+            _application_frame_marker(_deep_library_stack)
+        except ValueError:
+            ctx = opsalert._dispatch.enrich_context(None)
+
+        assert "frames elided" in ctx["_traceback"]
 
     async def test_enrichment_preserves_caller_data(self, session, session_factory):
         """Caller-provided context keys are preserved alongside enrichment."""
@@ -264,3 +311,22 @@ class TestFireFailureHandling:
 
         # Should not raise
         await _fire(AlertSeverity.ERROR, "cat", "msg", None, None)
+
+
+def _application_frame_marker(fn):
+    """A uniquely-named frame standing in for an application-level frame."""
+    return fn()
+
+
+# A stack of DISTINCT frames. Recursion will not do: traceback.format_tb
+# collapses repeated identical frames into "[Previous line repeated N times]",
+# so a recursive fixture produces a short traceback and never exercises the cap.
+_ns: dict = {}
+exec(
+    "\n".join(
+        [f"def _frame_{i:02d}():\n    _frame_{i + 1:02d}()" for i in range(60)]
+        + ["def _frame_60():", "    raise ValueError('boom at the bottom')"]
+    ),
+    _ns,
+)
+_deep_library_stack = _ns["_frame_00"]
