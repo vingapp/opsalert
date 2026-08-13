@@ -187,6 +187,15 @@ async def _deliver_immediate(
                 )
                 .values(notified=True)
             )
+            # Commit the mark NOW, per category. The transport has already
+            # delivered this email; if the mark rode along to a single
+            # end-of-sweep commit, any later failure (another category's
+            # send, the digest queries, the commit itself) would roll it
+            # back and the next sweep would re-email a message the
+            # recipient already has — and, because the throttle window is
+            # computed from notified rows, re-email it IMMEDIATELY. A sent
+            # notification must be unlosable the moment it is sent.
+            await session.commit()
             stats["immediate_sent"] += 1
 
     return stats
@@ -262,6 +271,10 @@ async def _deliver_digest(
             )
             .values(notified=True)
         )
+        # Same rule as immediate delivery: the digest email is out the door,
+        # so its mark must not be able to roll back with the caller's
+        # transaction. Commit it in place.
+        await session.commit()
         stats["digest_sent"] = 1
 
     return stats

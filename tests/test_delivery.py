@@ -1,14 +1,13 @@
 """Tests for alert delivery — immediate, throttled, and digest."""
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
-from sqlalchemy import select, update
+from sqlalchemy import select
 
 import opsalert
+from opsalert.delivery import deliver_alerts
 from opsalert.model import Alert
 from opsalert.store import fire_alert
-from opsalert.delivery import deliver_alerts
-from opsalert.transport import LogTransport
 from opsalert.types import AlertMessage
 
 
@@ -112,7 +111,7 @@ class TestDeliverImmediate:
             category="cat",
             message="old",
             notified=True,
-            created=datetime.now(timezone.utc) - timedelta(minutes=5),
+            created=datetime.now(UTC) - timedelta(minutes=5),
         )
         session.add(alert)
 
@@ -141,7 +140,7 @@ class TestDeliverImmediate:
             category="cat",
             message="old",
             notified=True,
-            created=datetime.now(timezone.utc) - timedelta(hours=2),
+            created=datetime.now(UTC) - timedelta(hours=2),
         )
         session.add(alert)
 
@@ -290,3 +289,65 @@ class TestDeliverNoTransport:
         stats = await deliver_alerts(session)
         assert stats["immediate_sent"] == 0
         assert stats["digest_sent"] == 0
+
+
+class _ExplodeAfterFirstTransport(opsalert.Transport):
+    """Delivers the first message, then blows up — simulates a mid-sweep
+    failure AFTER at least one email is irrevocably out the door."""
+
+    def __init__(self):
+        self.sent: list[AlertMessage] = []
+
+    def send(self, message, *, to, from_addr, from_name):
+        if self.sent:
+            raise RuntimeError("transport exploded mid-sweep")
+        self.sent.append(message)
+        return True
+
+
+class TestSentMarkDurability:
+    """A delivered notification's notified-mark must be unlosable.
+
+    The marks used to ride the caller's single end-of-sweep commit; a failure
+    anywhere later in the sweep rolled back marks for emails the recipient
+    already had, and the next sweep re-sent them immediately (the throttle
+    window is computed FROM notified rows). Delivery now commits each mark
+    the moment its send succeeds.
+    """
+
+    async def test_mark_survives_failure_later_in_the_sweep(
+        self, session, session_factory
+    ):
+        transport = _ExplodeAfterFirstTransport()
+        opsalert.configure(
+            session_factory=session_factory,
+            transport=transport,
+            delivery_to_email="ops@test.com",
+            delivery_from_email="alert@test.com",
+            delivery_throttle_minutes=0,
+        )
+
+        await fire_alert(session, severity="error", category="cat_a", message="a")
+        await fire_alert(session, severity="error", category="cat_b", message="b")
+        await session.commit()
+
+        with pytest.raises(RuntimeError):
+            await deliver_alerts(session)
+        # The caller's transaction dies with the exception — roll it back
+        # WITHOUT committing, as the real sweeper's failure path would.
+        await session.rollback()
+
+        assert len(transport.sent) == 1
+        delivered_category = transport.sent[0].category
+
+        # Read through a FRESH session: the delivered category's mark must
+        # have been committed before the sweep blew up.
+        async with session_factory() as fresh:
+            result = await fresh.execute(
+                select(Alert).where(Alert.category == delivered_category)
+            )
+            for alert in result.scalars():
+                assert alert.notified is True, (
+                    f"notified mark for delivered category {delivered_category!r} "
+                    "was lost — this alert will be re-emailed every sweep"
+                )
