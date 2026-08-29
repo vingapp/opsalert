@@ -89,6 +89,12 @@ opsalert.configure(
     # alerts from leaking outside test transactions.
     testing=False,
 
+    # Deployment environment label. When set, every alert subject is prefixed
+    # "[STAGING] [ERROR] category: message", every alert email body opens with
+    # an "Environment: staging" line, and every stored occurrence's context
+    # carries "environment": "staging". Leave unset (None) for no labelling.
+    environment="staging",
+
     # Category -> debugging guidance. Shown in next-fix output to help
     # developers understand what each category means and how to fix it.
     fix_hints={

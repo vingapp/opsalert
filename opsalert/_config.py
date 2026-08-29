@@ -19,6 +19,12 @@ class OpsAlertConfig:
     # No-op mode: all fires silently skip (use in test suites)
     testing: bool = False
 
+    # Deployment environment label ("staging", "production", ...). When set it
+    # prefixes every alert subject, heads every alert email body, and is stamped
+    # into every stored occurrence's context. None = no labelling at all, so
+    # consumers that never configure it are unaffected.
+    environment: str | None = None
+
     # Category → debugging guidance (host app provides its own)
     fix_hints: dict[str, str] = field(default_factory=dict)
     default_fix_hint: str = "Examine the tracebacks and code locations above."

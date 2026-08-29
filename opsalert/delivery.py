@@ -35,6 +35,31 @@ _RANK_TO_SEVERITY = {
 }
 
 
+def _subject_prefix(environment: str | None) -> str:
+    """``"[STAGING] "`` when an environment is configured, ``""`` when not.
+
+    An alert that does not say which deployment it came from is a bug report
+    with the machine name torn off. Consumers that never set `environment`
+    keep byte-identical subjects.
+    """
+    return f"[{environment.upper()}] " if environment else ""
+
+
+def _environment_html(environment: str | None) -> str:
+    """Leading ``Environment: staging`` line for an email body, or nothing."""
+    if not environment:
+        return ""
+    return (
+        '<p style="margin: 0 0 12px 0; font-size: 14px; color: #666;">'
+        f"Environment: <strong>{environment}</strong></p>"
+    )
+
+
+def _environment_text(environment: str | None) -> str:
+    """Leading ``Environment: staging`` line for a plain-text body."""
+    return f"Environment: {environment}\n" if environment else ""
+
+
 async def deliver_alerts(session) -> dict:
     """Deliver alert notification emails. Call from your scheduler.
 
@@ -89,6 +114,8 @@ async def _deliver_immediate(
 
     if cfg.transport is None:
         return stats
+
+    environment = cfg.environment
 
     immediate_severities = [s.value for s in IMMEDIATE_SEVERITIES]
     throttle_cutoff = datetime.now(UTC) - timedelta(minutes=throttle_minutes)
@@ -155,24 +182,30 @@ async def _deliver_immediate(
 
         worst_severity = _RANK_TO_SEVERITY.get(row.severity_rank, AlertSeverity.ERROR.value)
         latest_msg = row.latest_message or ""
-        subject = f"[{worst_severity.upper()}] {row.category}: {latest_msg[:60]}"
+        subject = (
+            f"{_subject_prefix(environment)}"
+            f"[{worst_severity.upper()}] {row.category}: {latest_msg[:60]}"
+        )
         html = _render_immediate_email(
             category=row.category,
             severity=worst_severity,
             count=row.count,
             latest_message=latest_msg,
+            environment=environment,
         )
 
         message = AlertMessage(
             subject=subject,
             html_body=html,
             text_body=(
+                f"{_environment_text(environment)}"
                 f"{worst_severity.upper()} — {row.category}: "
                 f"{latest_msg} ({row.count} occurrences)"
             ),
             severity=worst_severity,
             category=row.category,
             alert_count=row.count,
+            environment=environment,
         )
 
         sent = cfg.transport.send(message, to=to_email, from_addr=from_email, from_name=from_name)
@@ -211,6 +244,8 @@ async def _deliver_digest(
     if cfg.transport is None:
         return stats
 
+    environment = cfg.environment
+
     digest_severities = [s.value for s in DIGEST_SEVERITIES]
 
     # CTE: latest message per unnotified warn category
@@ -248,16 +283,23 @@ async def _deliver_digest(
     total_count = sum(row.count for row in categories)
     stats["digest_count"] = total_count
 
-    subject = f"[ALERT DIGEST] {total_count} warning(s) across {len(categories)} categorie(s)"
-    html = _render_digest_email(categories)
+    subject = (
+        f"{_subject_prefix(environment)}[ALERT DIGEST] "
+        f"{total_count} warning(s) across {len(categories)} categorie(s)"
+    )
+    html = _render_digest_email(categories, environment=environment)
 
     message = AlertMessage(
         subject=subject,
         html_body=html,
-        text_body=f"Alert Digest: {total_count} warning(s) across {len(categories)} categories",
+        text_body=(
+            f"{_environment_text(environment)}"
+            f"Alert Digest: {total_count} warning(s) across {len(categories)} categories"
+        ),
         severity="warn",
         category="digest",
         alert_count=total_count,
+        environment=environment,
     )
 
     sent = cfg.transport.send(message, to=to_email, from_addr=from_email, from_name=from_name)
@@ -281,12 +323,17 @@ async def _deliver_digest(
 
 
 def _render_immediate_email(
-    *, category: str, severity: str, count: int, latest_message: str
+    *,
+    category: str,
+    severity: str,
+    count: int,
+    latest_message: str,
+    environment: str | None = None,
 ) -> str:
     """Render HTML for an individual category alert email."""
     color = "#dc3545" if severity == AlertSeverity.CRITICAL else "#fd7e14"
     return f"""
-    <div style="font-family: sans-serif; max-width: 600px;">
+    <div style="font-family: sans-serif; max-width: 600px;">{_environment_html(environment)}
         <h2 style="color: {color};">
             {severity.upper()} Alert — {category}
         </h2>
@@ -301,7 +348,7 @@ def _render_immediate_email(
     """
 
 
-def _render_digest_email(categories) -> str:
+def _render_digest_email(categories, *, environment: str | None = None) -> str:
     """Render HTML for a digest email containing multiple warning categories."""
     rows = ""
     cell = "padding: 8px; border-bottom: 1px solid #eee;"
@@ -317,7 +364,7 @@ def _render_digest_email(categories) -> str:
 
     total = sum(r.count for r in categories)
     return f"""
-    <div style="font-family: sans-serif; max-width: 600px;">
+    <div style="font-family: sans-serif; max-width: 600px;">{_environment_html(environment)}
         <h2 style="color: #ffc107;">Alert Digest — {total} Warning(s)</h2>
         <table style="border-collapse: collapse; width: 100%;">
             <thead>

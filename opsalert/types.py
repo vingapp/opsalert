@@ -33,3 +33,7 @@ class AlertMessage:
     severity: str
     category: str
     alert_count: int = 1
+    # Deployment environment the alert came from ("staging", "production", ...).
+    # None when the host app did not configure one -- subjects and bodies then
+    # render exactly as they did before environment labelling existed.
+    environment: str | None = None

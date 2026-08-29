@@ -121,6 +121,34 @@ def _budget(truncated_keys: list[str], original_bytes: int) -> int:
     return CONTEXT_MAX_BYTES - marker_bytes
 
 
+def stamp_environment(context: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Add the configured deployment environment to an alert context.
+
+    Every stored occurrence has to say which deployment produced it — reading a
+    triage row and not knowing whether it came from staging or production makes
+    the row nearly useless. Stamped here, on the single store path, so direct
+    ``fire_alert`` callers get it as well as ``opsalert.error(...)``.
+
+    A caller-supplied ``environment`` key wins: the caller knows something we
+    don't (e.g. relaying an alert on another deployment's behalf). Returns the
+    context untouched when no environment is configured, or when opsalert has
+    not been configured at all — storing must never depend on config.
+    """
+    try:
+        from opsalert._config import get_config
+
+        environment = get_config().environment
+    except Exception:
+        return context
+    if not environment:
+        return context
+    if context and "environment" in context:
+        return context
+    stamped = dict(context) if context else {}
+    stamped["environment"] = environment
+    return stamped
+
+
 async def fire_alert(
     session: "AsyncSession",
     *,
@@ -136,7 +164,7 @@ async def fire_alert(
         category=category,
         message=message,
         source=source,
-        context_json=serialize_context(context),
+        context_json=serialize_context(stamp_environment(context)),
     )
     session.add(alert)
     await session.flush()
