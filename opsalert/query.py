@@ -8,12 +8,17 @@ Next-fix: Highest-priority group with aggregated debugging data
 import json
 from typing import TYPE_CHECKING
 
-from sqlalchemy import case, delete, desc, func, select
+from sqlalchemy import case, delete, desc, func, or_, select
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
-from opsalert.model import Alert
+from opsalert.lifecycle import (
+    DISPOSITION_IMMEDIATE,
+    STATUS_NEW,
+    effective_disposition,
+)
+from opsalert.model import Alert, AlertCondition
 from opsalert.types import AlertSeverity
 
 # Map severity strings to numeric rank for proper MAX ordering.
@@ -180,6 +185,7 @@ async def query_occurrences(
     severity: str | None = None,
     source: str | None = None,
     search: str | None = None,
+    condition_id: int | None = None,
     sort: str = "-created",
     limit: int = 50,
     offset: int = 0,
@@ -188,8 +194,13 @@ async def query_occurrences(
 
     Returns (items, total_count). Items are dicts (not ORM objects)
     so the host app doesn't need to import the model for serialization.
+
+    ``condition_id`` is the drill-down from the conditions list: "show me the
+    occurrences of THIS problem".
     """
     base_filters = []
+    if condition_id is not None:
+        base_filters.append(Alert.condition_id == condition_id)
     if category:
         base_filters.append(Alert.category == category)
     if message:
@@ -235,6 +246,7 @@ async def query_occurrences(
             "message": a.message,
             "context_json": a.context_json,
             "notified": a.notified,
+            "condition_id": a.condition_id,
             "created": a.created,
         }
         for a in result.scalars().all()
@@ -315,7 +327,14 @@ async def query_next_fix(
     The result includes unique code locations (_caller), exception signatures,
     tracebacks, and sample caller-provided contexts — everything a developer
     needs to diagnose and fix the issue.
+
+    Occurrences whose condition is acknowledged, resolved or closed are
+    excluded (P11): "what should I fix next" must not keep handing back the
+    thing somebody already picked up or already fixed. Occurrences with no
+    condition behave exactly as they did before.
     """
+    triageable = _open_condition_filter()
+
     # Query A: find the top-priority (category, message) group.
     top = (
         select(
@@ -327,6 +346,7 @@ async def query_next_fix(
             func.max(Alert.created).label("latest_created"),
             func.max(Alert.source).label("source"),
         )
+        .where(triageable)
         .group_by(Alert.category, Alert.message)
         .order_by(
             desc("severity_rank"),
@@ -341,7 +361,7 @@ async def query_next_fix(
     # Query B: load context_json for occurrences (paginated, not unbounded).
     occ_result = await session.execute(
         select(Alert.context_json)
-        .where(Alert.category == row.category, Alert.message == row.message)
+        .where(Alert.category == row.category, Alert.message == row.message, triageable)
         .order_by(Alert.created.desc())
         .limit(max_occurrences)
     )
@@ -397,6 +417,242 @@ async def query_next_fix(
         "sample_contexts": samples,
         "fix_hint": fix_hint,
     }
+
+
+# =============================================================================
+# Condition queries
+# =============================================================================
+
+
+def _open_condition_filter():
+    """Occurrences that are still somebody's problem.
+
+    True for orphans (no condition — legacy behaviour) and for occurrences of
+    a condition still in ``new``.
+    """
+    return or_(
+        Alert.condition_id.is_(None),
+        Alert.condition_id.in_(
+            select(AlertCondition.id).where(AlertCondition.status == STATUS_NEW)
+        ),
+    )
+
+
+def _scoped_environment(environment: str | None) -> str | None:
+    """Resolve the environment a condition query is scoped to (P9).
+
+    Explicit argument wins; otherwise the configured deployment. A condition
+    list that mixes staging and production is a list nobody can act on, and
+    resolving the staging copy must never silence production.
+    """
+    if environment is not None:
+        return environment
+    try:
+        from opsalert._config import get_config
+
+        return get_config().environment
+    except (RuntimeError, ImportError):
+        # Not configured (a host app that only queries, a test suite): no
+        # scope to apply. Any other failure is a real bug and must surface.
+        return None
+
+
+def _condition_dict(condition: AlertCondition) -> dict:
+    return {
+        "id": condition.id,
+        "signature_key": condition.signature_key,
+        "category": condition.category,
+        "source": condition.source,
+        "environment": condition.environment,
+        "template": condition.message_template,
+        "status": condition.status,
+        "disposition": condition.disposition,
+        "effective_disposition": effective_disposition(
+            condition.severity, condition.disposition
+        ),
+        "severity": condition.severity,
+        "latest_severity": condition.latest_severity,
+        "issue_url": condition.issue_url,
+        "resolved_by": condition.resolved_by,
+        "notes": condition.notes,
+        "occurrence_count": condition.occurrence_count,
+        "reopened_count": condition.reopened_count,
+        "median_interval_seconds": condition.median_interval_seconds,
+        "first_seen": condition.first_seen,
+        "last_seen": condition.last_seen,
+        "acknowledged_at": condition.acknowledged_at,
+        "acknowledged_by": condition.acknowledged_by,
+        "status_changed_at": condition.status_changed_at,
+        "resolved_at": condition.resolved_at,
+        "closed_at": condition.closed_at,
+        "created": condition.created,
+    }
+
+
+async def query_conditions(
+    session: "AsyncSession",
+    *,
+    status: str | None = None,
+    severity: str | None = None,
+    category: str | None = None,
+    search: str | None = None,
+    environment: str | None = None,
+    sort: str = "-last_seen",
+    limit: int = 50,
+    offset: int = 0,
+) -> tuple[list[dict], int, dict]:
+    """The conditions list. Returns ``(items, total, aggregates)``.
+
+    ``aggregates`` carries ``byStatus`` and ``bySeverity`` counts for the
+    filter facets — computed over the environment scope and the non-facet
+    filters, so the sidebar counts describe what clicking a facet would show.
+    """
+    scope = _scoped_environment(environment)
+
+    base_filters = []
+    if scope:
+        base_filters.append(AlertCondition.environment == scope)
+    if category:
+        base_filters.append(AlertCondition.category == category)
+    if search:
+        base_filters.append(AlertCondition.message_template.ilike(f"%{search}%"))
+
+    by_status_rows = (
+        await session.execute(
+            select(AlertCondition.status, func.count(AlertCondition.id))
+            .where(*base_filters)
+            .group_by(AlertCondition.status)
+        )
+    ).all()
+    by_severity_rows = (
+        await session.execute(
+            select(AlertCondition.severity, func.count(AlertCondition.id))
+            .where(*base_filters)
+            .group_by(AlertCondition.severity)
+        )
+    ).all()
+    aggregates = {
+        "byStatus": {row[0]: row[1] for row in by_status_rows},
+        "bySeverity": {row[0]: row[1] for row in by_severity_rows},
+    }
+
+    filters = list(base_filters)
+    if status:
+        filters.append(AlertCondition.status == status)
+    if severity:
+        filters.append(AlertCondition.severity == severity)
+
+    total = (
+        await session.scalar(select(func.count(AlertCondition.id)).where(*filters))
+    ) or 0
+
+    sort_map = {
+        "last_seen": AlertCondition.last_seen,
+        "first_seen": AlertCondition.first_seen,
+        "occurrence_count": AlertCondition.occurrence_count,
+        "category": AlertCondition.category,
+        "status": AlertCondition.status,
+        "severity": AlertCondition.severity,
+        "created": AlertCondition.created,
+    }
+    is_desc = sort.startswith("-")
+    col = sort_map.get(sort.lstrip("-"), AlertCondition.last_seen)
+
+    rows = (
+        (
+            await session.execute(
+                select(AlertCondition)
+                .where(*filters)
+                .order_by(col.desc() if is_desc else col.asc(), AlertCondition.id.desc())
+                .offset(offset)
+                .limit(limit)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return [_condition_dict(c) for c in rows], total, aggregates
+
+
+async def query_attention(
+    session: "AsyncSession",
+    *,
+    cursor: int | None = None,
+    environment: str | None = None,
+    limit: int = 50,
+) -> dict:
+    """The watchdog's view: what should wake somebody up right now.
+
+    Returns ``{"conditions": [...], "cursor": <opaque max occurrence id>}``.
+
+    Only ``new`` conditions whose effective disposition is ``immediate`` are
+    here (W2). Digest and collect never wake anyone — that is what choosing
+    them means — and an acknowledged condition has already woken somebody.
+
+    With a cursor, a condition appears only if it has fired since that cursor:
+    "nothing new" is an empty list and the same cursor, not a repeat of the
+    standing list. Without one, the caller gets the current attention set plus
+    a fresh cursor — a bootstrap, never a flood of history.
+    """
+    scope = _scoped_environment(environment)
+
+    filters = [AlertCondition.status == STATUS_NEW]
+    if scope:
+        filters.append(AlertCondition.environment == scope)
+
+    rows = (
+        (
+            await session.execute(
+                select(AlertCondition).where(*filters).order_by(AlertCondition.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    # The new cursor is the high-water mark of occurrences at query time,
+    # taken independently of what matched — so the next call can honestly say
+    # "nothing since".
+    max_occurrence_id = (await session.scalar(select(func.max(Alert.id)))) or 0
+    next_cursor = max(max_occurrence_id, cursor or 0)
+
+    # One count query per candidate condition. The candidate set is the
+    # attention set — conditions that are new AND immediate in one environment
+    # — which is small by construction and, when it is not, the fleet has a
+    # much louder problem than this query.
+    conditions = []
+    for condition in rows:
+        if (
+            effective_disposition(condition.severity, condition.disposition)
+            != DISPOSITION_IMMEDIATE
+        ):
+            continue
+        since = cursor or 0
+        count_since = (
+            await session.scalar(
+                select(func.count(Alert.id)).where(
+                    Alert.condition_id == condition.id, Alert.id > since
+                )
+            )
+        ) or 0
+        if cursor is not None and count_since == 0:
+            continue
+        conditions.append(
+            {
+                "id": condition.id,
+                "severity": condition.severity,
+                "category": condition.category,
+                "template": condition.message_template,
+                "occurrence_count": condition.occurrence_count,
+                "count_since_cursor": count_since,
+                "last_seen": condition.last_seen,
+                "reopened": (condition.reopened_count or 0) > 0,
+            }
+        )
+        if len(conditions) >= limit:
+            break
+
+    return {"conditions": conditions, "cursor": next_cursor}
 
 
 # =============================================================================

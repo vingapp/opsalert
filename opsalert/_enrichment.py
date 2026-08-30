@@ -5,9 +5,17 @@ Adds underscore-prefixed keys (won't collide with caller-provided data):
 - _exc_type, _exc_message, _traceback: active exception info (if any)
 - _task_name, _task_id: Celery task info (if running inside a task)
 """
+import logging
 import sys
 import traceback as tb_module
 from typing import Any
+
+logger = logging.getLogger(__name__)
+
+# A host-supplied provider that raises is a wiring defect, and one worth
+# hearing about — but it fires on every alert, so it is reported ONCE per
+# process and then left alone. Loud, not deafening.
+_provider_failure_reported = False
 
 # Module names to skip when walking the stack to find the caller.
 # Both this module and _dispatch.py are internal to the package.
@@ -110,5 +118,29 @@ def enrich_context(context: dict[str, Any] | None) -> dict[str, Any]:
                 enriched["_trace_origin"] = torigin
     except Exception:
         pass
+
+    # --- Requesting identity ---
+    # Optional, and never fatal: attribution is a nice-to-have, the alert is
+    # not. A provider that raises (no request context, a lazy attribute that
+    # hits the DB) costs the alert nothing.
+    try:
+        from opsalert._config import get_config
+        cfg = get_config()
+        if cfg.identity_provider is not None:
+            user_id, org_id = cfg.identity_provider()
+            if user_id is not None:
+                enriched["_user_id"] = user_id
+            if org_id is not None:
+                enriched["_org_id"] = org_id
+    except RuntimeError:
+        pass  # opsalert not configured — nothing to ask
+    except Exception:
+        global _provider_failure_reported
+        if not _provider_failure_reported:
+            _provider_failure_reported = True
+            logger.exception(
+                "opsalert: identity_provider raised; alerts will carry no "
+                "attribution until it is fixed (reported once per process)"
+            )
 
     return enriched

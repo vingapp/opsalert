@@ -1,4 +1,6 @@
 """Tests for the fire API — warn/error/critical dispatch."""
+import asyncio
+
 import pytest
 from sqlalchemy import select
 
@@ -6,6 +8,17 @@ import opsalert
 from opsalert._dispatch import _fire
 from opsalert.model import Alert
 from opsalert.types import AlertSeverity
+
+
+async def _drain_fires():
+    """Wait for the fire-and-forget tasks dispatch put on the loop.
+
+    ``_INFLIGHT`` is the strong-reference set that keeps those tasks from being
+    garbage-collected mid-flight; draining it is how a test observes a
+    fire-and-forget call's result.
+    """
+    while opsalert._dispatch._INFLIGHT:
+        await asyncio.gather(*list(opsalert._dispatch._INFLIGHT))
 
 
 class TestFireAPI:
@@ -293,6 +306,96 @@ class TestEnrichment:
 
         assert ctx["_trace_id"] == "req-xyz-789"
         assert "_trace_origin" not in ctx
+
+
+class TestIdentityProvider:
+    """Attribution enrichment: which account did this happen to?
+
+    Same contract as ``trace_provider`` — optional, and never able to cost an
+    alert. An alert that names the account it happened to is one somebody can
+    reproduce; an alert lost because the lookup failed is worth nothing.
+    """
+
+    async def test_identity_provider_adds_user_and_org(self, session_factory):
+        opsalert.configure(
+            session_factory=session_factory,
+            identity_provider=lambda: (42, 7),
+        )
+
+        ctx = opsalert._dispatch.enrich_context({"user_key": "val"})
+
+        assert ctx["_user_id"] == 42
+        assert ctx["_org_id"] == 7
+        assert ctx["user_key"] == "val"
+
+    async def test_identity_provider_none_values_omitted(self, session_factory):
+        """An anonymous request carries no attribution keys at all."""
+        opsalert.configure(
+            session_factory=session_factory,
+            identity_provider=lambda: (None, None),
+        )
+
+        ctx = opsalert._dispatch.enrich_context(None)
+
+        assert "_user_id" not in ctx
+        assert "_org_id" not in ctx
+        assert "_caller" in ctx
+
+    async def test_identity_provider_partial_values(self, session_factory):
+        opsalert.configure(
+            session_factory=session_factory,
+            identity_provider=lambda: (42, None),
+        )
+
+        ctx = opsalert._dispatch.enrich_context(None)
+
+        assert ctx["_user_id"] == 42
+        assert "_org_id" not in ctx
+
+    async def test_identity_provider_not_configured(self, session_factory):
+        opsalert.configure(session_factory=session_factory)
+
+        ctx = opsalert._dispatch.enrich_context(None)
+
+        assert "_user_id" not in ctx
+        assert "_org_id" not in ctx
+
+    async def test_identity_provider_exception_is_graceful(self, session_factory):
+        """A broken provider costs attribution, never the alert."""
+
+        def bad_provider():
+            raise RuntimeError("no request context here")
+
+        opsalert.configure(
+            session_factory=session_factory,
+            identity_provider=bad_provider,
+        )
+
+        ctx = opsalert._dispatch.enrich_context({"important": "data"})
+
+        assert "_user_id" not in ctx
+        assert ctx["important"] == "data"
+        assert "_caller" in ctx
+
+    async def test_a_broken_provider_still_stores_the_alert(
+        self, session, session_factory
+    ):
+        def bad_provider():
+            raise ValueError("boom")
+
+        opsalert.configure(
+            session_factory=session_factory,
+            identity_provider=bad_provider,
+        )
+
+        opsalert.error("cat", message="the alert that matters")
+        await _drain_fires()
+
+        async with session_factory() as fresh:
+            stored = (
+                await fresh.execute(select(Alert).where(Alert.category == "cat"))
+            ).scalar_one()
+        assert stored.message == "the alert that matters"
 
 
 class TestFireFailureHandling:

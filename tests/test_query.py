@@ -273,7 +273,7 @@ class TestQueryOccurrences:
         assert isinstance(item, dict)
         assert set(item.keys()) == {
             "id", "severity", "category", "source", "message",
-            "context_json", "notified", "created",
+            "context_json", "notified", "condition_id", "created",
         }
 
     async def test_filter_by_message(self, session):

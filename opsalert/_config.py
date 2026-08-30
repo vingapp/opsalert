@@ -48,6 +48,13 @@ class OpsAlertConfig:
     # Injected by the host app so opsalert stays dependency-free.
     trace_provider: Callable[[], tuple[str | None, str | None]] | None = None
 
+    # Returns (user_id, org_id) for whoever the current request belongs to.
+    # Same shape and same contract as trace_provider: injected by the host
+    # app, called on the fire path, and never allowed to break a fire. An
+    # alert that names the account it happened to is an alert somebody can
+    # actually reproduce.
+    identity_provider: Callable[[], tuple[Any | None, Any | None]] | None = None
+
 
 _config: OpsAlertConfig | None = None
 

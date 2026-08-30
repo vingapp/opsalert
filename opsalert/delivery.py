@@ -1,22 +1,46 @@
-"""Alert delivery — batched notification with throttling.
+"""Alert delivery — condition-aware notification with per-condition gating.
 
-Sends alert notification emails throttled by category:
-- ERROR/CRITICAL: individual email per category (with count), throttled
-- WARN: batched into periodic digest emails
+What gets emailed is decided per CONDITION, not per category:
 
-Performance fix: single query with LEFT JOIN for throttle check
-(replaces N+1 pattern of one throttle-check query per category).
+- a resolved/closed condition that fired again is reopened INLINE, before any
+  gating, so a recurrence can never be swallowed by the state it was left in
+  (P4). Delivery does not wait for the lifecycle sweep to notice;
+- ``collect`` marks its occurrences notified and sends nothing;
+- an ``acknowledged`` condition gets the digest at most — somebody is already
+  on it, and its occurrences keep accruing regardless (P5);
+- ``immediate`` conditions are throttled individually, then batched into ONE
+  email per category per sweep whose body enumerates the conditions (P7). The
+  cadence stays what it was; the inclusion decision moved down a level, so a
+  brand-new condition is never shadowed by its category-mates' throttle.
 
-This module provides plain async functions — no scheduler dependency.
-The host app wraps these in whatever scheduler it uses.
+Occurrences with no condition (fire-time resolution failed, or rows older than
+conditions) are delivered by the original category-grouped path, unchanged.
+
+Every transport-accepted send commits its notified-marks before the next send
+(P12) — a delivered email's mark must not be able to roll back.
+
+Plain async functions — no scheduler dependency. The host app wraps these in
+whatever scheduler it uses.
 """
 import logging
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import and_, case, func, select, update
+from sqlalchemy import and_, case, func, or_, select, update
 
 from opsalert._config import _resolve_setting, get_config
-from opsalert.model import Alert
+from opsalert.lifecycle import (
+    DISPOSITION_COLLECT,
+    DISPOSITION_DIGEST,
+    DISPOSITION_IMMEDIATE,
+    STATUS_ACKNOWLEDGED,
+    STATUS_CLOSED,
+    STATUS_RESOLVED,
+    STATUSES,
+    effective_disposition,
+    reopen_condition,
+)
+from opsalert.model import Alert, AlertCondition
 from opsalert.types import DIGEST_SEVERITIES, IMMEDIATE_SEVERITIES, AlertMessage, AlertSeverity
 
 logger = logging.getLogger(__name__)
@@ -33,6 +57,39 @@ _RANK_TO_SEVERITY = {
     2: AlertSeverity.ERROR.value,
     1: AlertSeverity.WARN.value,
 }
+
+# How many conditions an immediate email lists before it says "and N more".
+_CONDITION_LIST_CAP = 10
+
+# Marking is bounded by (condition, max occurrence id) pairs so a row that
+# arrived DURING the sweep is never marked as notified by an email that could
+# not have contained it. Pairs are applied in chunks to keep the statement sane.
+_MARK_CHUNK = 200
+
+
+@dataclass
+class _ConditionBatch:
+    """One condition's unnotified occurrences, as seen at the start of a sweep."""
+
+    condition_id: int
+    category: str
+    template: str
+    latest_message: str
+    severity: str
+    status: str
+    disposition: str | None
+    count: int
+    max_id: int
+    last_created: datetime | None
+
+
+@dataclass
+class _DigestRow:
+    """Row shape the digest renderer expects (category / message / count)."""
+
+    category: str
+    latest_message: str
+    count: int
 
 
 def _subject_prefix(environment: str | None) -> str:
@@ -64,13 +121,16 @@ async def deliver_alerts(session) -> dict:
     """Deliver alert notification emails. Call from your scheduler.
 
     Returns stats dict with immediate_sent, immediate_throttled,
-    digest_sent, digest_count.
+    digest_sent, digest_count, reopened, collected, skipped.
     """
     stats = {
         "immediate_sent": 0,
         "immediate_throttled": 0,
         "digest_sent": 0,
         "digest_count": 0,
+        "reopened": 0,
+        "collected": 0,
+        "skipped": 0,
     }
 
     enabled = _resolve_setting("delivery_enabled", True)
@@ -82,12 +142,57 @@ async def deliver_alerts(session) -> dict:
     from_name = _resolve_setting("delivery_from_name", "OpsAlert")
     throttle_minutes = _resolve_setting("delivery_throttle_minutes", 60)
 
+    # FIRST, before anything is gated: a condition somebody closed out that is
+    # firing again is a live problem, whatever its disposition says.
+    reopened_ids = await _reopen_recurring(session)
+    stats["reopened"] = len(reopened_ids)
+
+    batches, skipped = await _load_condition_batches(session)
+    stats["skipped"] += skipped
+
+    immediate: list[_ConditionBatch] = []
+    digest: list[_ConditionBatch] = []
+    collect: list[_ConditionBatch] = []
+    for batch in batches:
+        if batch.condition_id in reopened_ids:
+            # P4: a recurrence of something we thought was fixed goes out
+            # immediately, whatever disposition it was parked under. The
+            # disposition described the old episode.
+            immediate.append(batch)
+            continue
+        disposition = effective_disposition(batch.severity, batch.disposition)
+        if batch.status == STATUS_ACKNOWLEDGED and disposition == DISPOSITION_IMMEDIATE:
+            # P5: acknowledged leaves the immediate line. Digest at most.
+            disposition = DISPOSITION_DIGEST
+        if disposition == DISPOSITION_COLLECT:
+            collect.append(batch)
+        elif disposition == DISPOSITION_DIGEST:
+            digest.append(batch)
+        else:
+            immediate.append(batch)
+
+    # Collected conditions are recorded, not announced: mark and move on.
+    if collect:
+        await _mark_notified(session, [(b.condition_id, b.max_id) for b in collect])
+        await session.commit()
+        stats["collected"] = sum(b.count for b in collect)
+
+    cfg = get_config()
+    if cfg.transport is None:
+        return stats
+
     stats.update(
-        await _deliver_immediate(session, to_email, from_email, from_name, throttle_minutes)
+        await _deliver_immediate(
+            session,
+            immediate,
+            to_email,
+            from_email,
+            from_name,
+            throttle_minutes,
+            reopened_ids,
+        )
     )
-    stats.update(
-        await _deliver_digest(session, to_email, from_email, from_name)
-    )
+    stats.update(await _deliver_digest(session, digest, to_email, from_email, from_name))
 
     total = stats["immediate_sent"] + stats["digest_sent"]
     if total > 0:
@@ -101,37 +206,324 @@ async def deliver_alerts(session) -> dict:
     return stats
 
 
-async def _deliver_immediate(
-    session, to_email: str, from_email: str, from_name: str, throttle_minutes: int
-) -> dict:
-    """Send one email per unnotified ERROR/CRITICAL category.
+# =============================================================================
+# Condition-aware routing
+# =============================================================================
 
-    Performance fix: single query with LEFT JOIN for throttle check,
-    replacing N+1 per-category throttle queries.
+
+async def _reopen_recurring(session) -> set[int]:
+    """Reopen every resolved/closed condition with an unnotified occurrence.
+
+    Returns the ids it reopened, which then bypass disposition gating below.
+
+    This runs before disposition gating on purpose. If reopening were left to
+    the maintenance sweep, a sweep order of "deliver, then apply rules" would
+    let a recurrence on a collect-dispositioned closed condition be marked
+    notified and silently swallowed — the alert nobody ever sees.
     """
+    condition_ids = (
+        (
+            await session.execute(
+                select(Alert.condition_id)
+                .join(AlertCondition, AlertCondition.id == Alert.condition_id)
+                .where(
+                    Alert.notified.is_(False),
+                    AlertCondition.status.in_([STATUS_RESOLVED, STATUS_CLOSED]),
+                )
+                .distinct()
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not condition_ids:
+        return set()
+
+    now = datetime.now(UTC)
+    reopened: set[int] = set()
+    for condition_id in condition_ids:
+        condition = await session.get(AlertCondition, condition_id)
+        if condition is None:
+            continue
+        reopen_condition(condition, now=now)
+        reopened.add(condition_id)
+
+    # The reopen is a state change that must outlive whatever happens to the
+    # rest of this sweep — commit it in place, like a sent mark.
+    await session.commit()
+    return reopened
+
+
+async def _load_condition_batches(session) -> tuple[list[_ConditionBatch], int]:
+    """Group unnotified occurrences by condition. Returns (batches, skipped)."""
+    # The newest unnotified occurrence's text, per condition. The template is
+    # the identity, but a subject line reading "Row <n> failed" is worse than
+    # one reading "Row 42 failed" — the reader wants the instance.
+    latest_message = (
+        select(Alert.message)
+        .where(Alert.condition_id == AlertCondition.id, Alert.notified.is_(False))
+        .order_by(Alert.created.desc(), Alert.id.desc())
+        .limit(1)
+        .correlate(AlertCondition)
+        .scalar_subquery()
+    )
+
+    rows = (
+        await session.execute(
+            select(
+                AlertCondition.id.label("condition_id"),
+                AlertCondition.category,
+                AlertCondition.message_template,
+                latest_message.label("latest_message"),
+                AlertCondition.severity,
+                AlertCondition.status,
+                AlertCondition.disposition,
+                func.count(Alert.id).label("count"),
+                func.max(Alert.id).label("max_id"),
+                func.max(Alert.created).label("last_created"),
+            )
+            .join(Alert, Alert.condition_id == AlertCondition.id)
+            .where(Alert.notified.is_(False))
+            .group_by(
+                AlertCondition.id,
+                AlertCondition.category,
+                AlertCondition.message_template,
+                AlertCondition.severity,
+                AlertCondition.status,
+                AlertCondition.disposition,
+            )
+        )
+    ).all()
+
+    batches: list[_ConditionBatch] = []
+    skipped = 0
+    for row in rows:
+        # F3: one unreadable condition row must not take the sweep down with
+        # it. Skip it loudly and deliver everything else.
+        try:
+            if row.status not in STATUSES:
+                raise ValueError(f"unknown status {row.status!r}")
+            if not row.category:
+                raise ValueError("condition has no category")
+            batches.append(
+                _ConditionBatch(
+                    condition_id=row.condition_id,
+                    category=str(row.category),
+                    template=str(row.message_template or ""),
+                    latest_message=str(row.latest_message or row.message_template or ""),
+                    severity=str(row.severity or ""),
+                    status=str(row.status),
+                    disposition=row.disposition,
+                    count=int(row.count),
+                    max_id=int(row.max_id),
+                    last_created=row.last_created,
+                )
+            )
+        except Exception as exc:
+            skipped += 1
+            logger.exception(
+                "opsalert: skipping unusable condition %s during delivery", row.condition_id
+            )
+            _report_delivery_skip(row.condition_id, exc)
+    return batches, skipped
+
+
+def _report_delivery_skip(condition_id: object, exc: Exception) -> None:
+    """Raise an alert about a condition delivery could not read.
+
+    A row that delivery cannot interpret is silently un-deliverable — the
+    exact failure mode that hides real alerts — so it becomes an alert of its
+    own. Guarded, because alerting about a delivery failure must not be able
+    to break delivery.
+    """
+    try:
+        from opsalert._dispatch import error as _error
+
+        _error(
+            "alert_delivery",
+            message="Unusable alert condition row skipped during delivery",
+            source="opsalert.delivery",
+            context={"condition_id": condition_id, "reason": str(exc)},
+        )
+    except Exception:
+        logger.exception("opsalert: could not report unusable condition %s", condition_id)
+
+
+async def _mark_notified(session, pairs: list[tuple[int, int]]) -> None:
+    """Mark each condition's occurrences up to ``max_id`` as notified."""
+    for start in range(0, len(pairs), _MARK_CHUNK):
+        chunk = pairs[start : start + _MARK_CHUNK]
+        await session.execute(
+            update(Alert)
+            .where(
+                Alert.notified.is_(False),
+                or_(
+                    *[
+                        and_(Alert.condition_id == cid, Alert.id <= max_id)
+                        for cid, max_id in chunk
+                    ]
+                ),
+            )
+            .values(notified=True)
+        )
+
+
+async def _throttled_condition_ids(
+    session, batches: list[_ConditionBatch], throttle_minutes: int
+) -> set[int]:
+    """Condition ids that were emailed inside the throttle window.
+
+    Throttle state is read from notified occurrence rows (P12) rather than
+    stored on the condition: rows are the record of what actually went out,
+    and the window (60 min) is orders of magnitude shorter than retention
+    (90 d), so the evidence is always there when it matters.
+    """
+    if throttle_minutes <= 0 or not batches:
+        return set()
+
+    cutoff = (datetime.now(UTC) - timedelta(minutes=throttle_minutes)).replace(tzinfo=None)
+    rows = (
+        await session.execute(
+            select(Alert.condition_id, func.max(Alert.created).label("last_notified_at"))
+            .where(
+                Alert.notified.is_(True),
+                Alert.condition_id.in_([b.condition_id for b in batches]),
+            )
+            .group_by(Alert.condition_id)
+        )
+    ).all()
+    return {
+        row.condition_id
+        for row in rows
+        if row.last_notified_at is not None
+        and row.last_notified_at.replace(tzinfo=None) > cutoff
+    }
+
+
+async def _deliver_immediate(
+    session,
+    batches: list[_ConditionBatch],
+    to_email: str,
+    from_email: str,
+    from_name: str,
+    throttle_minutes: int,
+    reopened_ids: set[int] | None = None,
+) -> dict:
+    """One email per category per sweep, enumerating that category's conditions."""
     stats = {"immediate_sent": 0, "immediate_throttled": 0}
     cfg = get_config()
-
-    if cfg.transport is None:
-        return stats
-
     environment = cfg.environment
 
+    # A reopen is a state change, not a repeat: it is never throttled by the
+    # emails sent about the episode that was closed out.
+    throttled = await _throttled_condition_ids(
+        session, batches, throttle_minutes
+    ) - (reopened_ids or set())
+    by_category: dict[str, list[_ConditionBatch]] = {}
+    for batch in batches:
+        if batch.condition_id in throttled:
+            stats["immediate_throttled"] += 1
+            continue
+        by_category.setdefault(batch.category, []).append(batch)
+
+    for category, included in by_category.items():
+        included.sort(key=lambda b: b.count, reverse=True)
+        worst = max(
+            (b.severity for b in included),
+            key=lambda s: {"critical": 3, "error": 2, "warn": 1}.get(s, 0),
+        )
+        total = sum(b.count for b in included)
+        headline = included[0].latest_message
+
+        subject = (
+            f"{_subject_prefix(environment)}"
+            f"[{worst.upper()}] {category}: {headline[:60]}"
+        )
+        message = AlertMessage(
+            subject=subject,
+            html_body=_render_immediate_email(
+                category=category,
+                severity=worst,
+                count=total,
+                conditions=included,
+                environment=environment,
+            ),
+            text_body=(
+                f"{_environment_text(environment)}"
+                f"{worst.upper()} — {category}: {len(included)} condition(s), "
+                f"{total} occurrence(s)\n"
+                + "".join(
+                    f"- #{b.condition_id} {b.template} ×{b.count}\n"
+                    for b in included[:_CONDITION_LIST_CAP]
+                )
+                + (
+                    f"- and {len(included) - _CONDITION_LIST_CAP} more\n"
+                    if len(included) > _CONDITION_LIST_CAP
+                    else ""
+                )
+            ),
+            severity=worst,
+            category=category,
+            alert_count=total,
+            environment=environment,
+        )
+
+        sent = cfg.transport.send(message, to=to_email, from_addr=from_email, from_name=from_name)
+
+        if sent:
+            await _mark_notified(session, [(b.condition_id, b.max_id) for b in included])
+            # Commit the mark NOW, per email. The transport has already
+            # delivered it; if the mark rode along to a single end-of-sweep
+            # commit, any later failure (another category's send, the digest
+            # queries, the commit itself) would roll it back and the next
+            # sweep would re-email a message the recipient already has — and,
+            # because the throttle window is computed from notified rows,
+            # re-email it IMMEDIATELY. A sent notification must be unlosable
+            # the moment it is sent.
+            await session.commit()
+            stats["immediate_sent"] += 1
+
+    stats.update(
+        await _deliver_immediate_legacy(
+            session, to_email, from_email, from_name, throttle_minutes, stats
+        )
+    )
+    return stats
+
+
+async def _deliver_immediate_legacy(
+    session,
+    to_email: str,
+    from_email: str,
+    from_name: str,
+    throttle_minutes: int,
+    stats: dict,
+) -> dict:
+    """The original category-grouped path, for occurrences with no condition.
+
+    Untouched in shape: an orphan occurrence is still delivered, still grouped
+    by category, still throttled by that category's last notified row. That is
+    what makes a fire-time resolution failure cost nothing but grouping (F1).
+    """
+    cfg = get_config()
+    environment = cfg.environment
     immediate_severities = [s.value for s in IMMEDIATE_SEVERITIES]
     throttle_cutoff = datetime.now(UTC) - timedelta(minutes=throttle_minutes)
 
-    # Subquery: latest notified alert per category (for throttle check)
     last_notified = (
         select(
             Alert.category.label("cat"),
             func.max(Alert.created).label("last_notified_at"),
         )
-        .where(Alert.notified.is_(True), Alert.severity.in_(immediate_severities))
+        .where(
+            Alert.notified.is_(True),
+            Alert.severity.in_(immediate_severities),
+            Alert.condition_id.is_(None),
+        )
         .group_by(Alert.category)
         .subquery("last_notified")
     )
 
-    # CTE: latest message per unnotified category
     ranked = (
         select(
             Alert.category,
@@ -140,20 +532,28 @@ async def _deliver_immediate(
             .over(partition_by=Alert.category, order_by=Alert.created.desc())
             .label("rn"),
         )
-        .where(Alert.notified.is_(False), Alert.severity.in_(immediate_severities))
+        .where(
+            Alert.notified.is_(False),
+            Alert.severity.in_(immediate_severities),
+            Alert.condition_id.is_(None),
+        )
         .cte("ranked")
     )
 
-    # Main query: unnotified categories with counts + throttle info in one pass
     query = (
         select(
             Alert.category,
             func.max(_SEVERITY_RANK).label("severity_rank"),
             func.count(Alert.id).label("count"),
+            func.max(Alert.id).label("max_id"),
             ranked.c.message.label("latest_message"),
             last_notified.c.last_notified_at,
         )
-        .where(Alert.notified.is_(False), Alert.severity.in_(immediate_severities))
+        .where(
+            Alert.notified.is_(False),
+            Alert.severity.in_(immediate_severities),
+            Alert.condition_id.is_(None),
+        )
         .outerjoin(last_notified, Alert.category == last_notified.c.cat)
         .outerjoin(
             ranked,
@@ -167,36 +567,34 @@ async def _deliver_immediate(
     )
 
     result = await session.execute(query)
-    categories = result.all()
+    out = {
+        "immediate_sent": stats["immediate_sent"],
+        "immediate_throttled": stats["immediate_throttled"],
+    }
 
-    for row in categories:
-        # Throttle: skip if notified recently.
-        # Normalize to naive UTC for comparison (some DBs return naive datetimes).
+    for row in result.all():
         if (
             throttle_minutes > 0
             and row.last_notified_at is not None
             and row.last_notified_at.replace(tzinfo=None) > throttle_cutoff.replace(tzinfo=None)
         ):
-            stats["immediate_throttled"] += 1
+            out["immediate_throttled"] += 1
             continue
 
         worst_severity = _RANK_TO_SEVERITY.get(row.severity_rank, AlertSeverity.ERROR.value)
         latest_msg = row.latest_message or ""
-        subject = (
-            f"{_subject_prefix(environment)}"
-            f"[{worst_severity.upper()}] {row.category}: {latest_msg[:60]}"
-        )
-        html = _render_immediate_email(
-            category=row.category,
-            severity=worst_severity,
-            count=row.count,
-            latest_message=latest_msg,
-            environment=environment,
-        )
-
         message = AlertMessage(
-            subject=subject,
-            html_body=html,
+            subject=(
+                f"{_subject_prefix(environment)}"
+                f"[{worst_severity.upper()}] {row.category}: {latest_msg[:60]}"
+            ),
+            html_body=_render_legacy_email(
+                category=row.category,
+                severity=worst_severity,
+                count=row.count,
+                latest_message=latest_msg,
+                environment=environment,
+            ),
             text_body=(
                 f"{_environment_text(environment)}"
                 f"{worst_severity.upper()} — {row.category}: "
@@ -217,38 +615,33 @@ async def _deliver_immediate(
                     Alert.category == row.category,
                     Alert.severity.in_(immediate_severities),
                     Alert.notified.is_(False),
+                    Alert.condition_id.is_(None),
+                    Alert.id <= row.max_id,
                 )
                 .values(notified=True)
             )
-            # Commit the mark NOW, per category. The transport has already
-            # delivered this email; if the mark rode along to a single
-            # end-of-sweep commit, any later failure (another category's
-            # send, the digest queries, the commit itself) would roll it
-            # back and the next sweep would re-email a message the
-            # recipient already has — and, because the throttle window is
-            # computed from notified rows, re-email it IMMEDIATELY. A sent
-            # notification must be unlosable the moment it is sent.
+            # Commit-per-send, same rule as above.
             await session.commit()
-            stats["immediate_sent"] += 1
+            out["immediate_sent"] += 1
 
-    return stats
+    return out
 
 
 async def _deliver_digest(
-    session, to_email: str, from_email: str, from_name: str
+    session,
+    batches: list[_ConditionBatch],
+    to_email: str,
+    from_email: str,
+    from_name: str,
 ) -> dict:
-    """Send periodic digest email for WARN alerts."""
+    """One digest email covering digest-dispositioned conditions and orphans."""
     stats = {"digest_sent": 0, "digest_count": 0}
     cfg = get_config()
-
-    if cfg.transport is None:
-        return stats
-
     environment = cfg.environment
 
     digest_severities = [s.value for s in DIGEST_SEVERITIES]
 
-    # CTE: latest message per unnotified warn category
+    # Orphan (no condition) warn occurrences still ride the legacy grouping.
     ranked = (
         select(
             Alert.category,
@@ -257,41 +650,60 @@ async def _deliver_digest(
             .over(partition_by=Alert.category, order_by=Alert.created.desc())
             .label("rn"),
         )
-        .where(Alert.notified.is_(False), Alert.severity.in_(digest_severities))
+        .where(
+            Alert.notified.is_(False),
+            Alert.severity.in_(digest_severities),
+            Alert.condition_id.is_(None),
+        )
         .cte("ranked_digest")
     )
-
-    # Unnotified warning categories with counts
-    result = await session.execute(
-        select(
-            Alert.category,
-            func.count(Alert.id).label("count"),
-            ranked.c.message.label("latest_message"),
+    legacy_rows = (
+        await session.execute(
+            select(
+                Alert.category,
+                func.count(Alert.id).label("count"),
+                func.max(Alert.id).label("max_id"),
+                ranked.c.message.label("latest_message"),
+            )
+            .where(
+                Alert.notified.is_(False),
+                Alert.severity.in_(digest_severities),
+                Alert.condition_id.is_(None),
+            )
+            .outerjoin(
+                ranked,
+                and_(Alert.category == ranked.c.category, ranked.c.rn == 1),
+            )
+            .group_by(Alert.category, ranked.c.message)
         )
-        .where(Alert.notified.is_(False), Alert.severity.in_(digest_severities))
-        .outerjoin(
-            ranked,
-            and_(Alert.category == ranked.c.category, ranked.c.rn == 1),
-        )
-        .group_by(Alert.category, ranked.c.message)
-    )
-    categories = result.all()
+    ).all()
 
-    if not categories:
+    rows: dict[str, _DigestRow] = {}
+    for batch in batches:
+        row = rows.setdefault(
+            batch.category, _DigestRow(batch.category, batch.latest_message, 0)
+        )
+        row.count += batch.count
+        row.latest_message = batch.latest_message
+    for legacy in legacy_rows:
+        row = rows.setdefault(
+            legacy.category, _DigestRow(legacy.category, legacy.latest_message or "", 0)
+        )
+        row.count += legacy.count
+
+    if not rows:
         return stats
 
+    categories = list(rows.values())
     total_count = sum(row.count for row in categories)
     stats["digest_count"] = total_count
 
-    subject = (
-        f"{_subject_prefix(environment)}[ALERT DIGEST] "
-        f"{total_count} warning(s) across {len(categories)} categorie(s)"
-    )
-    html = _render_digest_email(categories, environment=environment)
-
     message = AlertMessage(
-        subject=subject,
-        html_body=html,
+        subject=(
+            f"{_subject_prefix(environment)}[ALERT DIGEST] "
+            f"{total_count} warning(s) across {len(categories)} categorie(s)"
+        ),
+        html_body=_render_digest_email(categories, environment=environment),
         text_body=(
             f"{_environment_text(environment)}"
             f"Alert Digest: {total_count} warning(s) across {len(categories)} categories"
@@ -305,14 +717,18 @@ async def _deliver_digest(
     sent = cfg.transport.send(message, to=to_email, from_addr=from_email, from_name=from_name)
 
     if sent:
-        await session.execute(
-            update(Alert)
-            .where(
-                Alert.severity.in_(digest_severities),
-                Alert.notified.is_(False),
+        await _mark_notified(session, [(b.condition_id, b.max_id) for b in batches])
+        if legacy_rows:
+            await session.execute(
+                update(Alert)
+                .where(
+                    Alert.severity.in_(digest_severities),
+                    Alert.notified.is_(False),
+                    Alert.condition_id.is_(None),
+                    Alert.id <= max(r.max_id for r in legacy_rows),
+                )
+                .values(notified=True)
             )
-            .values(notified=True)
-        )
         # Same rule as immediate delivery: the digest email is out the door,
         # so its mark must not be able to roll back with the caller's
         # transaction. Commit it in place.
@@ -327,10 +743,66 @@ def _render_immediate_email(
     category: str,
     severity: str,
     count: int,
+    conditions: list[_ConditionBatch],
+    environment: str | None = None,
+) -> str:
+    """Render HTML for a category email listing its conditions."""
+    color = "#dc3545" if severity == AlertSeverity.CRITICAL else "#fd7e14"
+    cell = "padding: 8px; border-bottom: 1px solid #eee;"
+    listed = conditions[:_CONDITION_LIST_CAP]
+    rows = "".join(
+        f"""
+        <tr>
+            <td style="{cell}">#{c.condition_id}</td>
+            <td style="{cell}">{c.template}</td>
+            <td style="{cell} text-align: center;">{c.count}</td>
+        </tr>
+        """
+        for c in listed
+    )
+    remainder = len(conditions) - len(listed)
+    more = (
+        f'<p style="color: #666;">…and {remainder} more condition(s) in this category.</p>'
+        if remainder > 0
+        else ""
+    )
+    return f"""
+    <div style="font-family: sans-serif; max-width: 600px;">{_environment_html(environment)}
+        <h2 style="color: {color};">
+            {severity.upper()} Alert — {category}
+        </h2>
+        <table style="border-collapse: collapse; width: 100%;">
+            <thead>
+                <tr style="background: #f8f9fa;">
+                    <th style="padding: 8px; text-align: left;">Condition</th>
+                    <th style="padding: 8px; text-align: left;">What is wrong</th>
+                    <th style="padding: 8px; text-align: center;">New</th>
+                </tr>
+            </thead>
+            <tbody>
+                {rows}
+            </tbody>
+        </table>
+        {more}
+        <table style="border-collapse: collapse; margin-top: 12px;">
+            <tr><td style="padding: 4px 12px 4px 0; color: #666;">Category:</td>
+                <td>{category}</td></tr>
+            <tr><td style="padding: 4px 12px 4px 0; color: #666;">Occurrences:</td>
+                <td>{count}</td></tr>
+        </table>
+    </div>
+    """
+
+
+def _render_legacy_email(
+    *,
+    category: str,
+    severity: str,
+    count: int,
     latest_message: str,
     environment: str | None = None,
 ) -> str:
-    """Render HTML for an individual category alert email."""
+    """Render HTML for a category email of condition-less occurrences."""
     color = "#dc3545" if severity == AlertSeverity.CRITICAL else "#fd7e14"
     return f"""
     <div style="font-family: sans-serif; max-width: 600px;">{_environment_html(environment)}

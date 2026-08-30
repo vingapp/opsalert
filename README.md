@@ -10,6 +10,8 @@ Application code needs to report operational problems — failed API calls, unex
 - Works from both async (FastAPI) and sync (Celery) contexts
 - Auto-enriches every alert with caller location, active exception info, and Celery task context
 - Stores structured data for dashboard display and programmatic triage
+- Groups occurrences into **conditions** — the recurring problem behind them — with
+  a lifecycle somebody can act on (acknowledge, resolve, collect)
 - Delivers notifications via pluggable transports (email, webhook, log)
 
 ## Installation
@@ -22,9 +24,11 @@ Requires Python 3.11+ and SQLAlchemy 2.0+. No other runtime dependencies.
 
 ## Quick Start
 
-### 1. Create the table
+### 1. Create the tables
 
-opsalert owns a single database table. Create it via your migration tool or directly:
+opsalert owns two database tables — `opsalert` (one row per occurrence) and
+`alert_condition` (one row per recurring problem). Create them via your migration
+tool, or with `opsalert.ensure_tables(engine)`:
 
 ```sql
 CREATE TABLE opsalert (
@@ -35,7 +39,33 @@ CREATE TABLE opsalert (
     message VARCHAR(500) NOT NULL,
     context_json TEXT,
     notified BOOLEAN NOT NULL DEFAULT 0,
+    condition_id INTEGER NULL REFERENCES alert_condition (id),
     created DATETIME NOT NULL
+);
+
+CREATE TABLE alert_condition (
+    id INTEGER NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    signature_key VARCHAR(64) NOT NULL UNIQUE,
+    category VARCHAR(100) NOT NULL,
+    source VARCHAR(100),
+    environment VARCHAR(50),
+    message_template VARCHAR(500) NOT NULL,
+    status VARCHAR(12) NOT NULL DEFAULT 'new',
+    disposition VARCHAR(12),
+    severity VARCHAR(10) NOT NULL,
+    latest_severity VARCHAR(10),
+    issue_url VARCHAR(500),
+    resolved_by VARCHAR(100),
+    notes TEXT,
+    acknowledged_at DATETIME, acknowledged_by VARCHAR(100), status_changed_at DATETIME,
+    resolved_at DATETIME, closed_at DATETIME,
+    first_seen DATETIME, last_seen DATETIME,
+    occurrence_count INTEGER NOT NULL DEFAULT 0,
+    reopened_count INTEGER NOT NULL DEFAULT 0,
+    median_interval_seconds INTEGER,
+    stats_synced_through INTEGER NOT NULL DEFAULT 0,
+    created DATETIME NOT NULL,
+    updated DATETIME NOT NULL
 );
 
 CREATE INDEX ix_opsalert_cat_created ON opsalert (category, created);
@@ -43,6 +73,10 @@ CREATE INDEX ix_opsalert_cat_msg ON opsalert (category, message);
 CREATE INDEX ix_opsalert_notified_sev ON opsalert (notified, severity, category);
 CREATE INDEX ix_opsalert_cat_notified_created ON opsalert (category, notified, created);
 CREATE INDEX ix_opsalert_created ON opsalert (created);
+CREATE INDEX ix_opsalert_condition ON opsalert (condition_id, id);
+CREATE INDEX ix_alert_condition_env_status ON alert_condition (environment, status);
+CREATE INDEX ix_alert_condition_env_category ON alert_condition (environment, category);
+CREATE INDEX ix_alert_condition_status_last_seen ON alert_condition (status, last_seen);
 ```
 
 For Alembic integration, add `OpsAlertBase.metadata` to your `target_metadata`:
@@ -74,7 +108,20 @@ opsalert.error("import_pipeline", message="Row 42 failed", source="contacts", co
 opsalert.critical("startup_failure", message="DB pool exhausted")
 ```
 
-That's it. Each call creates one row in the `opsalert` table. If `configure()` hasn't been called (e.g., in a test suite), calls silently no-op.
+That's it. Each call creates one row in the `opsalert` table and links it to the
+condition it is an instance of. If `configure()` hasn't been called (e.g., in a test
+suite), calls silently no-op.
+
+Pass `params` when the message has variable parts, and the condition's identity
+becomes exact instead of guessed from the text:
+
+```python
+opsalert.error(
+    "request_anomaly",
+    message="PUT {route} exceeded its budget",   # the template IS the identity
+    params={"route": "/api/view/shares/abc123/"},  # stored message is rendered
+)
+```
 
 ## Configuration
 
@@ -122,6 +169,13 @@ opsalert.configure(
     # the current value or None to fall back to the static default.
     # Use this to make settings configurable without restarts.
     get_setting=my_settings_resolver,
+
+    # Optional: () -> (trace_id, trace_origin) for the current execution context.
+    trace_provider=my_trace_provider,
+
+    # Optional: () -> (user_id, org_id) for whoever the current request belongs
+    # to. Failures are swallowed — attribution never costs an alert.
+    identity_provider=my_identity_provider,
 )
 ```
 
@@ -149,9 +203,9 @@ opsalert.configure(get_setting=resolve_setting, ...)
 Three severity levels, identical signatures:
 
 ```python
-opsalert.warn(category, *, message, source=None, context=None)
-opsalert.error(category, *, message, source=None, context=None)
-opsalert.critical(category, *, message, source=None, context=None)
+opsalert.warn(category, *, message, source=None, context=None, params=None)
+opsalert.error(category, *, message, source=None, context=None, params=None)
+opsalert.critical(category, *, message, source=None, context=None, params=None)
 ```
 
 | Parameter | Type | Description |
@@ -160,6 +214,7 @@ opsalert.critical(category, *, message, source=None, context=None)
 | `message` | `str` | Specific sub-type (e.g., `"SendGrid 429"`, `"GET /api/users/"`). Used for Level 2 grouping. |
 | `source` | `str \| None` | Where the alert originated (e.g., `"email"`, `"api"`, `"celery"`). |
 | `context` | `dict \| None` | Arbitrary structured data. Serialized as JSON. |
+| `params` | `dict \| None` | Values for a `str.format`-style `message` template. With `params`, the raw template is the condition's identity and the stored message is the rendered text. A missing key renders as its own placeholder — it never raises. |
 
 ### Severity Levels
 
@@ -181,6 +236,8 @@ Every alert's `context` dict is automatically enriched with underscore-prefixed 
 | `_traceback` | Formatted traceback (truncated to 2000 chars) |
 | `_task_name` | Celery task name (if running inside a Celery task) |
 | `_task_id` | Celery task ID |
+| `_trace_id`, `_trace_origin` | From the configured `trace_provider`, if any |
+| `_user_id`, `_org_id` | From the configured `identity_provider`, if any |
 
 ### Async/Sync Detection
 
@@ -285,7 +342,14 @@ opsalert provides two delivery functions that your scheduler calls periodically.
 ```python
 # Call from your scheduler (e.g., every 5 minutes)
 stats = await opsalert.deliver_alerts(session)
-# Returns: {"immediate_sent": 2, "immediate_throttled": 1, "digest_sent": 1, "digest_count": 15}
+# {"immediate_sent": 2, "immediate_throttled": 1, "digest_sent": 1,
+#  "digest_count": 15, "reopened": 1, "collected": 3, "skipped": 0}
+
+# Maintenance: fold occurrences into their conditions, then run the rules.
+await opsalert.sync_condition_stats(session)
+# {"adopted": 0, "conditions_updated": 4, "occurrences_counted": 12}
+await opsalert.apply_lifecycle_rules(session)
+# {"reopened": 0, "auto_closed": 1, "auto_staled": 0}
 
 stats = await opsalert.cleanup_alerts(session)
 # Returns: {"deleted": 42}
@@ -293,19 +357,115 @@ stats = await opsalert.cleanup_alerts(session)
 
 ### Delivery Behavior
 
-**Immediate** (ERROR + CRITICAL):
-- One email per unnotified category
-- Throttled: won't re-send for the same category within `delivery_throttle_minutes`
-- Single query with LEFT JOIN for throttle check (no N+1)
+Delivery is decided per CONDITION, and it decides using only what it can see at
+the moment it runs — it never assumes the maintenance sweep ran first.
 
-**Digest** (WARN):
-- All unnotified warnings batched into one email
-- Sent on each scheduler invocation if any exist
+1. **Reopen first.** Any unnotified occurrence on a `resolved`/`closed` condition
+   reopens it (status → `new`, `reopened_count` + 1) BEFORE any gating, and that
+   condition then emails immediately whatever its disposition says. A recurrence
+   of something you thought was fixed can never be swallowed by the state you
+   left it in.
+2. **Then route by effective disposition** (explicit override, else derived from
+   severity — error/critical → `immediate`, warn → `digest`):
+   - `collect` — occurrences are marked notified, no email. Recorded, not announced.
+   - `digest` — batched into the periodic digest.
+   - `immediate` — throttled per condition, then grouped into ONE email per
+     category per sweep whose body enumerates that category's conditions
+     (10 listed, then "and N more").
+   - An `acknowledged` condition gets the digest at most: somebody is already on
+     it, and its occurrences keep accruing regardless.
+3. **Occurrences with no condition** (a fire-time resolution failure, or rows
+   older than conditions) are delivered by the original category-grouped path,
+   unchanged.
+
+The throttle is per condition, not per category, so a noisy condition can no
+longer shadow a brand-new one that shares its category. Throttle state is read
+from notified occurrence rows, and every transport-accepted send commits its
+notified-marks before the next send — a delivered email's mark cannot roll back.
 
 **Cleanup:**
-- Deletes alerts older than `retention_max_age_days`
+- Deletes occurrences older than `retention_max_age_days` — but only once they
+  are provably counted (`id <= its condition's stats_synced_through`). Counters
+  outlive the rows they were computed from; a row the sweeper has not folded in
+  yet simply waits.
+- Occurrences with no condition are deleted on age alone.
+- Conditions are never auto-deleted. An untriaged condition silent for 30 days
+  auto-closes, and a recurrence reopens it.
 
-Both functions mark processed alerts as `notified=True` so they aren't re-sent.
+## Conditions and lifecycle
+
+An occurrence is one `opsalert.error(...)` call. A **condition** is the recurring
+problem those occurrences are instances of — identified by
+`hash(category, source, environment, message_template)`, where the template is
+either the caller's explicit `params` template or one derived from the message
+by a conservative normalizer (numbers, uuids, long hex ids, quoted strings and
+timestamps become placeholders; a multi-line message collapses to its first line).
+
+Environment is part of the identity: the same failure in staging and in
+production is two conditions, so resolving the staging one never silences
+production.
+
+`status` and `disposition` are orthogonal:
+
+| `status` | Meaning |
+|----------|---------|
+| `new` | Untriaged. On the attention line if its disposition is `immediate`. |
+| `acknowledged` | Somebody has it. Leaves the attention line and immediate email; digest at most. Occurrences keep accruing. |
+| `resolved` | Believed fixed. Auto-closes after `max(6h, 10 × median interval)` of silence. |
+| `closed` | Done. A recurrence reopens it. |
+
+| `disposition` | Meaning |
+|---------------|---------|
+| `NULL` | Derive from severity: error/critical → immediate, warn → digest. |
+| `immediate` | Email as soon as it fires (throttled). |
+| `digest` | Periodic digest only. |
+| `collect` | Record occurrences, never email. ("wontfix" = acknowledged + collect + a note.) |
+
+```python
+await opsalert.set_status(session, condition_id, "acknowledged", actor="chris")
+await opsalert.set_status(
+    session, condition_id, "resolved", actor="chris",
+    issue_url="https://github.com/org/repo/pull/144",
+)
+await opsalert.set_disposition(session, condition_id, "collect", actor="chris")
+```
+
+Transitions are validated (`closed → resolved` raises `ValueError`) and stamped:
+`acknowledged_at`/`acknowledged_by`, `resolved_at`/`resolved_by`, `closed_at`,
+`status_changed_at`.
+
+### Condition queries
+
+```python
+items, total, aggregates = await opsalert.query_conditions(
+    session, status="new", severity=None, category=None, search=None,
+    sort="-last_seen", limit=50, offset=0,
+)
+# aggregates: {"byStatus": {...}, "bySeverity": {...}}  — env-scoped
+
+result = await opsalert.query_attention(session, cursor=last_cursor)
+# {"conditions": [{"id", "severity", "category", "template", "occurrence_count",
+#                  "count_since_cursor", "last_seen", "reopened"}], "cursor": 1234}
+
+occurrences, total = await opsalert.query_occurrences(session, condition_id=7)
+```
+
+`query_attention` is the watchdog's view: only `new` conditions whose effective
+disposition is `immediate`, and — with a cursor — only those that have fired
+since it. Nothing new means an empty list and the same cursor. Without a cursor
+it returns the current attention set plus a fresh cursor, never a flood of
+history. `query_next_fix` likewise skips occurrences whose condition is
+acknowledged, resolved or closed.
+
+### Failure behaviour
+
+Condition resolution runs in a short-lived session of its own (or, where no
+isolated session exists, inside a `SAVEPOINT` on the caller's session), so its
+row lock is never held across the caller's work. Any failure — deadlock, pool
+exhaustion, a broken factory — stores the occurrence with `condition_id = NULL`
+and returns normally. The maintenance sweep adopts orphans on an unbounded
+`condition_id IS NULL` scan, and delivery still emails them via the legacy
+category path. Conditionization can fail; an alert cannot be lost to it.
 
 ## Transports
 
@@ -380,7 +540,9 @@ class PagerDutyTransport(Transport):
 
 ## Database Model
 
-Single table `opsalert`, owned entirely by the package:
+Two tables, owned entirely by the package.
+
+### `opsalert` — occurrences
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -391,9 +553,30 @@ Single table `opsalert`, owned entirely by the package:
 | `message` | `varchar(500)` | Specific sub-type for Level 2 grouping |
 | `context_json` | `text` | JSON-serialized structured data (nullable) |
 | `notified` | `bool` | Whether delivery has been sent for this alert |
+| `condition_id` | `int \| None` | The condition this is an instance of. NULL = orphan (resolution failed, or the row predates conditions) — never an error, never a reason to drop the occurrence. |
 | `created` | `datetime(tz)` | UTC timestamp, auto-set on creation |
 
-Alerts are write-once. No `modified` column — only the `notified` flag is ever updated.
+Alerts are write-once. Only `notified` and `condition_id` are ever updated.
+
+### `alert_condition` — the problems behind them
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | `int` | Primary key — the handle operators use |
+| `signature_key` | `varchar(64)` | `sha256(category, source, environment, template)`, unique |
+| `category`, `source`, `environment` | | Identity fields, copied for querying |
+| `message_template` | `varchar(500)` | The template that identifies the problem |
+| `status` | `varchar(12)` | `new`, `acknowledged`, `resolved`, `closed` |
+| `disposition` | `varchar(12)` | `immediate`, `digest`, `collect`, or NULL (derive from severity) |
+| `severity` | `varchar(10)` | Worst severity ever seen |
+| `latest_severity` | `varchar(10)` | Severity of the most recent occurrence |
+| `issue_url`, `resolved_by`, `notes` | | The human resolution record |
+| `acknowledged_at`, `acknowledged_by`, `status_changed_at`, `resolved_at`, `closed_at` | `datetime(tz)` | Audit stamps |
+| `first_seen`, `last_seen` | `datetime(tz)` | Maintained by the stats sweep; survive pruning |
+| `occurrence_count`, `reopened_count` | `int` | Ditto |
+| `median_interval_seconds` | `int \| None` | Median gap over the last ≤50 occurrences; drives auto-close |
+| `stats_synced_through` | `int` | Highest occurrence id folded into the counters. Cleanup may only delete at or below it. |
+| `created`, `updated` | `datetime(tz)` | |
 
 ### Indexes
 
@@ -404,6 +587,10 @@ Alerts are write-once. No `modified` column — only the `notified` flag is ever
 | `ix_opsalert_notified_sev` | notified, severity, category | Delivery sweeper |
 | `ix_opsalert_cat_notified_created` | category, notified, created | Batch throttle check |
 | `ix_opsalert_created` | created | Cleanup sweeper |
+| `ix_admin_alert_condition` | condition_id, id | Condition drill-down, watermark scan, orphan adoption |
+| `ix_alert_condition_env_status` | environment, status | Conditions list / attention |
+| `ix_alert_condition_env_category` | environment, category | Category facet |
+| `ix_alert_condition_status_last_seen` | status, last_seen | Lifecycle sweeps |
 
 ### Alembic Integration
 
@@ -419,7 +606,8 @@ target_metadata = [Base.metadata, OpsAlertBase.metadata]
 
 ## Testing
 
-opsalert ships with 77 tests that run against an in-memory SQLite database:
+opsalert ships with a test suite that runs against an in-memory SQLite database
+(the signature tests are pinned to real production messages):
 
 ```bash
 pip install opsalert[dev]
@@ -458,13 +646,15 @@ def test_fires_alert(mock_alert):
 opsalert/
     __init__.py        Public API re-exports
     _config.py         OpsAlertConfig dataclass, configure(), get_config()
+    signature.py       Condition identity: normalize_message(), condition_signature()
+    lifecycle.py       sync_condition_stats(), apply_lifecycle_rules(), set_status()
     _dispatch.py       warn/error/critical — fire-and-forget entry points
     _enrichment.py     Auto-capture caller, exception, Celery task info
-    model.py           Alert SQLAlchemy model (own DeclarativeBase)
-    store.py           fire_alert() — single INSERT per call
-    query.py           Dashboard selectors, next-fix, aggregates, delete
-    delivery.py        Batched email delivery with throttling
-    cleanup.py         TTL-based deletion
+    model.py           Alert + AlertCondition models (own DeclarativeBase)
+    store.py           fire_alert() + condition resolution (isolated / SAVEPOINT)
+    query.py           Dashboard selectors, conditions, attention, next-fix, delete
+    delivery.py        Condition-gated email delivery with per-condition throttling
+    cleanup.py         Watermark-gated TTL deletion
     transport.py       Transport ABC + CallableTransport, WebhookTransport, LogTransport
     types.py           AlertSeverity enum, AlertMessage dataclass
 ```

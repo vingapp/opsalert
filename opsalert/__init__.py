@@ -13,23 +13,41 @@ Usage::
     opsalert.warn("sendgrid_delivery", message="SendGrid 429", source="email")
     opsalert.error("sendgrid_delivery", message="SendGrid 500", source="email")
     opsalert.critical("startup_failure", message="DB pool exhausted")
+
+    # Structured emission: the message is a template, params are its values,
+    # and the template is the alert condition's identity.
+    opsalert.error(
+        "request_anomaly",
+        message="{method} {route} exceeded its budget",
+        params={"method": "PUT", "route": "/api/view/shares/{stub}/"},
+    )
 """
 from opsalert._config import configure, get_config, reset_config
 from opsalert._dispatch import critical, error, warn
 from opsalert.cleanup import cleanup_alerts
 from opsalert.delivery import deliver_alerts
-from opsalert.model import Alert, OpsAlertBase
+from opsalert.lifecycle import (
+    apply_lifecycle_rules,
+    effective_disposition,
+    set_disposition,
+    set_status,
+    sync_condition_stats,
+)
+from opsalert.model import Alert, AlertCondition, OpsAlertBase
 from opsalert.query import (
     delete_batch,
     delete_by_category,
     delete_by_id,
     query_aggregates,
+    query_attention,
     query_by_trace_id,
     query_categories,
+    query_conditions,
     query_messages,
     query_next_fix,
     query_occurrences,
 )
+from opsalert.signature import condition_signature, normalize_message
 from opsalert.store import fire_alert
 from opsalert.transport import CallableTransport, LogTransport, Transport, WebhookTransport
 from opsalert.types import DIGEST_SEVERITIES, IMMEDIATE_SEVERITIES, AlertMessage, AlertSeverity
@@ -63,6 +81,8 @@ __all__ = [
     "query_by_trace_id",
     "query_aggregates",
     "query_next_fix",
+    "query_conditions",
+    "query_attention",
     # Delete API
     "delete_batch",
     "delete_by_category",
@@ -70,6 +90,14 @@ __all__ = [
     # Sweeper entry points
     "deliver_alerts",
     "cleanup_alerts",
+    "sync_condition_stats",
+    "apply_lifecycle_rules",
+    # Condition lifecycle
+    "set_status",
+    "set_disposition",
+    "effective_disposition",
+    "condition_signature",
+    "normalize_message",
     # Transport
     "Transport",
     "CallableTransport",
@@ -77,6 +105,7 @@ __all__ = [
     "WebhookTransport",
     # Model (for Alembic integration)
     "Alert",
+    "AlertCondition",
     "OpsAlertBase",
     # Types
     "AlertSeverity",

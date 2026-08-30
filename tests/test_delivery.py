@@ -95,7 +95,12 @@ class TestDeliverImmediate:
         assert alert.notified is True
 
     async def test_throttles_recently_notified(self, session, session_factory):
-        """Skips category if notified within throttle window."""
+        """Skips a condition that was emailed inside the throttle window.
+
+        The throttle is per CONDITION now, not per category: a category-wide
+        throttle would let a chatty condition shadow a brand-new one that has
+        never been emailed at all.
+        """
         transport = _TrackingTransport()
         opsalert.configure(
             session_factory=session_factory,
@@ -105,23 +110,54 @@ class TestDeliverImmediate:
             delivery_throttle_minutes=60,
         )
 
-        # Create an already-notified alert (recent)
-        alert = Alert(
-            severity="error",
-            category="cat",
-            message="old",
-            notified=True,
-            created=datetime.now(UTC) - timedelta(minutes=5),
-        )
-        session.add(alert)
+        # An occurrence of this condition was emailed five minutes ago.
+        emailed = await fire_alert(session, severity="error", category="cat", message="boom")
+        emailed.notified = True
+        emailed.created = datetime.now(UTC) - timedelta(minutes=5)
 
-        # Create a new unnotified alert
-        await fire_alert(session, severity="error", category="cat", message="new")
+        # The same condition fires again.
+        await fire_alert(session, severity="error", category="cat", message="boom")
         await session.commit()
 
         stats = await deliver_alerts(session)
         assert stats["immediate_throttled"] == 1
         assert stats["immediate_sent"] == 0
+
+    async def test_new_condition_is_not_shadowed_by_a_throttled_sibling(
+        self, session, session_factory
+    ):
+        """A never-emailed condition goes out even when a category-mate is throttled.
+
+        This is the whole point of moving the throttle down to the condition:
+        under the old category-level rule, one noisy condition silenced every
+        new problem that happened to share its category.
+        """
+        transport = _TrackingTransport()
+        opsalert.configure(
+            session_factory=session_factory,
+            transport=transport,
+            delivery_to_email="ops@test.com",
+            delivery_from_email="alert@test.com",
+            delivery_throttle_minutes=60,
+        )
+
+        noisy = await fire_alert(session, severity="error", category="cat", message="known boom")
+        noisy.notified = True
+        noisy.created = datetime.now(UTC) - timedelta(minutes=5)
+        await fire_alert(session, severity="error", category="cat", message="known boom")
+        await fire_alert(
+            session, severity="error", category="cat", message="never seen before"
+        )
+        await session.commit()
+
+        stats = await deliver_alerts(session)
+        await session.commit()
+
+        assert stats["immediate_sent"] == 1
+        assert stats["immediate_throttled"] == 1
+        body = transport.sent[0].text_body
+        assert "never seen before" in body
+        assert "known boom" not in body
 
     async def test_does_not_throttle_old_notifications(self, session, session_factory):
         """Sends if last notification was outside the throttle window."""
@@ -134,17 +170,12 @@ class TestDeliverImmediate:
             delivery_throttle_minutes=60,
         )
 
-        # Old notified alert (outside throttle window)
-        alert = Alert(
-            severity="error",
-            category="cat",
-            message="old",
-            notified=True,
-            created=datetime.now(UTC) - timedelta(hours=2),
-        )
-        session.add(alert)
+        # Same condition, emailed two hours ago — outside the window.
+        emailed = await fire_alert(session, severity="error", category="cat", message="boom")
+        emailed.notified = True
+        emailed.created = datetime.now(UTC) - timedelta(hours=2)
 
-        await fire_alert(session, severity="error", category="cat", message="new")
+        await fire_alert(session, severity="error", category="cat", message="boom")
         await session.commit()
 
         stats = await deliver_alerts(session)

@@ -13,7 +13,7 @@ from sqlalchemy import select
 import opsalert
 from opsalert.delivery import (
     _render_digest_email,
-    _render_immediate_email,
+    _render_legacy_email,
     _subject_prefix,
     deliver_alerts,
 )
@@ -113,7 +113,8 @@ async def test_digest_subject_unchanged_without_an_environment(session, session_
 
 
 def test_immediate_body_opens_with_the_environment():
-    html = _render_immediate_email(
+    # The orphan (no-condition) body — the one pinned byte-for-byte below.
+    html = _render_legacy_email(
         category="import_pipeline",
         severity="error",
         count=3,
@@ -161,13 +162,13 @@ def test_unconfigured_environment_renders_byte_identical_bodies():
     kwargs = dict(
         category="import_pipeline", severity="error", count=3, latest_message="Row 42 failed"
     )
-    assert _render_immediate_email(**kwargs) == _render_immediate_email(
+    assert _render_legacy_email(**kwargs) == _render_legacy_email(
         **kwargs, environment=None
     )
     # Golden: the exact pre-change body, character for character. A substring
     # check would pass on a body that merely gained a blank line where the
     # environment paragraph goes; this fails on it.
-    assert _render_immediate_email(**kwargs) == """
+    assert _render_legacy_email(**kwargs) == """
     <div style="font-family: sans-serif; max-width: 600px;">
         <h2 style="color: #fd7e14;">
             ERROR Alert \u2014 import_pipeline
