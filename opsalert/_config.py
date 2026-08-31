@@ -40,6 +40,10 @@ class OpsAlertConfig:
     delivery_throttle_minutes: int = 60
     delivery_digest_interval_minutes: int = 360
     retention_max_age_days: int = 90
+    # A condition with zero occurrences (a degraded fire's leftover — see
+    # opsalert#2) is reaped once older than this. Minutes, not days: the row
+    # holds no history, the delay only shields in-flight fires.
+    condition_empty_reap_minutes: int = 60
 
     # Optional runtime settings resolver: (key: str) → value | None
     get_setting: Callable[[str], Any] | None = None

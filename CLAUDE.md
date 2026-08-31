@@ -18,7 +18,9 @@ For users-of-uptake guidance see `~/CLAUDE.md`. The repo README has the contract
     pruned on a retention clock.
   - `alert_condition` — one row per **condition**, the recurring problem those
     occurrences are instances of. Carries the state a human cares about (status,
-    disposition, issue url, counters) and is never auto-deleted.
+    disposition, issue url, counters) and is never auto-deleted once it has
+    had an occurrence (a zero-occurrence leftover of a degraded fire is
+    reaped — opsalert#2).
 - `tests/` — pytest, `asyncio_mode = "auto"`
 
 ## Hard contract (do not break)

@@ -26,6 +26,14 @@ from opsalert.signature import condition_signature, normalize_message, render_te
 
 logger = logging.getLogger(__name__)
 
+# Reserved context key carrying the emit-time template on the occurrence row.
+# A params emission's identity is the raw template, and the occurrence stores
+# only the RENDERED text — so when condition resolution degrades (F1), the
+# adoption sweeper would otherwise have to guess the template back out of the
+# rendered message, guess differently, and fork a second condition
+# (opsalert#2). Rides ``context_json`` the same way ``_trace_id`` does.
+TEMPLATE_CONTEXT_KEY = "_message_template"
+
 # ``Alert.context_json`` is MySQL TEXT — 65535 *bytes*, not characters. An
 # oversized context used to raise DataError 1406 mid-flush, which loses the
 # whole alert: the record explaining what went wrong is dropped precisely when
@@ -357,6 +365,12 @@ async def fire_alert(
     stamped = stamp_environment(context)
     rendered = render_template(message, params)
     template = message if params else normalize_message(message)
+    if params:
+        # Persist the identity the emit path used, so an orphaned occurrence
+        # (F1) is adopted under EXACTLY this condition and never a fork. The
+        # no-params case needs nothing: the stored message IS the message the
+        # sweeper normalizes, so it reproduces the same template.
+        stamped = {**(stamped or {}), TEMPLATE_CONTEXT_KEY: template}
 
     condition_id = await resolve_condition_id(
         session,

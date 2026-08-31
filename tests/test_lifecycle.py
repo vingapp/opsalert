@@ -227,6 +227,107 @@ class TestOrphanAdoption:
         assert stats["adopted"] == 1
 
 
+class TestAdoptionIdentity:
+    """opsalert#2: an adopted orphan must land under the EMIT path's identity.
+
+    Emit time uses the raw template as identity when ``params`` is passed;
+    the occurrence row stores only the rendered text. Adoption must reuse the
+    template the fire persisted on the row — normalizing the rendered message
+    instead forks a second, permanently-empty condition.
+    """
+
+    async def test_degraded_params_fire_is_adopted_into_the_emit_condition(
+        self, session, engine, monkeypatch
+    ):
+        """The headline: attachment degrades AFTER the condition committed.
+
+        The sabotaged factory commits the condition and then blows up, which
+        is F1's worst shape: the emit-identity condition exists (×0), and the
+        occurrence is stored as an orphan. The sweep must adopt the orphan
+        into THAT condition — one condition, populated — never mint a second
+        one from the rendered message.
+        """
+        from contextlib import asynccontextmanager
+
+        from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+        from opsalert import store
+        from opsalert.store import fire_alert
+
+        maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+        class _DropsAfterCommit:
+            """Session whose connection 'dies' right after a successful commit."""
+
+            def __init__(self, inner):
+                self._inner = inner
+
+            def __getattr__(self, name):
+                return getattr(self._inner, name)
+
+            async def commit(self):
+                await self._inner.commit()
+                raise RuntimeError("connection dropped after commit")
+
+        @asynccontextmanager
+        async def sabotaged_factory():
+            async with maker() as inner:
+                yield _DropsAfterCommit(inner)
+
+        # Report a non-SQLite dialect so the isolated-session branch runs
+        # (the same device the store's degradation tests use).
+        monkeypatch.setattr(store, "_dialect_name", lambda _s: "postgresql")
+        import opsalert
+
+        opsalert.configure(session_factory=sabotaged_factory)
+
+        template = "PUT /api/view/shares/{stub}/ exceeded its budget"
+        alert = await fire_alert(
+            session,
+            severity="error",
+            category="request_anomaly",
+            message=template,
+            params={"stub": "ChFICzP9VHlILNzd"},
+        )
+        await session.commit()
+        assert alert.condition_id is None  # attachment degraded (F1)
+        # The emit-identity condition committed before the "connection died".
+        assert len((await session.execute(select(AlertCondition))).scalars().all()) == 1
+
+        stats = await sync_condition_stats(session)
+        await session.commit()
+
+        assert stats["adopted"] == 1
+        condition = (await session.execute(select(AlertCondition))).scalar_one()
+        assert condition.message_template == template
+        assert condition.occurrence_count == 0  # counted later, past the lag
+        orphan = (await session.execute(select(Alert))).scalar_one()
+        assert orphan.condition_id == condition.id
+
+    async def test_old_style_orphan_falls_back_to_the_normalized_message(
+        self, session
+    ):
+        """A row that predates the stored template still adopts, by normalizer."""
+        from opsalert.signature import normalize_message
+
+        session.add(
+            Alert(
+                severity="error",
+                category="cat",
+                message="boom 123",
+                created=datetime.now(UTC) - LONG_AGO,
+            )
+        )
+        await session.commit()
+
+        stats = await sync_condition_stats(session)
+        await session.commit()
+
+        assert stats["adopted"] == 1
+        condition = (await session.execute(select(AlertCondition))).scalar_one()
+        assert condition.message_template == normalize_message("boom 123") == "boom <n>"
+
+
 class TestAutomaticRules:
     async def _resolved_condition(self, session, *, silent_for, median=None):
         now = datetime.now(UTC)

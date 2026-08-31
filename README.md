@@ -389,8 +389,12 @@ notified-marks before the next send — a delivered email's mark cannot roll bac
   outlive the rows they were computed from; a row the sweeper has not folded in
   yet simply waits.
 - Occurrences with no condition are deleted on age alone.
-- Conditions are never auto-deleted. An untriaged condition silent for 30 days
-  auto-closes, and a recurrence reopens it.
+- Conditions that ever had an occurrence are never auto-deleted. An untriaged
+  condition silent for 30 days auto-closes, and a recurrence reopens it.
+- A condition with ZERO occurrences — the leftover of a fire whose attachment
+  degraded (opsalert#2) — is reaped once older than
+  `condition_empty_reap_minutes` (default 60), provided it is untriaged and
+  unannotated. It records nothing, so nothing is lost.
 
 ## Conditions and lifecycle
 

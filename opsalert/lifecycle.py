@@ -21,7 +21,7 @@ from sqlalchemy import case, func, select, update
 
 from opsalert.model import Alert, AlertCondition
 from opsalert.signature import condition_signature, normalize_message
-from opsalert.store import _lookup_or_create
+from opsalert.store import TEMPLATE_CONTEXT_KEY, _lookup_or_create
 from opsalert.types import AlertSeverity
 
 logger = logging.getLogger(__name__)
@@ -205,8 +205,17 @@ async def _adopt_orphans(session, *, now: datetime, batch_size: int = 500) -> in
         for row in rows:
             last_id = row.id
             try:
-                environment = _environment_from_context(row.context_json)
-                template = normalize_message(row.message or "")
+                context = _context_dict(row.context_json)
+                environment = _context_str(context, "environment")
+                # A params emission stored its emit-time template on the row
+                # (opsalert#2): reuse it VERBATIM, so the orphan lands under
+                # the same identity the fire path would have produced.
+                # Normalizing the rendered message is only for old rows that
+                # never carried one — and for those, message == what the emit
+                # path normalized, so the identities still agree.
+                template = _context_str(context, TEMPLATE_CONTEXT_KEY) or normalize_message(
+                    row.message or ""
+                )
                 signature_key = condition_signature(
                     row.category, row.source, environment, template
                 )
@@ -247,18 +256,27 @@ async def _adopt_orphans(session, *, now: datetime, batch_size: int = 500) -> in
     return adopted
 
 
-def _environment_from_context(context_json: str | None) -> str | None:
-    """Read ``environment`` out of a stored context, tolerating anything."""
+def _context_dict(context_json: str | None) -> dict:
+    """Parse a stored context, tolerating anything.
+
+    A context we cannot parse is a context with no readable keys: the
+    occurrence lands in the unlabelled bucket (and falls back to the
+    normalized message for identity) rather than being skipped.
+    """
     if not context_json:
-        return None
+        return {}
     try:
-        value = json.loads(context_json).get("environment")
-    except (ValueError, TypeError, AttributeError):
-        # A context we cannot parse is a context with no environment: the
-        # occurrence lands in the unlabelled bucket rather than being skipped.
+        parsed = json.loads(context_json)
+    except (ValueError, TypeError):
         logger.warning("opsalert: unparseable context on an orphan occurrence")
-        return None
-    return value if isinstance(value, str) else None
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _context_str(context: dict, key: str) -> str | None:
+    """A non-empty string value out of a parsed context, or None."""
+    value = context.get(key)
+    return value if isinstance(value, str) and value else None
 
 
 async def _count_below_watermark(session, occurrence_ids: list[int]) -> None:
