@@ -212,7 +212,7 @@ async def deliver_alerts(session) -> dict:
 
 
 async def _reopen_recurring(session) -> set[int]:
-    """Reopen every resolved/closed condition with an unnotified occurrence.
+    """Reopen every resolved/closed condition that has recurred SINCE then.
 
     Returns the ids it reopened, which then bypass disposition gating below.
 
@@ -220,6 +220,16 @@ async def _reopen_recurring(session) -> set[int]:
     the maintenance sweep, a sweep order of "deliver, then apply rules" would
     let a recurrence on a collect-dispositioned closed condition be marked
     notified and silently swallowed — the alert nobody ever sees.
+
+    A recurrence is an occurrence CREATED AFTER the condition left the living
+    set — not merely an unnotified one. ``notified=False`` alone also matches
+    the pre-resolution backlog, and resolving a condition that still held
+    undelivered occurrences then reopened it on the very next delivery pass,
+    for a problem that had not fired since before the fix (opsalert#1 —
+    prod condition 52 reopened off a backlog 57 minutes older than its
+    resolution). ``set_status`` now marks that backlog notified at
+    resolve/close time; the time predicate here is the second line of
+    defense, and the one that defines what "recurred" means.
     """
     condition_ids = (
         (
@@ -229,6 +239,12 @@ async def _reopen_recurring(session) -> set[int]:
                 .where(
                     Alert.notified.is_(False),
                     AlertCondition.status.in_([STATUS_RESOLVED, STATUS_CLOSED]),
+                    Alert.created
+                    > func.coalesce(
+                        AlertCondition.resolved_at,
+                        AlertCondition.closed_at,
+                        AlertCondition.status_changed_at,
+                    ),
                 )
                 .distinct()
             )

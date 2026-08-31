@@ -355,3 +355,106 @@ class TestCorruptConditionIsolation:
         assert "Unusable alert condition row skipped during delivery" in [
             a.message for a in still_waiting
         ]
+
+
+class TestResolveWithUndeliveredBacklog:
+    """opsalert#1 — resolving a condition that still holds undelivered rows.
+
+    Prod condition 52: resolved at 09:37 with 105 unnotified occurrences, the
+    newest 57 minutes OLDER than the resolution. The next delivery pass read
+    ``notified=False`` as "recurred" and flipped it straight back to ``new``,
+    re-waking the watch for a problem that had not fired since before the fix.
+    """
+
+    async def test_set_status_resolved_retires_the_backlog(self, session, session_factory):
+        """Resolving marks the pre-resolution backlog notified — it is not
+        owed to anyone: resolving IS the human seeing it."""
+        transport = _TrackingTransport()
+        _configure(session_factory, transport)
+
+        await _fire_old(session, severity="error", category="cat", message="boom")
+        await _fire_old(session, severity="error", category="cat", message="boom")
+        await session.commit()
+        await sync_condition_stats(session)
+        condition = await _condition(session)
+
+        await set_status(session, condition, "resolved", actor="chris")
+        await session.commit()
+
+        unnotified = (
+            await session.execute(
+                select(Alert).where(Alert.notified.is_(False))
+            )
+        ).scalars().all()
+        assert unnotified == []
+
+    async def test_backlog_does_not_reopen_but_recurrence_does(
+        self, session, session_factory
+    ):
+        """The two halves of opsalert#1's prescribed test, in order.
+
+        First: a resolved condition whose unnotified occurrences all PREDATE
+        the resolution (the pre-fix concealment state, recreated by hand)
+        stays resolved through a delivery pass. Second: one occurrence dated
+        after the resolution reopens it — guarding the original P4 concern so
+        this fix cannot silence real recurrences.
+        """
+        transport = _TrackingTransport()
+        _configure(session_factory, transport)
+
+        await _fire_old(session, severity="error", category="cat", message="boom")
+        await session.commit()
+        await sync_condition_stats(session)
+        condition = await _condition(session)
+        await set_status(session, condition, "resolved", actor="chris")
+        # Recreate the pre-fix state: a backlog resolve did not retire.
+        await session.execute(Alert.__table__.update().values(notified=False))
+        await session.commit()
+
+        stats = await deliver_alerts(session)
+        await session.commit()
+
+        assert stats["reopened"] == 0
+        await session.refresh(condition)
+        assert condition.status == "resolved"
+        assert condition.reopened_count == 0
+
+        # Now it genuinely recurs.
+        await fire_alert(session, severity="error", category="cat", message="boom")
+        await session.commit()
+
+        stats = await deliver_alerts(session)
+        await session.commit()
+
+        assert stats["reopened"] == 1
+        await session.refresh(condition)
+        assert condition.status == "new"
+        assert condition.reopened_count == 1
+        assert stats["immediate_sent"] >= 1
+
+    async def test_direct_close_also_retires_the_backlog(self, session, session_factory):
+        """Closing straight from acknowledged retires the backlog the same way
+        (closed_at is set; resolved_at never is — the COALESCE order in the
+        delivery predicate depends on both being handled)."""
+        transport = _TrackingTransport()
+        _configure(session_factory, transport)
+
+        await _fire_old(session, severity="error", category="cat", message="boom")
+        await session.commit()
+        await sync_condition_stats(session)
+        condition = await _condition(session)
+
+        await set_status(session, condition, "acknowledged", actor="chris")
+        await set_status(session, condition, "closed", actor="chris")
+        await session.commit()
+
+        unnotified = (
+            await session.execute(select(Alert).where(Alert.notified.is_(False)))
+        ).scalars().all()
+        assert unnotified == []
+
+        stats = await deliver_alerts(session)
+        await session.commit()
+        assert stats["reopened"] == 0
+        await session.refresh(condition)
+        assert condition.status == "closed"

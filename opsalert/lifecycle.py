@@ -586,6 +586,24 @@ async def set_status(
         condition.resolved_by = resolved_by or actor
     elif status == STATUS_CLOSED:
         condition.closed_at = now
+
+    if status in (STATUS_RESOLVED, STATUS_CLOSED):
+        # Retire the undelivered backlog (opsalert#1). Resolving is a human
+        # saying "I have seen this and dealt with it" — emailing the history
+        # afterwards has no audience, and leaving it unnotified either
+        # phantom-reopened the condition (before delivery's time predicate)
+        # or would sit owed-but-undeliverable forever (after it). ``notified``
+        # keeps meaning "no longer owed to anyone". Occurrences arriving
+        # after ``now`` are untouched: they are the recurrence signal.
+        await session.execute(
+            update(Alert)
+            .where(
+                Alert.condition_id == condition.id,
+                Alert.notified.is_(False),
+                Alert.created <= now,
+            )
+            .values(notified=True)
+        )
     elif status == STATUS_NEW:
         # Back to untriaged: the old acknowledgement no longer describes it.
         condition.acknowledged_at = None
