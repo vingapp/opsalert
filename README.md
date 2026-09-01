@@ -342,8 +342,12 @@ opsalert provides two delivery functions that your scheduler calls periodically.
 ```python
 # Call from your scheduler (e.g., every 5 minutes)
 stats = await opsalert.deliver_alerts(session)
-# {"immediate_sent": 2, "immediate_throttled": 1, "digest_sent": 1,
+# {"immediate_sent": 2, "immediate_throttled": 1,
+#  "immediate_throttled_conditions": 4, "digest_sent": 1,
 #  "digest_count": 15, "reopened": 1, "collected": 3, "skipped": 0}
+# immediate_throttled counts category EMAILS suppressed because every one of
+# that category's conditions was inside its window; the *_conditions figure
+# counts the throttled conditions themselves.
 
 # Maintenance: fold occurrences into their conditions, then run the rules.
 await opsalert.sync_condition_stats(session)
@@ -369,19 +373,30 @@ the moment it runs — it never assumes the maintenance sweep ran first.
    severity — error/critical → `immediate`, warn → `digest`):
    - `collect` — occurrences are marked notified, no email. Recorded, not announced.
    - `digest` — batched into the periodic digest.
-   - `immediate` — throttled per condition, then grouped into ONE email per
-     category per sweep whose body enumerates that category's conditions
-     (10 listed, then "and N more").
+   - `immediate` — grouped into ONE email per category per sweep whose body
+     enumerates that category's conditions (10 listed, then "and N more"),
+     and the throttle gates that email: it goes out only if at least one
+     member is unthrottled.
    - An `acknowledged` condition gets the digest at most: somebody is already on
      it, and its occurrences keep accruing regardless.
 3. **Occurrences with no condition** (a fire-time resolution failure, or rows
    older than conditions) are delivered by the original category-grouped path,
    unchanged.
 
-The throttle is per condition, not per category, so a noisy condition can no
-longer shadow a brand-new one that shares its category. Throttle state is read
-from notified occurrence rows, and every transport-accepted send commits its
-notified-marks before the next send — a delivered email's mark cannot roll back.
+Throttle state is per condition, but it gates the category email as a unit. A
+category is mailed only when at least one member is unthrottled — never emailed
+inside the window, or just reopened — so a brand-new condition is never shadowed
+by a noisy category-mate, while a category whose members have all been emailed
+once stays silent for the rest of the window. When the email goes out it carries
+every member with unnotified occurrences, throttled ones included, and they are
+all marked notified with it; when every member is throttled nothing is sent and
+nothing is marked. Throttle state is read from notified occurrence rows, and
+every transport-accepted send commits its notified-marks before the next send —
+a delivered email's mark cannot roll back.
+
+The digest subject and `AlertMessage.severity` carry the worst severity present,
+not a hardcoded `warn` — P5 routes acknowledged error/critical conditions into
+the digest, so it is not a warnings-only email.
 
 **Cleanup:**
 - Deletes occurrences older than `retention_max_age_days` — but only once they

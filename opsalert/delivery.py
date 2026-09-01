@@ -8,10 +8,13 @@ What gets emailed is decided per CONDITION, not per category:
 - ``collect`` marks its occurrences notified and sends nothing;
 - an ``acknowledged`` condition gets the digest at most — somebody is already
   on it, and its occurrences keep accruing regardless (P5);
-- ``immediate`` conditions are throttled individually, then batched into ONE
-  email per category per sweep whose body enumerates the conditions (P7). The
-  cadence stays what it was; the inclusion decision moved down a level, so a
-  brand-new condition is never shadowed by its category-mates' throttle.
+- ``immediate`` conditions are batched into ONE email per category per sweep
+  whose body enumerates the conditions (P7), and the THROTTLE APPLIES TO THAT
+  EMAIL: it goes out only if at least one member is unthrottled — never
+  emailed inside the window, or just reopened — and it then carries every
+  member with unnotified occurrences. A brand-new condition still wakes you;
+  a category whose members have all been emailed once is silent for the rest
+  of the window, whatever their occurrence timing (opsalert#5).
 
 Occurrences with no condition (fire-time resolution failed, or rows older than
 conditions) are delivered by the original category-grouped path, unchanged.
@@ -57,6 +60,23 @@ _RANK_TO_SEVERITY = {
     2: AlertSeverity.ERROR.value,
     1: AlertSeverity.WARN.value,
 }
+
+# In-Python severity ordering, for picking the worst severity in a batch.
+_SEVERITY_ORDER = {
+    AlertSeverity.CRITICAL.value: 3,
+    AlertSeverity.ERROR.value: 2,
+    AlertSeverity.WARN.value: 1,
+}
+
+
+def _worst_severity(severities) -> str:
+    """The most severe of the given severity strings (warn if none are known)."""
+    return max(
+        severities,
+        key=lambda s: _SEVERITY_ORDER.get(s, 0),
+        default=AlertSeverity.WARN.value,
+    )
+
 
 # How many conditions an immediate email lists before it says "and N more".
 _CONDITION_LIST_CAP = 10
@@ -121,11 +141,20 @@ async def deliver_alerts(session) -> dict:
     """Deliver alert notification emails. Call from your scheduler.
 
     Returns stats dict with immediate_sent, immediate_throttled,
-    digest_sent, digest_count, reopened, collected, skipped.
+    immediate_throttled_conditions, digest_sent, digest_count, reopened,
+    collected, skipped.
+
+    ``immediate_throttled`` counts category EMAILS suppressed because every
+    one of that category's conditions was inside its throttle window — the
+    figure that says how much mail the throttle actually prevented.
+    ``immediate_throttled_conditions`` is the finer number: conditions that
+    were inside their window, whether they were held back with a suppressed
+    email or rode along on one that went out anyway.
     """
     stats = {
         "immediate_sent": 0,
         "immediate_throttled": 0,
+        "immediate_throttled_conditions": 0,
         "digest_sent": 0,
         "digest_count": 0,
         "reopened": 0,
@@ -425,8 +454,24 @@ async def _deliver_immediate(
     throttle_minutes: int,
     reopened_ids: set[int] | None = None,
 ) -> dict:
-    """One email per category per sweep, enumerating that category's conditions."""
-    stats = {"immediate_sent": 0, "immediate_throttled": 0}
+    """One email per category per sweep, enumerating that category's conditions.
+
+    The throttle gates the EMAIL, not membership in it (opsalert#5). A
+    category is mailed only when at least one of its conditions is unthrottled
+    — never emailed inside the window, or just reopened. When it is mailed it
+    carries every member with unnotified occurrences: the throttled ones ride
+    along and are marked notified, because the mail is going out regardless and
+    "was emailed about" is exactly what the window measures. When every member
+    is throttled nothing is sent, nothing is marked, and the occurrences wait
+    for a later sweep. Dropping the throttled condition from the list instead
+    (the pre-fix behaviour) let any one fresh member re-send the whole
+    category, so the effective interval was throttle/N, not throttle.
+    """
+    stats = {
+        "immediate_sent": 0,
+        "immediate_throttled": 0,
+        "immediate_throttled_conditions": 0,
+    }
     cfg = get_config()
     environment = cfg.environment
 
@@ -437,17 +482,19 @@ async def _deliver_immediate(
     ) - (reopened_ids or set())
     by_category: dict[str, list[_ConditionBatch]] = {}
     for batch in batches:
-        if batch.condition_id in throttled:
-            stats["immediate_throttled"] += 1
-            continue
         by_category.setdefault(batch.category, []).append(batch)
 
     for category, included in by_category.items():
+        held = [b for b in included if b.condition_id in throttled]
+        if len(held) == len(included):
+            # Every member is inside its window: this email is suppressed.
+            stats["immediate_throttled"] += 1
+            stats["immediate_throttled_conditions"] += len(held)
+            continue
+        stats["immediate_throttled_conditions"] += len(held)
+
         included.sort(key=lambda b: b.count, reverse=True)
-        worst = max(
-            (b.severity for b in included),
-            key=lambda s: {"critical": 3, "error": 2, "warn": 1}.get(s, 0),
-        )
+        worst = _worst_severity([b.severity for b in included])
         total = sum(b.count for b in included)
         headline = included[0].latest_message
 
@@ -586,6 +633,7 @@ async def _deliver_immediate_legacy(
     out = {
         "immediate_sent": stats["immediate_sent"],
         "immediate_throttled": stats["immediate_throttled"],
+        "immediate_throttled_conditions": stats["immediate_throttled_conditions"],
     }
 
     for row in result.all():
@@ -714,17 +762,32 @@ async def _deliver_digest(
     total_count = sum(row.count for row in categories)
     stats["digest_count"] = total_count
 
+    # P5 routes ACKNOWLEDGED error and critical conditions into this digest, so
+    # it is not a warning digest — saying so misinforms about the one thing an
+    # alert email exists to convey, and lies to any transport that keys off
+    # ``message.severity`` (Slack colour, PagerDuty priority). Legacy orphan
+    # rows are warn by construction (DIGEST_SEVERITIES); condition batches
+    # carry their own severity.
+    worst = _worst_severity([b.severity for b in batches])
+    worst_suffix = (
+        f" — worst: {worst.upper()}"
+        if _SEVERITY_ORDER.get(worst, 0) > _SEVERITY_ORDER[AlertSeverity.WARN.value]
+        else ""
+    )
+
     message = AlertMessage(
         subject=(
             f"{_subject_prefix(environment)}[ALERT DIGEST] "
-            f"{total_count} warning(s) across {len(categories)} categorie(s)"
+            f"{total_count} alert(s) across {len(categories)} categorie(s)"
+            f"{worst_suffix}"
         ),
         html_body=_render_digest_email(categories, environment=environment),
         text_body=(
             f"{_environment_text(environment)}"
-            f"Alert Digest: {total_count} warning(s) across {len(categories)} categories"
+            f"Alert Digest: {total_count} alert(s) across {len(categories)} "
+            f"categories{worst_suffix}"
         ),
-        severity="warn",
+        severity=worst,
         category="digest",
         alert_count=total_count,
         environment=environment,

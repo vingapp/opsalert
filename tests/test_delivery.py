@@ -95,11 +95,11 @@ class TestDeliverImmediate:
         assert alert.notified is True
 
     async def test_throttles_recently_notified(self, session, session_factory):
-        """Skips a condition that was emailed inside the throttle window.
+        """Sends nothing when every condition in the category is inside the window.
 
-        The throttle is per CONDITION now, not per category: a category-wide
-        throttle would let a chatty condition shadow a brand-new one that has
-        never been emailed at all.
+        Throttle state is per CONDITION, but it gates the category EMAIL: this
+        category's only member was emailed five minutes ago, so no mail goes
+        out and the new occurrence waits (opsalert#5).
         """
         transport = _TrackingTransport()
         opsalert.configure(
@@ -128,9 +128,12 @@ class TestDeliverImmediate:
     ):
         """A never-emailed condition goes out even when a category-mate is throttled.
 
-        This is the whole point of moving the throttle down to the condition:
-        under the old category-level rule, one noisy condition silenced every
-        new problem that happened to share its category.
+        A brand-new problem is never silenced by its category-mates' throttle.
+        The throttled mate rides along on the email that was going out anyway
+        and is marked notified with it (opsalert#5): no email was suppressed,
+        so ``immediate_throttled`` — which counts suppressed emails — is 0,
+        and the finer per-condition figure records the one that was inside
+        its window.
         """
         transport = _TrackingTransport()
         opsalert.configure(
@@ -154,10 +157,11 @@ class TestDeliverImmediate:
         await session.commit()
 
         assert stats["immediate_sent"] == 1
-        assert stats["immediate_throttled"] == 1
+        assert stats["immediate_throttled"] == 0
+        assert stats["immediate_throttled_conditions"] == 1
         body = transport.sent[0].text_body
         assert "never seen before" in body
-        assert "known boom" not in body
+        assert "known boom" in body
 
     async def test_does_not_throttle_old_notifications(self, session, session_factory):
         """Sends if last notification was outside the throttle window."""

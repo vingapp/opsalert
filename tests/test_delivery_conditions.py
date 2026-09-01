@@ -458,3 +458,220 @@ class TestResolveWithUndeliveredBacklog:
         assert stats["reopened"] == 0
         await session.refresh(condition)
         assert condition.status == "closed"
+
+
+class TestCategoryThrottle:
+    """opsalert#5 — the throttle bounds EMAILS, not list membership.
+
+    A category email goes out only when it carries at least one condition
+    that is not throttled. When it goes out it carries every member with
+    unnotified occurrences; when every member is throttled nothing is sent
+    and nothing is marked.
+    """
+
+    async def _emailed_ago(self, session, minutes: int) -> None:
+        """Backdate every notified row so the throttle reads it as `minutes` old."""
+        await session.execute(
+            Alert.__table__.update()
+            .where(Alert.notified.is_(True))
+            .values(created=datetime.now(UTC) - timedelta(minutes=minutes))
+        )
+        await session.commit()
+
+    async def test_a_fully_throttled_category_sends_nothing(
+        self, session, session_factory
+    ):
+        """Two conditions in one category, both emailed, both firing again.
+
+        Under the pre-fix rule each fresh occurrence re-qualified the category
+        and the email went out again inside the window.
+        """
+        transport = _TrackingTransport()
+        _configure(session_factory, transport, throttle=60)
+
+        await fire_alert(session, severity="error", category="cat", message="pool exhausted")
+        await fire_alert(session, severity="error", category="cat", message="disk full")
+        await session.commit()
+
+        first = await deliver_alerts(session)
+        await session.commit()
+        assert first["immediate_sent"] == 1
+
+        # Both conditions fire again, inside the window.
+        await self._emailed_ago(session, 5)
+        await fire_alert(session, severity="error", category="cat", message="pool exhausted")
+        await fire_alert(session, severity="error", category="cat", message="disk full")
+        await session.commit()
+
+        second = await deliver_alerts(session)
+        await session.commit()
+
+        assert second["immediate_sent"] == 0
+        assert second["immediate_throttled"] == 1, "one EMAIL was suppressed, not two conditions"
+        assert len(transport.sent) == 1, "a second email went out inside the window"
+
+        # Nothing was marked: the occurrences wait for the next sweep.
+        unnotified = (
+            (await session.execute(select(Alert).where(Alert.notified.is_(False))))
+            .scalars()
+            .all()
+        )
+        assert len(unnotified) == 2
+
+        # Once the window has passed they are delivered.
+        await self._emailed_ago(session, 180)
+        third = await deliver_alerts(session)
+        await session.commit()
+        assert third["immediate_sent"] == 1
+        assert third["immediate_throttled"] == 0
+        assert len(transport.sent) == 2
+        body = transport.sent[1].text_body
+        assert "pool exhausted" in body
+        assert "disk full" in body
+
+    async def test_a_throttled_condition_rides_along_with_a_fresh_one(
+        self, session, session_factory
+    ):
+        """The email is going out anyway — carry everyone and mark them all."""
+        transport = _TrackingTransport()
+        _configure(session_factory, transport, throttle=60)
+
+        noisy = await fire_alert(
+            session, severity="error", category="cat", message="known boom"
+        )
+        noisy.notified = True
+        noisy.created = datetime.now(UTC) - timedelta(minutes=5)
+        await fire_alert(session, severity="error", category="cat", message="known boom")
+        await fire_alert(
+            session, severity="error", category="cat", message="never seen before"
+        )
+        await session.commit()
+
+        stats = await deliver_alerts(session)
+        await session.commit()
+
+        assert stats["immediate_sent"] == 1
+        assert stats["immediate_throttled"] == 0, "no email was suppressed"
+        assert stats["immediate_throttled_conditions"] == 1
+        assert len(transport.sent) == 1
+        body = transport.sent[0].text_body
+        assert "never seen before" in body
+        assert "known boom" in body, "a throttled member must ride along"
+
+        unnotified = (
+            (await session.execute(select(Alert).where(Alert.notified.is_(False))))
+            .scalars()
+            .all()
+        )
+        assert unnotified == [], "everyone on a sent email is marked notified"
+
+    async def test_a_reopen_sends_an_otherwise_fully_throttled_category(
+        self, session, session_factory
+    ):
+        """P4 outranks the throttle even when it is the only fresh member."""
+        transport = _TrackingTransport()
+        _configure(session_factory, transport, throttle=60)
+
+        await _fire_old(session, severity="error", category="cat", message="old boom")
+        await session.commit()
+        await sync_condition_stats(session)
+        condition = await _condition(session)
+        await set_status(session, condition, "resolved", actor="chris")
+
+        # Everything so far has been emailed, five minutes ago.
+        noisy = await fire_alert(
+            session, severity="error", category="cat", message="known boom"
+        )
+        noisy.notified = True
+        await session.execute(
+            Alert.__table__.update().values(
+                notified=True, created=datetime.now(UTC) - timedelta(minutes=5)
+            )
+        )
+        await session.commit()
+
+        # The resolved condition recurs; its noisy category-mate also fires.
+        await fire_alert(session, severity="error", category="cat", message="old boom")
+        await fire_alert(session, severity="error", category="cat", message="known boom")
+        await session.commit()
+
+        stats = await deliver_alerts(session)
+        await session.commit()
+
+        assert stats["reopened"] == 1
+        assert stats["immediate_sent"] == 1, "a reopen is never throttled"
+        assert stats["immediate_throttled"] == 0
+        body = transport.sent[0].text_body
+        assert "old boom" in body
+        assert "known boom" in body
+
+    async def test_a_throttled_member_with_the_bigger_count_does_not_break_the_headline(
+        self, session, session_factory
+    ):
+        """The loudest member may be the throttled one; the email still reads right."""
+        transport = _TrackingTransport()
+        _configure(session_factory, transport, throttle=60)
+
+        seen = await fire_alert(
+            session, severity="error", category="cat", message="loud boom"
+        )
+        seen.notified = True
+        seen.created = datetime.now(UTC) - timedelta(minutes=5)
+        for _ in range(4):
+            await fire_alert(session, severity="error", category="cat", message="loud boom")
+        await fire_alert(session, severity="critical", category="cat", message="quiet boom")
+        await session.commit()
+
+        stats = await deliver_alerts(session)
+        await session.commit()
+
+        assert stats["immediate_sent"] == 1
+        message = transport.sent[0]
+        assert message.severity == "critical"
+        assert "loud boom" in message.subject
+        assert message.alert_count == 5
+
+
+class TestDigestSeverity:
+    """opsalert#5 — an acknowledged CRITICAL must not arrive as a 'warning'."""
+
+    async def test_digest_subject_and_severity_carry_the_worst_severity(
+        self, session, session_factory
+    ):
+        transport = _TrackingTransport()
+        _configure(session_factory, transport)
+
+        await _fire_old(session, severity="critical", category="cat", message="db down")
+        await session.commit()
+        await sync_condition_stats(session)
+        await set_status(session, await _condition(session), "acknowledged", actor="chris")
+        await session.commit()
+
+        stats = await deliver_alerts(session)
+        await session.commit()
+
+        assert stats["digest_sent"] == 1
+        message = transport.sent[0]
+        assert message.category == "digest"
+        assert "CRITICAL" in message.subject
+        assert "warning" not in message.subject
+        assert "warning" not in message.text_body
+        assert message.severity == "critical"
+
+    async def test_an_all_warn_digest_says_nothing_about_severity(
+        self, session, session_factory
+    ):
+        transport = _TrackingTransport()
+        _configure(session_factory, transport)
+
+        await _fire_old(session, severity="warn", category="cat", message="slow query")
+        await session.commit()
+
+        stats = await deliver_alerts(session)
+        await session.commit()
+
+        assert stats["digest_sent"] == 1
+        message = transport.sent[0]
+        assert message.severity == "warn"
+        assert "worst" not in message.subject
+        assert "alert(s)" in message.subject
