@@ -464,21 +464,48 @@ items, total, aggregates = await opsalert.query_conditions(
 
 result = await opsalert.query_attention(session, cursor=last_cursor)
 # {"conditions": [{"id", "severity", "category", "template", "occurrence_count",
-#                  "count_since_cursor", "last_seen", "reopened"}], "cursor": 1234}
+#                  "count_since_cursor", "last_seen", "reopened"}],
+#  "cursor": "2.eyJtIjp7IjciOjN9fQ"}   # opaque string — store it, hand it back
 
 occurrences, total = await opsalert.query_occurrences(session, condition_id=7)
 ```
 
 `query_attention` is the watchdog's view: only `new` conditions whose effective
-disposition is `immediate`, and — with a cursor — only those that have fired
-since it. Nothing new means an empty list and the caller's own cursor back.
-Without a cursor it returns the current attention set plus a fresh cursor, never
-a flood of history. **The returned cursor is the highest occurrence id the
-response actually reported** — never a global high-water mark, so a condition
-that was created (or adopted from orphans) after the query read its candidate
-set still has occurrences above the cursor and surfaces on the next call.
-Results are ordered by that per-condition high-water mark ascending, so a
-`limit` truncation drops only conditions the cursor stays below.
+disposition is `immediate`, in condition-id order. Nothing new means an empty
+list and the caller's own cursor back; without a cursor it returns the current
+attention set plus a fresh one, never a flood of history.
+
+**The cursor is an opaque URL-safe string — the set of conditions the caller has
+been told about, each with how many occurrences it had when they were told**
+(`"2." + base64url({"m": {condition_id: count}})`; roughly 12 bytes per condition
+on the line). A condition is reported when it has **no entry** — never reported,
+so it wakes once unconditionally, zero-occurrence rows included — or when its
+**live occurrence count exceeds its recorded mark**, which is a refire.
+
+Keying on condition identity is what makes a late-visible condition safe: one
+created after an earlier call read its candidates, or adopted from orphan
+occurrences by a later sweep, has no entry regardless of where its occurrence ids
+fall. Keying the refire test on *count* rather than a maximum id matters for the
+same reason — auto-increment order is not commit order, so a slow request's
+occurrence can land below ids already reported and must still count.
+
+Marks are pruned to the current candidate set, so the cursor cannot grow past the
+attention line, and a condition that leaves `new` and comes back is reported
+again. That pruning is scoped by `environment`: a cursor belongs to the scope it
+was issued for — one cursor per watchdog per environment. A `limit` truncation
+leaves the dropped conditions' marks untouched, so the next call drains them.
+
+A cursor that parses as an integer is honoured as the pre-`v2` occurrence
+watermark for one call and upgraded in the response; `None` or `""` bootstraps;
+anything else raises `ValueError` (a malformed cursor is never silently a
+bootstrap, which would re-page the whole board). One residual: marks are
+reconciled only when the query runs, so if occurrences are deleted (an admin
+purge, or retention cleanup ageing out a condition's oldest rows) and it fires
+again before the next call, the live count can climb back toward the old mark
+without exceeding it and those refires are not reported. That call lowers the
+mark to the live count; the next occurrence after it is reported. The masking is
+bounded to one polling interval, not permanent.
+
 `query_next_fix` likewise skips occurrences whose condition is acknowledged,
 resolved or closed.
 

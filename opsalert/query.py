@@ -5,6 +5,7 @@ Level 2 (?category=X): GROUP BY message within category → count, latest_create
 Level 3 (?category=X&message=Y): Individual occurrences with context
 Next-fix: Highest-priority group with aggregated debugging data
 """
+import base64
 import json
 from typing import TYPE_CHECKING
 
@@ -574,41 +575,159 @@ async def query_conditions(
     return [_condition_dict(c) for c in rows], total, aggregates
 
 
+# The attention cursor is versioned and opaque: "2." + base64url of a JSON
+# mark set. Version 1 was a bare integer occurrence watermark; it is still
+# accepted for one call so a running watchdog upgrades on its next tick
+# without a flood and without a lost wake.
+_ATTENTION_CURSOR_V2_PREFIX = "2."
+
+
+def _encode_attention_cursor(marks: dict[int, int]) -> str:
+    """Encode a {condition_id: occurrences_reported} map as an opaque cursor.
+
+    Sorted by condition id so an unchanged mark set encodes to an identical
+    string — "the same cursor back" is byte-for-byte, not just semantically,
+    whenever nothing was reported and nothing was pruned.
+    """
+    payload = json.dumps(
+        {"m": {str(cid): count for cid, count in sorted(marks.items())}},
+        separators=(",", ":"),
+    )
+    encoded = base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii")
+    return _ATTENTION_CURSOR_V2_PREFIX + encoded.rstrip("=")
+
+
+def _decode_attention_cursor(
+    cursor: str | int | None,
+) -> tuple[dict[int, int] | None, int | None]:
+    """Decode a cursor into ``(marks, legacy_watermark)``.
+
+    Exactly one of the two is not None, except on bootstrap (``None``/empty)
+    where both are None. Anything that is neither a v2 string nor an integer
+    raises ``ValueError`` — a malformed cursor must NOT degrade to a bootstrap,
+    which would re-report the whole attention set as if it were new.
+    """
+    if cursor is None:
+        return None, None
+    if isinstance(cursor, bool):  # bool is an int; never a cursor
+        raise ValueError(f"Not a valid attention cursor: {cursor!r}")
+    if isinstance(cursor, int):
+        return None, max(0, cursor)
+
+    text = cursor.strip()
+    if not text:
+        return None, None
+
+    try:
+        return None, max(0, int(text))
+    except ValueError:
+        pass
+
+    if not text.startswith(_ATTENTION_CURSOR_V2_PREFIX):
+        raise ValueError(f"Not a valid attention cursor: {cursor!r}")
+
+    body = text[len(_ATTENTION_CURSOR_V2_PREFIX) :]
+    try:
+        raw = base64.urlsafe_b64decode(body + "=" * (-len(body) % 4))
+        payload = json.loads(raw.decode("utf-8"))
+    except Exception as exc:  # noqa: BLE001 — every decode failure is the same
+        raise ValueError(f"Not a valid attention cursor: {cursor!r}") from exc
+
+    if not isinstance(payload, dict) or not isinstance(payload.get("m"), dict):
+        raise ValueError(f"Not a valid attention cursor: {cursor!r}")
+
+    marks: dict[int, int] = {}
+    for key, value in payload["m"].items():
+        try:
+            condition_id = int(key)
+            count = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Not a valid attention cursor: {cursor!r}") from exc
+        if count < 0:
+            raise ValueError(f"Not a valid attention cursor: {cursor!r}")
+        marks[condition_id] = count
+    return marks, None
+
+
 async def query_attention(
     session: "AsyncSession",
     *,
-    cursor: int | None = None,
+    cursor: str | int | None = None,
     environment: str | None = None,
     limit: int = 50,
 ) -> dict:
     """The watchdog's view: what should wake somebody up right now.
 
-    Returns ``{"conditions": [...], "cursor": <opaque occurrence id>}``.
+    Returns ``{"conditions": [...], "cursor": "<opaque string>"}``. The cursor
+    is opaque — callers store it and hand it back, they never parse it.
 
     Only ``new`` conditions whose effective disposition is ``immediate`` are
     here (W2). Digest and collect never wake anyone — that is what choosing
     them means — and an acknowledged condition has already woken somebody.
+    Conditions are returned in condition-id order.
 
-    With a cursor, a condition appears only if it has fired since that cursor:
-    "nothing new" is an empty list and the caller's own cursor handed straight
-    back. Without one, the caller gets the current attention set plus a fresh
-    cursor — a bootstrap, never a flood of history.
+    THE CURSOR IS THE SET OF CONDITIONS THE CALLER HAS BEEN TOLD ABOUT, EACH
+    WITH HOW MANY OCCURRENCES IT HAD WHEN THEY WERE TOLD (opsalert#4). Given
+    that cursor (or none), a candidate is reported when either:
 
-    THE CURSOR IS THE HIGHEST OCCURRENCE ID THIS RESPONSE ACTUALLY REPORTED
-    (opsalert#4). It never advances past an occurrence belonging to a condition
-    that was not included, so a condition that did not exist yet when the
-    candidate snapshot was read — created late, or an orphan adopted by a later
-    sweep — still has occurrences above the cursor and surfaces on the next
-    call. A global high-water mark cannot promise that: it buries such a
-    condition forever, because it can only reappear by firing again. The cost
-    is at most one repeat of a condition already reported.
+    * it has **no entry in the cursor** — never reported, so it is reported
+      once unconditionally, including a condition with zero occurrences; or
+    * its **live occurrence count is above its recorded mark** — it fired
+      again. ``count_since_cursor`` is that difference (the whole live count
+      when there was no entry).
 
-    Qualifying conditions are ordered by their highest occurrence id since the
-    cursor, ASCENDING, and then truncated to ``limit``. That ordering is what
-    makes truncation safe: every dropped condition has occurrences strictly
-    above every included one, so the returned cursor leaves them intact and the
-    next call drains them.
+    Keying on condition identity rather than an occurrence-id watermark is what
+    closes this issue: a condition that became visible late — created after a
+    previous call read its candidates, adopted from orphan occurrences by a
+    later sweep, or committed out of id order — has no entry, so it is reported
+    regardless of where its occurrence ids fall. Keying the refire test on
+    COUNT rather than max id matters for the same reason in the other
+    direction: auto-increment order is not commit order, so a slow request's
+    occurrence can land below ids already reported and must still count.
+
+    Bookkeeping the returned cursor performs, all of it deliberate:
+
+    * every candidate that was reported gets ``mark = live count``;
+    * a candidate that qualified but was dropped by ``limit`` keeps the mark it
+      came in with — so a never-reported one stays absent from the cursor
+      entirely and is reported by the next call. Truncation skips nothing;
+    * a candidate that did not qualify keeps its mark, lowered to the live
+      count if occurrences were deleted underneath it;
+    * marks for conditions that are no longer candidates are DROPPED, so the
+      cursor cannot grow past the size of the attention set and a condition
+      that leaves ``new`` and comes back (reopened, or re-dispositioned to
+      ``immediate``) is reported again — that wake is wanted.
+
+    Because marks are pruned to the current candidate set, and that set is
+    scoped by ``environment``, a cursor belongs to the environment scope it was
+    issued for: replaying it under a different scope prunes every mark and
+    re-reports that scope's attention set. One cursor per watchdog per
+    environment.
+
+    "Nothing new" is an empty list and the caller's marks handed back. For a
+    cursor this function issued, that string is byte-identical unless a mark
+    was pruned or lowered — both changes in what the cursor means, so both
+    have to be carried forward.
+
+    Compatibility: a cursor that parses as an integer is read as the v1
+    occurrence watermark (report candidates with an occurrence above it) for
+    that one call, and a v2 cursor is returned. ``None`` or an empty string is
+    a bootstrap: the current attention set plus a fresh cursor, never a flood
+    of history. Anything else raises ``ValueError`` — a malformed cursor is
+    never silently treated as a bootstrap, which would re-page the whole board.
+
+    Residual, stated exactly: a mark is only reconciled against the live count
+    when this function runs. If occurrences of a candidate are deleted — an
+    admin purge, or retention cleanup ageing out its oldest rows — and it fires
+    again before the next call, the live count can climb back toward the old
+    mark without exceeding it; those refires are not reported. The call that
+    sees the shortfall lowers the mark to the live count, and the next
+    occurrence after that is reported. The masking is therefore bounded to one
+    polling interval, not permanent.
     """
+    marks_in, legacy_since = _decode_attention_cursor(cursor)
+    marks: dict[int, int] = dict(marks_in or {})
+
     scope = _scoped_environment(environment)
 
     filters = [AlertCondition.status == STATUS_NEW]
@@ -632,45 +751,65 @@ async def query_attention(
         == DISPOSITION_IMMEDIATE
     ]
 
-    # One grouped query over the whole candidate set — count and high-water
-    # mark per condition. The candidate set is the attention set — conditions
-    # that are new AND immediate in one environment — which is small by
-    # construction and, when it is not, the fleet has a much louder problem
-    # than this query.
-    since = cursor or 0
-    stats: dict[int, tuple[int, int]] = {}
+    # One grouped query over the whole candidate set — the LIVE occurrence
+    # count per condition, unfiltered by id. The candidate set is the attention
+    # set (new AND immediate in one environment), which is small by
+    # construction; when it is not, the fleet has a much louder problem than
+    # this query.
+    live: dict[int, int] = {}
+    legacy_new: dict[int, int] = {}
     if candidates:
+        candidate_ids = [c.id for c in candidates]
         grouped = await session.execute(
-            select(
-                Alert.condition_id,
-                func.count(Alert.id),
-                func.max(Alert.id),
-            )
-            .where(
-                Alert.condition_id.in_([c.id for c in candidates]),
-                Alert.id > since,
-            )
+            select(Alert.condition_id, func.count(Alert.id))
+            .where(Alert.condition_id.in_(candidate_ids))
             .group_by(Alert.condition_id)
         )
-        stats = {row[0]: (row[1] or 0, row[2]) for row in grouped}
+        live = {row[0]: row[1] or 0 for row in grouped}
+        if legacy_since is not None:
+            grouped_since = await session.execute(
+                select(Alert.condition_id, func.count(Alert.id))
+                .where(
+                    Alert.condition_id.in_(candidate_ids),
+                    Alert.id > legacy_since,
+                )
+                .group_by(Alert.condition_id)
+            )
+            legacy_new = {row[0]: row[1] or 0 for row in grouped_since}
 
-    qualifying = []
+    next_marks: dict[int, int] = {}
+    qualifying: list[tuple[AlertCondition, int]] = []
     for condition in candidates:
-        count_since, max_id_since = stats.get(condition.id, (0, None))
-        if cursor is not None and count_since == 0:
-            # Nothing since the caller last heard. Still ``new``, still in the
-            # attention set — but reporting it again would be a repeat, and it
-            # holds the cursor back by nothing: it has no occurrence above the
-            # cursor to hold it at.
+        count = live.get(condition.id, 0)
+        if legacy_since is not None:
+            # One-tick v1 semantics: fired above the watermark. Everything else
+            # was already reported under v1, so it starts at its live count
+            # rather than being re-reported on the next call.
+            since_count = legacy_new.get(condition.id, 0)
+            if since_count > 0:
+                qualifying.append((condition, since_count))
+            else:
+                next_marks[condition.id] = count
             continue
-        qualifying.append((max_id_since, condition, count_since))
 
-    # Ascending by high-water mark, so ``limit`` truncates from the top and the
-    # cursor stays below everything that was dropped. Ties are impossible
-    # (occurrence ids are unique); the condition id only settles the order of
-    # bootstrap rows that have no occurrences at all.
-    qualifying.sort(key=lambda item: (item[0] or 0, item[1].id))
+        mark = marks.get(condition.id)
+        if mark is None:
+            qualifying.append((condition, count))
+        elif count > mark:
+            qualifying.append((condition, count - mark))
+        else:
+            # Not a refire. Carry the mark, lowered if occurrences were deleted
+            # underneath it, so the count can rise past it again.
+            next_marks[condition.id] = min(mark, count)
+
     included = qualifying[:limit]
+    included_ids = {condition.id for condition, _ in included}
+    for condition, _ in qualifying:
+        if condition.id in included_ids:
+            next_marks[condition.id] = live.get(condition.id, 0)
+        elif condition.id in marks:
+            # Truncated: unchanged, so the next call reports it again.
+            next_marks[condition.id] = marks[condition.id]
 
     conditions = [
         {
@@ -683,13 +822,10 @@ async def query_attention(
             "last_seen": condition.last_seen,
             "reopened": (condition.reopened_count or 0) > 0,
         }
-        for _, condition, count_since in included
+        for condition, count_since in included
     ]
 
-    # Never backwards: the caller's cursor is the floor.
-    next_cursor = max([since, *[m for m, _, _ in included if m is not None]])
-
-    return {"conditions": conditions, "cursor": next_cursor}
+    return {"conditions": conditions, "cursor": _encode_attention_cursor(next_marks)}
 
 
 # =============================================================================
