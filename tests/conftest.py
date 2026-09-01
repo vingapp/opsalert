@@ -2,10 +2,10 @@
 from contextlib import asynccontextmanager
 
 import pytest
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from opsalert.model import OpsAlertBase
 import opsalert
+from opsalert.model import OpsAlertBase
 
 
 @pytest.fixture
