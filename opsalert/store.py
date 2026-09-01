@@ -304,6 +304,16 @@ async def resolve_condition_id(
         "severity": severity,
         "latest_severity": severity,
         "status_changed_at": now,
+        # first_seen is stamped at creation, not left NULL until the next stats
+        # sweep (opsalert#4). A condition is created BY a fire, so "first seen"
+        # is now; a reader meeting the row in the gap before the sweep would
+        # otherwise see a condition that has apparently never happened. This is
+        # safe against the sweep, which only ever moves first_seen EARLIER
+        # (lifecycle._apply_counts) — so a backdated or pre-existing occurrence
+        # still corrects it. last_seen is deliberately NOT stamped: the sweep
+        # only moves it LATER, so a value from creation would mask the true
+        # time of an occurrence that is older than the row.
+        "first_seen": now,
         "created": now,
         "updated": now,
     }

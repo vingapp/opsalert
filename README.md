@@ -471,10 +471,16 @@ occurrences, total = await opsalert.query_occurrences(session, condition_id=7)
 
 `query_attention` is the watchdog's view: only `new` conditions whose effective
 disposition is `immediate`, and — with a cursor — only those that have fired
-since it. Nothing new means an empty list and the same cursor. Without a cursor
-it returns the current attention set plus a fresh cursor, never a flood of
-history. `query_next_fix` likewise skips occurrences whose condition is
-acknowledged, resolved or closed.
+since it. Nothing new means an empty list and the caller's own cursor back.
+Without a cursor it returns the current attention set plus a fresh cursor, never
+a flood of history. **The returned cursor is the highest occurrence id the
+response actually reported** — never a global high-water mark, so a condition
+that was created (or adopted from orphans) after the query read its candidate
+set still has occurrences above the cursor and surfaces on the next call.
+Results are ordered by that per-condition high-water mark ascending, so a
+`limit` truncation drops only conditions the cursor stays below.
+`query_next_fix` likewise skips occurrences whose condition is acknowledged,
+resolved or closed.
 
 ### Failure behaviour
 
@@ -591,7 +597,7 @@ Alerts are write-once. Only `notified` and `condition_id` are ever updated.
 | `latest_severity` | `varchar(10)` | Severity of the most recent occurrence |
 | `issue_url`, `resolved_by`, `notes` | | The human resolution record |
 | `acknowledged_at`, `acknowledged_by`, `status_changed_at`, `resolved_at`, `closed_at` | `datetime(tz)` | Audit stamps |
-| `first_seen`, `last_seen` | `datetime(tz)` | Maintained by the stats sweep; survive pruning |
+| `first_seen`, `last_seen` | `datetime(tz)` | Stamped when the condition is created, then maintained by the stats sweep; survive pruning |
 | `occurrence_count`, `reopened_count` | `int` | Ditto |
 | `median_interval_seconds` | `int \| None` | Median gap over the last ≤50 occurrences; drives auto-close |
 | `stats_synced_through` | `int` | Highest occurrence id folded into the counters. Cleanup may only delete at or below it. |

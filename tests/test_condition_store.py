@@ -5,12 +5,14 @@ bookkeeping, and bookkeeping must never cost an alert. Every failure mode
 here ends with the occurrence stored and the caller unharmed.
 """
 import asyncio
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from sqlalchemy import select
 
 import opsalert
 from opsalert import store
+from opsalert.lifecycle import _naive, sync_condition_stats
 from opsalert.model import Alert, AlertCondition
 from opsalert.signature import condition_signature, normalize_message
 from opsalert.store import fire_alert, resolve_condition_id
@@ -44,6 +46,25 @@ class TestConditionResolution:
         assert conditions[0].message_template == "Row <n> failed"
         assert conditions[0].status == "new"
         assert conditions[0].severity == "error"
+
+    async def test_a_new_condition_is_born_with_its_first_seen(self, session):
+        """No NULL window between creating the condition and the stats sweep."""
+        alert = await fire_alert(
+            session, severity="error", category="import", message="Row 42 failed"
+        )
+        alert.created = datetime.now(UTC) - timedelta(days=2)  # older than the row
+        await session.commit()
+
+        condition = (await _conditions(session))[0]
+        stamped = condition.first_seen
+        assert stamped is not None
+
+        # The sweep still owns it afterwards, and can only move it EARLIER.
+        await sync_condition_stats(session)
+        await session.commit()
+        await session.refresh(condition)
+        assert _naive(condition.first_seen) == _naive(alert.created)
+        assert _naive(condition.first_seen) < _naive(stamped)
 
     async def test_same_signature_fires_share_one_condition(self, session):
         for row in range(5):

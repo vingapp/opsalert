@@ -583,16 +583,31 @@ async def query_attention(
 ) -> dict:
     """The watchdog's view: what should wake somebody up right now.
 
-    Returns ``{"conditions": [...], "cursor": <opaque max occurrence id>}``.
+    Returns ``{"conditions": [...], "cursor": <opaque occurrence id>}``.
 
     Only ``new`` conditions whose effective disposition is ``immediate`` are
     here (W2). Digest and collect never wake anyone — that is what choosing
     them means — and an acknowledged condition has already woken somebody.
 
     With a cursor, a condition appears only if it has fired since that cursor:
-    "nothing new" is an empty list and the same cursor, not a repeat of the
-    standing list. Without one, the caller gets the current attention set plus
-    a fresh cursor — a bootstrap, never a flood of history.
+    "nothing new" is an empty list and the caller's own cursor handed straight
+    back. Without one, the caller gets the current attention set plus a fresh
+    cursor — a bootstrap, never a flood of history.
+
+    THE CURSOR IS THE HIGHEST OCCURRENCE ID THIS RESPONSE ACTUALLY REPORTED
+    (opsalert#4). It never advances past an occurrence belonging to a condition
+    that was not included, so a condition that did not exist yet when the
+    candidate snapshot was read — created late, or an orphan adopted by a later
+    sweep — still has occurrences above the cursor and surfaces on the next
+    call. A global high-water mark cannot promise that: it buries such a
+    condition forever, because it can only reappear by firing again. The cost
+    is at most one repeat of a condition already reported.
+
+    Qualifying conditions are ordered by their highest occurrence id since the
+    cursor, ASCENDING, and then truncated to ``limit``. That ordering is what
+    makes truncation safe: every dropped condition has occurrences strictly
+    above every included one, so the returned cursor leaves them intact and the
+    next call drains them.
     """
     scope = _scoped_environment(environment)
 
@@ -610,47 +625,69 @@ async def query_attention(
         .all()
     )
 
-    # The new cursor is the high-water mark of occurrences at query time,
-    # taken independently of what matched — so the next call can honestly say
-    # "nothing since".
-    max_occurrence_id = (await session.scalar(select(func.max(Alert.id)))) or 0
-    next_cursor = max(max_occurrence_id, cursor or 0)
+    candidates = [
+        condition
+        for condition in rows
+        if effective_disposition(condition.severity, condition.disposition)
+        == DISPOSITION_IMMEDIATE
+    ]
 
-    # One count query per candidate condition. The candidate set is the
-    # attention set — conditions that are new AND immediate in one environment
-    # — which is small by construction and, when it is not, the fleet has a
-    # much louder problem than this query.
-    conditions = []
-    for condition in rows:
-        if (
-            effective_disposition(condition.severity, condition.disposition)
-            != DISPOSITION_IMMEDIATE
-        ):
-            continue
-        since = cursor or 0
-        count_since = (
-            await session.scalar(
-                select(func.count(Alert.id)).where(
-                    Alert.condition_id == condition.id, Alert.id > since
-                )
+    # One grouped query over the whole candidate set — count and high-water
+    # mark per condition. The candidate set is the attention set — conditions
+    # that are new AND immediate in one environment — which is small by
+    # construction and, when it is not, the fleet has a much louder problem
+    # than this query.
+    since = cursor or 0
+    stats: dict[int, tuple[int, int]] = {}
+    if candidates:
+        grouped = await session.execute(
+            select(
+                Alert.condition_id,
+                func.count(Alert.id),
+                func.max(Alert.id),
             )
-        ) or 0
-        if cursor is not None and count_since == 0:
-            continue
-        conditions.append(
-            {
-                "id": condition.id,
-                "severity": condition.severity,
-                "category": condition.category,
-                "template": condition.message_template,
-                "occurrence_count": condition.occurrence_count,
-                "count_since_cursor": count_since,
-                "last_seen": condition.last_seen,
-                "reopened": (condition.reopened_count or 0) > 0,
-            }
+            .where(
+                Alert.condition_id.in_([c.id for c in candidates]),
+                Alert.id > since,
+            )
+            .group_by(Alert.condition_id)
         )
-        if len(conditions) >= limit:
-            break
+        stats = {row[0]: (row[1] or 0, row[2]) for row in grouped}
+
+    qualifying = []
+    for condition in candidates:
+        count_since, max_id_since = stats.get(condition.id, (0, None))
+        if cursor is not None and count_since == 0:
+            # Nothing since the caller last heard. Still ``new``, still in the
+            # attention set — but reporting it again would be a repeat, and it
+            # holds the cursor back by nothing: it has no occurrence above the
+            # cursor to hold it at.
+            continue
+        qualifying.append((max_id_since, condition, count_since))
+
+    # Ascending by high-water mark, so ``limit`` truncates from the top and the
+    # cursor stays below everything that was dropped. Ties are impossible
+    # (occurrence ids are unique); the condition id only settles the order of
+    # bootstrap rows that have no occurrences at all.
+    qualifying.sort(key=lambda item: (item[0] or 0, item[1].id))
+    included = qualifying[:limit]
+
+    conditions = [
+        {
+            "id": condition.id,
+            "severity": condition.severity,
+            "category": condition.category,
+            "template": condition.message_template,
+            "occurrence_count": condition.occurrence_count,
+            "count_since_cursor": count_since,
+            "last_seen": condition.last_seen,
+            "reopened": (condition.reopened_count or 0) > 0,
+        }
+        for _, condition, count_since in included
+    ]
+
+    # Never backwards: the caller's cursor is the floor.
+    next_cursor = max([since, *[m for m, _, _ in included if m is not None]])
 
     return {"conditions": conditions, "cursor": next_cursor}
 

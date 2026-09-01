@@ -233,6 +233,171 @@ class TestAttention:
         result = await query_attention(session)
         assert result["conditions"][0]["reopened"] is True
 
+    async def test_the_cursor_never_passes_a_condition_that_was_not_returned(
+        self, session, session_factory
+    ):
+        """opsalert#4 — a condition born after the candidate snapshot must survive.
+
+        Orphan occurrences exist before the first call but their condition is
+        only created later (the adoption sweep). If the first call's cursor had
+        advanced past those occurrence ids, the condition could never be
+        reported: it has already fired, and nothing above the cursor is left.
+        """
+        opsalert.configure(session_factory=session_factory)
+        await _fire_old(session, message="loud")
+        await session.commit()
+        await sync_condition_stats(session)
+        await session.commit()
+
+        # Two occurrences whose condition resolution degraded (F1): stored,
+        # counted by nobody yet, owned by no condition.
+        for _ in range(2):
+            session.add(
+                Alert(
+                    severity="error",
+                    category="cat",
+                    message="orphaned boom",
+                    condition_id=None,
+                    created=datetime.now(UTC) - timedelta(minutes=10),
+                )
+            )
+        await session.commit()
+
+        first = await query_attention(session)
+        assert [c["template"] for c in first["conditions"]] == ["loud"]
+
+        # The sweeper adopts them — the condition is born now, after the
+        # snapshot the first call took.
+        await sync_condition_stats(session)
+        await session.commit()
+
+        second = await query_attention(session, cursor=first["cursor"])
+
+        assert [c["template"] for c in second["conditions"]] == ["orphaned boom"]
+        assert second["conditions"][0]["count_since_cursor"] == 2
+        assert second["cursor"] > first["cursor"]
+
+    async def test_limit_truncation_is_cursor_safe(self, session, session_factory):
+        """A truncated condition is drained by the next call, never skipped."""
+        opsalert.configure(session_factory=session_factory)
+        for message in ("first", "second", "third"):
+            await _fire_old(session, message=message)
+        await session.commit()
+        await sync_condition_stats(session)
+        await session.commit()
+
+        page1 = await query_attention(session, limit=2)
+        assert [c["template"] for c in page1["conditions"]] == ["first", "second"]
+
+        page2 = await query_attention(session, cursor=page1["cursor"], limit=2)
+        assert [c["template"] for c in page2["conditions"]] == ["third"]
+
+        page3 = await query_attention(session, cursor=page2["cursor"], limit=2)
+        assert page3["conditions"] == []
+        assert page3["cursor"] == page2["cursor"]
+
+    async def test_a_reported_condition_repeats_only_when_it_fires_again(
+        self, session, session_factory
+    ):
+        opsalert.configure(session_factory=session_factory)
+        await _fire_old(session, message="loud")
+        await session.commit()
+        await sync_condition_stats(session)
+        await session.commit()
+
+        first = await query_attention(session)
+        quiet = await query_attention(session, cursor=first["cursor"])
+        assert quiet["conditions"] == []
+        assert quiet["cursor"] == first["cursor"]
+
+        await _fire_old(session, message="loud")
+        await session.commit()
+
+        again = await query_attention(session, cursor=quiet["cursor"])
+        assert [c["template"] for c in again["conditions"]] == ["loud"]
+        assert again["conditions"][0]["count_since_cursor"] == 1
+
+    async def test_an_empty_attention_set_hands_the_cursor_straight_back(
+        self, session, session_factory
+    ):
+        """Nothing to report must not move the cursor — in either direction."""
+        opsalert.configure(session_factory=session_factory)
+        await _fire_old(session, severity="warn", message="quiet")  # digest, never here
+        await session.commit()
+        await sync_condition_stats(session)
+        await session.commit()
+
+        bootstrap = await query_attention(session)
+        assert bootstrap["conditions"] == []
+        assert bootstrap["cursor"] == 0
+
+        held = await query_attention(session, cursor=17)
+        assert held["conditions"] == []
+        assert held["cursor"] == 17
+
+    async def test_a_cursor_beyond_every_occurrence_comes_back_unchanged(
+        self, session, session_factory
+    ):
+        """The cursor never moves backwards, even when it is ahead of the table."""
+        opsalert.configure(session_factory=session_factory)
+        await _fire_old(session, message="loud")
+        await session.commit()
+        await sync_condition_stats(session)
+        await session.commit()
+
+        result = await query_attention(session, cursor=10_000)
+
+        assert result["conditions"] == []
+        assert result["cursor"] == 10_000
+
+    async def test_a_quiet_new_condition_neither_reports_nor_holds_the_cursor_back(
+        self, session, session_factory
+    ):
+        """Still ``new``, but everything it did is below the cursor."""
+        opsalert.configure(session_factory=session_factory)
+        await _fire_old(session, message="old news")
+        await session.commit()
+        await sync_condition_stats(session)
+        await session.commit()
+        cursor = (await query_attention(session))["cursor"]
+
+        await _fire_old(session, message="fresh")
+        await session.commit()
+        await sync_condition_stats(session)
+        await session.commit()
+
+        result = await query_attention(session, cursor=cursor)
+
+        assert [c["template"] for c in result["conditions"]] == ["fresh"]
+        fresh = (
+            await session.execute(
+                select(Alert).where(Alert.message == "fresh")
+            )
+        ).scalar_one()
+        assert result["cursor"] == fresh.id
+
+    async def test_bootstrap_lists_a_condition_with_no_occurrences_without_a_cursor_jump(
+        self, session, session_factory
+    ):
+        """A zero-occurrence condition is visible but contributes no cursor."""
+        opsalert.configure(session_factory=session_factory)
+        session.add(
+            AlertCondition(
+                signature_key="empty-one",
+                category="cat",
+                message_template="never fired",
+                status="new",
+                severity="error",
+                latest_severity="error",
+            )
+        )
+        await session.commit()
+
+        result = await query_attention(session)
+
+        assert [c["template"] for c in result["conditions"]] == ["never fired"]
+        assert result["cursor"] == 0
+
 
 class TestNextFixExcludesHandledConditions:
     """A15/P11 — do not hand back work somebody already picked up."""
