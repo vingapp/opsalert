@@ -1,6 +1,6 @@
 """Tests for transport implementations."""
 import json
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 import pytest
 
@@ -35,7 +35,9 @@ class TestCallableTransport:
 
         transport = CallableTransport(mock_send)
         msg = _make_message()
-        result = transport.send(msg, to="ops@test.com", from_addr="alert@test.com", from_name="Alerts")
+        result = transport.send(
+            msg, to="ops@test.com", from_addr="alert@test.com", from_name="Alerts"
+        )
 
         assert result is True
         assert len(calls) == 1
@@ -83,52 +85,93 @@ class TestLogTransport:
         assert "infra" in caplog.text
 
 
+class _FakeResponse:
+    """Stands in for the urlopen context manager — a real object, not a mock."""
+
+    def __init__(self, status: int) -> None:
+        self.status = status
+
+    def __enter__(self) -> "_FakeResponse":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        return False
+
+
+class _FakeUrlopen:
+    """Records the Request it was handed and returns a canned response."""
+
+    def __init__(self, status: int = 200) -> None:
+        self._status = status
+        self.calls: list[tuple[object, object]] = []
+
+    def __call__(self, req, timeout=None):
+        self.calls.append((req, timeout))
+        return _FakeResponse(self._status)
+
+    @property
+    def request(self):
+        assert len(self.calls) == 1, f"expected exactly one urlopen call, got {len(self.calls)}"
+        return self.calls[0][0]
+
+    @property
+    def timeout(self):
+        assert len(self.calls) == 1, f"expected exactly one urlopen call, got {len(self.calls)}"
+        return self.calls[0][1]
+
+
 class TestWebhookTransport:
-    """Test WebhookTransport with mocked urllib."""
+    """Test WebhookTransport against a fake urlopen."""
 
-    @patch("opsalert.transport.urllib.request.urlopen")
-    def test_posts_json(self, mock_urlopen):
+    def test_posts_json(self):
         """POSTs JSON payload to the configured URL."""
-        mock_resp = MagicMock()
-        mock_resp.status = 200
-        mock_resp.__enter__ = lambda s: s
-        mock_resp.__exit__ = MagicMock(return_value=False)
-        mock_urlopen.return_value = mock_resp
-
-        transport = WebhookTransport("https://hooks.example.com/alert")
-        msg = _make_message(severity="error", category="sendgrid")
-        result = transport.send(msg, to="ops@test.com", from_addr="a", from_name="b")
+        fake_urlopen = _FakeUrlopen(status=200)
+        with patch("opsalert.transport.urllib.request.urlopen", new=fake_urlopen):
+            transport = WebhookTransport("https://hooks.example.com/alert")
+            msg = _make_message(severity="error", category="sendgrid")
+            result = transport.send(msg, to="ops@test.com", from_addr="a", from_name="b")
 
         assert result is True
-        mock_urlopen.assert_called_once()
-        req = mock_urlopen.call_args[0][0]
+        assert len(fake_urlopen.calls) == 1
+        req = fake_urlopen.request
+        assert req.full_url == "https://hooks.example.com/alert"
         payload = json.loads(req.data)
         assert payload["severity"] == "error"
         assert payload["category"] == "sendgrid"
+        assert fake_urlopen.timeout == 10
 
-    @patch("opsalert.transport.urllib.request.urlopen")
-    def test_returns_false_on_error(self, mock_urlopen):
+    def test_returns_false_on_error(self):
         """Returns False on network error."""
-        mock_urlopen.side_effect = ConnectionError("down")
+        def boom(req, timeout=None):
+            raise ConnectionError("down")
 
-        transport = WebhookTransport("https://hooks.example.com/alert")
-        result = transport.send(_make_message(), to="a", from_addr="b", from_name="c")
+        with patch("opsalert.transport.urllib.request.urlopen", new=boom):
+            transport = WebhookTransport("https://hooks.example.com/alert")
+            result = transport.send(_make_message(), to="a", from_addr="b", from_name="c")
+
         assert result is False
 
-    @patch("opsalert.transport.urllib.request.urlopen")
-    def test_custom_headers(self, mock_urlopen):
+    @pytest.mark.parametrize("status", [300, 404, 500])
+    def test_returns_false_on_non_2xx(self, status):
+        """A non-2xx response is a failed send."""
+        fake_urlopen = _FakeUrlopen(status=status)
+        with patch("opsalert.transport.urllib.request.urlopen", new=fake_urlopen):
+            transport = WebhookTransport("https://hooks.example.com/alert")
+            result = transport.send(_make_message(), to="a", from_addr="b", from_name="c")
+
+        assert result is False
+        assert len(fake_urlopen.calls) == 1
+
+    def test_custom_headers(self):
         """Custom headers are included in the request."""
-        mock_resp = MagicMock()
-        mock_resp.status = 200
-        mock_resp.__enter__ = lambda s: s
-        mock_resp.__exit__ = MagicMock(return_value=False)
-        mock_urlopen.return_value = mock_resp
+        fake_urlopen = _FakeUrlopen(status=200)
+        with patch("opsalert.transport.urllib.request.urlopen", new=fake_urlopen):
+            transport = WebhookTransport(
+                "https://hooks.example.com/alert",
+                headers={"Authorization": "Bearer tok123"},
+            )
+            transport.send(_make_message(), to="a", from_addr="b", from_name="c")
 
-        transport = WebhookTransport(
-            "https://hooks.example.com/alert",
-            headers={"Authorization": "Bearer tok123"},
-        )
-        transport.send(_make_message(), to="a", from_addr="b", from_name="c")
-
-        req = mock_urlopen.call_args[0][0]
+        req = fake_urlopen.request
         assert req.get_header("Authorization") == "Bearer tok123"
+        assert req.get_header("Content-type") == "application/json"
