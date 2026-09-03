@@ -9,6 +9,7 @@ import pytest
 from sqlalchemy import select
 
 from opsalert.lifecycle import (
+    ACK_BURST_MIN,
     AUTO_CLOSE_FLOOR,
     apply_lifecycle_rules,
     effective_disposition,
@@ -492,6 +493,387 @@ class TestHumanTransitions:
         assert condition.disposition == "collect"
         await set_disposition(session, condition, None, actor="chris")
         assert condition.disposition is None
+
+
+class TestAckEscalation:
+    """opsalert#7: an acknowledged condition returns to ``new`` when it gets
+    worse or a lease expires — "acknowledged" must not mean "silent forever".
+    """
+
+    async def _synced_condition(self, session, *, occurrences=1, severity="warn", now=None):
+        now = now or datetime.now(UTC)
+        for _ in range(occurrences):
+            await _fire_backdated(session, severity=severity, now=now)
+        await session.commit()
+        await sync_condition_stats(session, now=now)
+        await session.commit()
+        return await _the_condition(session)
+
+    async def test_ack_stamps_severity_count_and_lease(self, session):
+        """If ack stops stamping the baseline, escalation has nothing to
+        compare the current state against and can never fire."""
+        now = datetime.now(UTC)
+        condition = await self._synced_condition(session, occurrences=3, severity="warn", now=now)
+        await set_status(session, condition, "acknowledged", actor="chris", now=now)
+        await session.commit()
+
+        assert condition.acknowledged_severity == "warn"
+        assert condition.acknowledged_occurrence_count == 3
+        assert condition.acknowledged_until is None
+
+    async def test_ack_rejects_lease_in_the_past(self, session):
+        """A lease already in the past would reopen on the very next sweep
+        — that isn't a lease, it's a no-op acknowledgement."""
+        now = datetime.now(UTC)
+        condition = await self._synced_condition(session, now=now)
+        with pytest.raises(ValueError):
+            await set_status(
+                session,
+                condition,
+                "acknowledged",
+                actor="chris",
+                now=now,
+                acknowledged_until=now - timedelta(minutes=1),
+            )
+
+    async def test_reack_restamps_baseline(self, session):
+        """Re-acknowledging must re-baseline, or a renewed ack keeps
+        comparing new occurrences against a stale count/severity forever."""
+        now = datetime.now(UTC)
+        condition = await self._synced_condition(session, occurrences=1, severity="warn", now=now)
+        await set_status(session, condition, "acknowledged", actor="chris", now=now)
+        await session.commit()
+        assert condition.acknowledged_occurrence_count == 1
+        assert condition.acknowledged_severity == "warn"
+
+        later = now + timedelta(hours=1)
+        await _fire_backdated(session, severity="error", age=timedelta(minutes=5), now=later)
+        await session.commit()
+        await set_status(session, condition, "acknowledged", actor="chris", now=later)
+        await session.commit()
+
+        assert condition.acknowledged_occurrence_count == 2
+        assert condition.acknowledged_severity == "error"
+
+    async def test_escalate_severity_reopens_acknowledged(self, session):
+        """If escalation doesn't fire, a condition that got strictly worse
+        after acknowledgement stays silently acknowledged."""
+        now = datetime.now(UTC)
+        condition = await self._synced_condition(session, occurrences=2, severity="warn", now=now)
+        await set_status(session, condition, "acknowledged", actor="chris", now=now)
+        await session.commit()
+
+        later = now + timedelta(minutes=10)
+        await _fire_backdated(session, severity="error", age=timedelta(minutes=1), now=later)
+        await session.commit()
+
+        result = await apply_lifecycle_rules(session, now=later + timedelta(minutes=5))
+        await session.commit()
+
+        assert result["escalated"] == 1
+        assert condition.status == "new"
+        assert condition.reopened_count == 1
+        assert "severity escalated" in (condition.notes or "")
+        assert condition.acknowledged_at is None
+        assert condition.acknowledged_severity is None
+        assert condition.acknowledged_occurrence_count is None
+        assert condition.acknowledged_until is None
+
+    async def test_escalate_severity_ignores_pre_ack_occurrences(self, session):
+        """Rule 1 must only look at occurrences since the ack, or an old
+        error from before the ack would reopen every warn-level condition."""
+        now = datetime.now(UTC)
+        await _fire_backdated(session, severity="error", age=timedelta(minutes=30), now=now)
+        await session.commit()
+        await sync_condition_stats(session, now=now)
+        await session.commit()
+        condition = await _the_condition(session)
+        await set_status(session, condition, "acknowledged", actor="chris", now=now)
+        await session.commit()
+        assert condition.acknowledged_severity == "error"
+
+        later = now + timedelta(minutes=10)
+        await _fire_backdated(session, severity="warn", age=timedelta(minutes=1), now=later)
+        await session.commit()
+
+        result = await apply_lifecycle_rules(session, now=later + timedelta(minutes=5))
+        await session.commit()
+
+        assert result["escalated"] == 0
+        assert condition.status == "acknowledged"
+
+    async def test_burst_reopens_acknowledged(self, session):
+        """If burst detection doesn't fire, a convoy-shaped condition — a
+        near-instant median even at a modest long-run rate — never re-wakes
+        the watch."""
+        now = datetime.now(UTC)
+        for h in range(24):
+            await _fire_backdated(session, severity="warn", age=timedelta(hours=24 - h), now=now)
+        await session.commit()
+        await sync_condition_stats(session, now=now)
+        await session.commit()
+        condition = await _the_condition(session)
+        assert condition.occurrence_count == 24
+        await set_status(session, condition, "acknowledged", actor="chris", now=now)
+        await session.commit()
+
+        later = now + timedelta(hours=2)
+        for _ in range(12):
+            await _fire_backdated(session, severity="warn", age=timedelta(minutes=1), now=later)
+        await session.commit()
+
+        result = await apply_lifecycle_rules(session, now=later + timedelta(minutes=1))
+        await session.commit()
+
+        assert result["escalated"] == 1
+        assert condition.status == "new"
+        assert "burst" in (condition.notes or "")
+
+    async def test_burst_below_minimum_does_not_reopen(self, session):
+        """ACK_BURST_MIN exists so a handful of extra occurrences — normal
+        noise — never trips a reopen; only a real burst should."""
+        now = datetime.now(UTC)
+        for h in range(24):
+            await _fire_backdated(session, severity="warn", age=timedelta(hours=24 - h), now=now)
+        await session.commit()
+        await sync_condition_stats(session, now=now)
+        await session.commit()
+        condition = await _the_condition(session)
+        await set_status(session, condition, "acknowledged", actor="chris", now=now)
+        await session.commit()
+
+        later = now + timedelta(hours=2)
+        for _ in range(9):
+            await _fire_backdated(session, severity="warn", age=timedelta(minutes=1), now=later)
+        await session.commit()
+
+        result = await apply_lifecycle_rules(session, now=later + timedelta(minutes=1))
+        await session.commit()
+
+        assert result["escalated"] == 0
+        assert condition.status == "acknowledged"
+
+    async def test_burst_within_baseline_does_not_reopen(self, session):
+        """The burst rule must compare against the RATE, not a raw count —
+        otherwise a condition that has always been this chatty gets
+        punished for behaving exactly as it always has."""
+        now = datetime.now(UTC)
+        await _fire_backdated(session, severity="warn", age=timedelta(minutes=30), now=now)
+        await session.commit()
+        await sync_condition_stats(session, now=now)
+        await session.commit()
+        condition = await _the_condition(session)
+        await set_status(session, condition, "acknowledged", actor="chris", now=now)
+        condition.acknowledged_occurrence_count = 600
+        condition.first_seen = now - timedelta(hours=1)
+        await session.commit()
+
+        later = now + timedelta(hours=2)
+        for _ in range(15):
+            await _fire_backdated(session, severity="warn", age=timedelta(minutes=1), now=later)
+        await session.commit()
+
+        result = await apply_lifecycle_rules(session, now=later + timedelta(minutes=1))
+        await session.commit()
+
+        assert result["escalated"] == 0
+        assert condition.status == "acknowledged"
+
+    async def test_ack_mid_burst_baseline_uses_live_occurrences_not_stale_counter(
+        self, session
+    ):
+        """Amendment: ``occurrence_count`` lags a sweep + STATS_LAG_SECONDS.
+        Acking mid-burst while that column is still 0 must not baseline at
+        0 (which would re-trip on the very next sweep) — the ack-time count
+        is read directly off Alert rows created at or before the ack."""
+        now = datetime.now(UTC)
+        for _ in range(12):
+            await _fire_backdated(session, severity="warn", age=timedelta(minutes=1), now=now)
+        await session.commit()
+        condition = await _the_condition(session)
+        assert condition.occurrence_count == 0  # never synced — the stale value
+
+        await set_status(session, condition, "acknowledged", actor="chris", now=now)
+        await session.commit()
+        assert condition.acknowledged_occurrence_count == 12
+
+        # A sweep one minute later, nothing new fired: must not reopen.
+        result = await apply_lifecycle_rules(session, now=now + timedelta(minutes=1))
+        await session.commit()
+        assert result["escalated"] == 0
+        assert condition.status == "acknowledged"
+
+        # 12 more within baseline (baseline = 12/hour floored to 1h -> 3/15m;
+        # 12 in 15m is under 5x -> still no reopen).
+        later = now + timedelta(minutes=10)
+        for _ in range(12):
+            await _fire_backdated(session, severity="warn", age=timedelta(minutes=1), now=later)
+        await session.commit()
+        result = await apply_lifecycle_rules(session, now=later + timedelta(minutes=1))
+        await session.commit()
+        assert result["escalated"] == 0
+        assert condition.status == "acknowledged"
+
+        # A real burst well past 5x baseline reopens it.
+        even_later = later + timedelta(minutes=10)
+        for _ in range(20):
+            await _fire_backdated(
+                session, severity="warn", age=timedelta(minutes=1), now=even_later
+            )
+        await session.commit()
+        result = await apply_lifecycle_rules(session, now=even_later + timedelta(minutes=1))
+        await session.commit()
+        assert result["escalated"] == 1
+        assert condition.status == "new"
+
+    async def test_collect_disposition_is_exempt_from_escalation(self, session):
+        """acknowledged + collect is the spelling of wontfix: a human decided
+        this is never acted on. If escalation reopened it, every deploy-time
+        burst on a wontfix condition would churn reopened_count and notes for
+        nobody — collect never wakes anyone regardless of status."""
+        now = datetime.now(UTC)
+        condition = await self._synced_condition(session, occurrences=1, severity="warn", now=now)
+        await set_status(session, condition, "acknowledged", actor="chris", now=now)
+        await set_disposition(session, condition, "collect", actor="chris")
+        await session.commit()
+
+        later = now + timedelta(minutes=5)
+        for _ in range(ACK_BURST_MIN + 5):
+            await _fire_backdated(session, severity="critical", now=later)
+        await session.commit()
+        await sync_condition_stats(session, now=later + timedelta(minutes=2))
+        result = await apply_lifecycle_rules(session, now=later + timedelta(minutes=2))
+        await session.commit()
+
+        assert result["escalated"] == 0
+        assert condition.status == "acknowledged"
+
+    async def test_lease_expiry_reopens_when_still_firing(self, session):
+        """If lease expiry doesn't fire, a time-boxed ack becomes a
+        permanent one the moment the operator forgets to follow up."""
+        now = datetime.now(UTC)
+        condition = await self._synced_condition(session, occurrences=1, severity="warn", now=now)
+        await set_status(
+            session,
+            condition,
+            "acknowledged",
+            actor="chris",
+            now=now,
+            acknowledged_until=now + timedelta(hours=1),
+        )
+        await session.commit()
+
+        fire_time = now + timedelta(minutes=30)
+        await _fire_backdated(session, severity="warn", age=timedelta(minutes=1), now=fire_time)
+        await session.commit()
+
+        sweep_now = now + timedelta(hours=2)
+        await sync_condition_stats(session, now=sweep_now)
+        await session.commit()
+
+        result = await apply_lifecycle_rules(session, now=sweep_now)
+        await session.commit()
+
+        assert result["escalated"] == 1
+        assert condition.status == "new"
+        assert "lease expired" in (condition.notes or "")
+
+    async def test_lease_expiry_quiet_condition_stays_acknowledged(self, session):
+        """Expiry with no occurrence since ack must be a no-op — the
+        existing auto-close/auto-stale rules own a condition that went
+        quiet, not this one."""
+        now = datetime.now(UTC)
+        condition = await self._synced_condition(session, occurrences=1, severity="warn", now=now)
+        await set_status(
+            session,
+            condition,
+            "acknowledged",
+            actor="chris",
+            now=now,
+            acknowledged_until=now + timedelta(hours=1),
+        )
+        await session.commit()
+
+        result = await apply_lifecycle_rules(session, now=now + timedelta(hours=2))
+        await session.commit()
+
+        assert result["escalated"] == 0
+        assert condition.status == "acknowledged"
+
+    async def test_lease_not_expired_no_reopen(self, session):
+        """A lease still inside its window must not reopen the condition,
+        or 'acknowledge with a lease' just means 'acknowledge, then
+        immediately reopen'."""
+        now = datetime.now(UTC)
+        condition = await self._synced_condition(session, occurrences=1, severity="warn", now=now)
+        await set_status(
+            session,
+            condition,
+            "acknowledged",
+            actor="chris",
+            now=now,
+            acknowledged_until=now + timedelta(hours=1),
+        )
+        await session.commit()
+
+        fire_time = now + timedelta(minutes=10)
+        await _fire_backdated(session, severity="warn", age=timedelta(minutes=1), now=fire_time)
+        await session.commit()
+        sweep_now = now + timedelta(minutes=30)
+        await sync_condition_stats(session, now=sweep_now)
+        await session.commit()
+
+        result = await apply_lifecycle_rules(session, now=sweep_now)
+        await session.commit()
+
+        assert result["escalated"] == 0
+        assert condition.status == "acknowledged"
+
+    async def test_legacy_ack_without_baseline(self, session):
+        """Amendment: a legacy NULL ``acknowledged_severity`` must SKIP rule
+        1 rather than fall back to ``condition.severity`` — by the time this
+        rule runs, ``sync_condition_stats`` has already folded any post-ack
+        occurrence into ``condition.severity``, so "worse than worst-ever"
+        could never trip and a fallback would silently disable escalation
+        for exactly the legacy rows that need it most."""
+        now = datetime.now(UTC)
+        await _fire_backdated(session, severity="error", age=timedelta(minutes=30), now=now)
+        await session.commit()
+        await sync_condition_stats(session, now=now)
+        await session.commit()
+        condition = await _the_condition(session)
+        await set_status(session, condition, "acknowledged", actor="chris", now=now)
+        # Simulate a pre-migration row: baseline unknowable.
+        condition.acknowledged_severity = None
+        condition.acknowledged_occurrence_count = None
+        await session.commit()
+
+        # A brand-new critical occurrence (worse than anything ever seen)
+        # must NOT escalate via rule 1 while severity baseline is NULL.
+        later = now + timedelta(minutes=10)
+        await _fire_backdated(session, severity="critical", age=timedelta(minutes=1), now=later)
+        await session.commit()
+        await sync_condition_stats(session, now=later + timedelta(minutes=5))
+        await session.commit()
+
+        result = await apply_lifecycle_rules(session, now=later + timedelta(minutes=5))
+        await session.commit()
+        assert result["escalated"] == 0
+        assert condition.status == "acknowledged"
+
+        # NULL count still baselines at 0 — a burst of >= ACK_BURST_MIN does
+        # reopen it even with severity escalation unavailable.
+        even_later = later + timedelta(minutes=20)
+        for _ in range(10):
+            await _fire_backdated(
+                session, severity="warn", age=timedelta(minutes=1), now=even_later
+            )
+        await session.commit()
+        result2 = await apply_lifecycle_rules(session, now=even_later + timedelta(minutes=1))
+        await session.commit()
+        assert result2["escalated"] == 1
+        assert condition.status == "new"
+        assert "burst" in (condition.notes or "")
 
 
 class TestEffectiveDisposition:

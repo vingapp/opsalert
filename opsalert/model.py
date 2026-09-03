@@ -106,6 +106,12 @@ class AlertCondition(OpsAlertBase):
     occurrence pruning: they are maintained by the stats sweeper up to the
     ``stats_synced_through`` watermark, and cleanup may only delete
     occurrences at or below that watermark (P3).
+
+    ``acknowledged`` does not mean silenced forever: ``acknowledged_severity``,
+    ``acknowledged_occurrence_count`` and ``acknowledged_until`` let the
+    lifecycle sweep notice the episode got worse (severity escalation, a
+    burst far above the ack-time rate) or that a time-boxed lease expired
+    while the condition kept firing, and reopen it (opsalert#7).
     """
 
     __tablename__ = "alert_condition"
@@ -149,6 +155,19 @@ class AlertCondition(OpsAlertBase):
         DateTime(timezone=True), nullable=True
     )
     acknowledged_by: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    # Baseline captured AT ack time, so the escalation rule (opsalert#7) has
+    # something to compare the condition's current state against. NULL on
+    # rows acknowledged before this column existed, and on any row where the
+    # ack predates the baseline being known — lifecycle.py treats NULL as
+    # "unknowable", not "zero", except where documented at the call site.
+    acknowledged_severity: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    acknowledged_occurrence_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Optional lease: past this time, a still-firing acknowledged condition
+    # reopens even without escalation or burst — the operator said "I've got
+    # this for a while", not "forever".
+    acknowledged_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     status_changed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )

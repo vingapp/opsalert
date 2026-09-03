@@ -6,12 +6,26 @@ Three jobs live here:
    counters, so the counters survive the occurrences (which are pruned).
 2. :func:`apply_lifecycle_rules` runs the automatic transitions: reopen,
    auto-close of a resolved condition that has gone quiet, auto-stale of a
-   condition nobody ever triaged and that stopped happening.
+   condition nobody ever triaged and that stopped happening, and escalation
+   of an acknowledged condition that got worse (opsalert#7): a new all-time
+   severity, a burst far above its ack-time rate, or a lease that expired
+   while it kept firing.
 3. :func:`set_status` / :func:`set_disposition` are the human edits, with
    transition validation and audit stamps.
 
 Plain async functions, no scheduler dependency — the host app wires them into
 whatever sweeper it runs.
+
+opsalert#7 option 3 (tie the acknowledgement to the GitHub issue staying
+open) is deliberately NOT implemented: opsalert runs inside the host app and
+has no GitHub credentials or network access to check issue state.
+
+The three baseline columns the escalation rule reads (``acknowledged_severity``,
+``acknowledged_occurrence_count``, ``acknowledged_until``) are DDL owned by the
+host app's alembic migrations, not by this package's ``ensure_tables``
+(create_all only, never alters an existing table) — the host MUST apply that
+migration before running this version, since ``select(AlertCondition)``
+selects every mapped column and a missing column fails the query outright.
 """
 import json
 import logging
@@ -67,6 +81,23 @@ AUTO_STALE_SILENCE = timedelta(days=30)
 
 # How many recent inter-arrival gaps feed the median.
 MEDIAN_SAMPLE = 50
+
+# opsalert#7 — an acknowledged condition reopens when it gets worse than it
+# was at ack time. Burst detection compares the CURRENT rate against a
+# baseline rate computed over the condition's whole pre-ack lifetime
+# (occurrence_count / age), never against ``median_interval_seconds``: the
+# median is the median of the last MEDIAN_SAMPLE gaps, and for a convoy-shaped
+# condition (bursts separated by long quiet stretches) that median tracks the
+# few seconds BETWEEN convoy members even when the long-run rate is a handful
+# per hour — a median-based rule would never trip for exactly the conditions
+# this rule exists to catch (prod condition 261).
+ACK_BURST_WINDOW = timedelta(minutes=15)
+ACK_BURST_MIN = 10
+ACK_BURST_MULTIPLE = 5
+# Floor under the baseline's age denominator: a condition acknowledged
+# minutes after it first appeared must not get a wildly inflated baseline
+# rate from a near-zero age.
+ACK_BASELINE_MIN_AGE = timedelta(hours=1)
 
 _SEVERITY_ORDER = {
     AlertSeverity.WARN.value: 1,
@@ -127,6 +158,9 @@ def reopen_condition(condition: AlertCondition, *, now: datetime | None = None) 
     condition.closed_at = None
     condition.acknowledged_at = None
     condition.acknowledged_by = None
+    condition.acknowledged_severity = None
+    condition.acknowledged_occurrence_count = None
+    condition.acknowledged_until = None
     logger.warning(
         "opsalert: condition %s (%s) reopened — it fired again after being closed out",
         condition.id,
@@ -435,12 +469,145 @@ async def apply_lifecycle_rules(session, *, now: datetime | None = None) -> dict
     reopened = await _reopen_recurrences(session, now=now)
     auto_closed = await _auto_close_resolved(session, now=now)
     auto_staled = await _auto_stale_new(session, now=now)
+    escalated = await _escalate_acknowledged(session, now=now)
     await session.flush()
     return {
         "reopened": reopened,
         "auto_closed": auto_closed,
         "auto_staled": auto_staled,
+        "escalated": escalated,
     }
+
+
+async def _escalate_acknowledged(session, *, now: datetime) -> int:
+    """Bring an acknowledged condition back to ``new`` when it got worse.
+
+    "Acknowledged" means a human has seen THIS episode and owns it — not
+    "silent forever". Three independent triggers, checked in this order
+    (first match wins) for every acknowledged condition:
+
+    1. Severity escalation — an occurrence since the ack outranks the worst
+       severity the condition had AT ack time.
+    2. Burst — occurrences in the last :data:`ACK_BURST_WINDOW` are at least
+       :data:`ACK_BURST_MIN` and that rate is more than
+       :data:`ACK_BURST_MULTIPLE` times the condition's baseline rate at ack
+       time (occurrence_count / age, floored at :data:`ACK_BASELINE_MIN_AGE`
+       — see the module-level comment for why this is NOT the median).
+    3. Lease expiry — ``acknowledged_until`` has passed AND the condition has
+       fired since the ack (``last_seen > acknowledged_at``). A lease expiring
+       on a condition that went quiet does nothing; the auto-close/auto-stale
+       rules own a quiet condition.
+
+    One aggregate query per acknowledged condition covers both occurrence
+    rules — acknowledged conditions are few (dozens), so per-condition is
+    fine, but a query per condition per rule is not.
+
+    NULL ``acknowledged_severity``/``acknowledged_occurrence_count`` (rows
+    acknowledged before this column existed) do NOT fall back to
+    ``condition.severity``. The sweep runs :func:`sync_condition_stats`
+    before this rule, and that fold already merges every post-ack occurrence
+    into ``condition.severity`` — "worse than the worst-ever" could then
+    never trip, silently disabling escalation for exactly the rows most in
+    need of it. So NULL severity means the ack-time baseline is genuinely
+    unknowable and rule 1 is SKIPPED for that condition (the host migration
+    backfills the baseline for pre-existing rows, so this is transient).
+    NULL count still means a baseline of 0 for rule 2, so any burst at or
+    above ``ACK_BURST_MIN`` trips it — legacy acks made no rate promise.
+    """
+    conditions = (
+        (
+            await session.execute(
+                select(AlertCondition).where(AlertCondition.status == STATUS_ACKNOWLEDGED)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not conditions:
+        return 0
+
+    window_start = now - ACK_BURST_WINDOW
+    escalated = 0
+    for condition in conditions:
+        if condition.disposition == DISPOSITION_COLLECT:
+            # "wontfix" (acknowledged + collect): a human decided this is never
+            # to be acted on. Reopening it would only churn reopened_count —
+            # collect never wakes anyone either way, and the operator's
+            # decision stands until they change the disposition.
+            continue
+        ack_at = condition.acknowledged_at
+        if ack_at is None:
+            # No ack timestamp at all — nothing to compare occurrences
+            # against; leave it alone rather than guess.
+            continue
+
+        # One aggregate query covers both occurrence rules: the max severity
+        # rank over every occurrence since ack (rule 1) and a count of just
+        # the ones inside the burst window (rule 2), via a conditional
+        # aggregate rather than two round trips.
+        row = (
+            await session.execute(
+                select(
+                    func.max(_ALERT_SEVERITY_RANK).label("max_rank_since_ack"),
+                    func.count(case((Alert.created > window_start, 1))).label("burst_count"),
+                ).where(Alert.condition_id == condition.id, Alert.created > ack_at)
+            )
+        ).one()
+        max_rank_since_ack = row.max_rank_since_ack
+
+        note = None
+
+        ack_severity = condition.acknowledged_severity
+        if ack_severity is not None:
+            ack_rank = _SEVERITY_ORDER.get(ack_severity, 0)
+            worst_since_rank = max_rank_since_ack or 0
+            if worst_since_rank > ack_rank:
+                worst_since = _RANK_TO_SEVERITY.get(worst_since_rank, "?")
+                note = (
+                    f"reopened: severity escalated {ack_severity} → {worst_since} "
+                    "after acknowledgement"
+                )
+        if note is None:
+            burst_count = row.burst_count or 0
+            if burst_count >= ACK_BURST_MIN:
+                ack_count = condition.acknowledged_occurrence_count or 0
+                # baseline_rate = acknowledged_occurrence_count / age at ack,
+                # age floored so a condition acked minutes after it first
+                # appeared doesn't get a wildly inflated baseline rate.
+                first_seen = _naive(condition.first_seen)
+                naive_ack_at = _naive(ack_at)
+                baseline_span = (
+                    max(naive_ack_at - first_seen, ACK_BASELINE_MIN_AGE)
+                    if first_seen is not None
+                    else ACK_BASELINE_MIN_AGE
+                )
+                baseline_rate_per_15m = ack_count / (baseline_span.total_seconds() / 60 / 15)
+                if burst_count > ACK_BURST_MULTIPLE * baseline_rate_per_15m:
+                    window_minutes = int(ACK_BURST_WINDOW.total_seconds() // 60)
+                    note = (
+                        f"reopened: burst {burst_count} in {window_minutes}m vs baseline "
+                        f"{baseline_rate_per_15m:.1f}/15m after acknowledgement"
+                    )
+            if note is None and condition.acknowledged_until is not None:
+                until = _naive(condition.acknowledged_until)
+                naive_now = _naive(now)
+                last_seen = _naive(condition.last_seen)
+                naive_ack_at = _naive(ack_at)
+                if (
+                    naive_now > until
+                    and last_seen is not None
+                    and last_seen > naive_ack_at
+                ):
+                    note = "reopened: acknowledgement lease expired while still firing"
+
+        if note is None:
+            continue
+
+        reopen_condition(condition, now=now)
+        condition.notes = _append_note(condition.notes, note)
+        escalated += 1
+
+    return escalated
 
 
 async def _reopen_recurrences(session, *, now: datetime) -> int:
@@ -576,6 +743,7 @@ async def set_status(
     resolved_by: str | None = None,
     notes: str | None = None,
     now: datetime | None = None,
+    acknowledged_until: datetime | None = None,
 ) -> AlertCondition:
     """Move a condition to ``status``, validating the transition and stamping it.
 
@@ -583,8 +751,18 @@ async def set_status(
     operator action on an admin surface, not the fire path — refusing it out
     loud is right; a silently-ignored acknowledgement would leave someone
     believing an alert was handled.
+
+    Acknowledging (including re-acknowledging an already-acknowledged
+    condition — the same-status path below still reaches this) stamps
+    ``acknowledged_severity``/``acknowledged_occurrence_count`` from the
+    condition's current state and, if given, ``acknowledged_until`` — a lease
+    an operator uses to renew, or to re-baseline after a burst. ``now`` if the
+    lease has already passed is refused: a lease in the past reopens on the
+    very next sweep, which is not what "acknowledge with a lease" means.
     """
     now = now or datetime.now(UTC)
+    if acknowledged_until is not None and _naive(acknowledged_until) <= _naive(now):
+        raise ValueError("acknowledged_until must be in the future")
     condition = await _load(session, condition)
 
     if status not in STATUSES:
@@ -599,6 +777,23 @@ async def set_status(
     if status == STATUS_ACKNOWLEDGED:
         condition.acknowledged_at = now
         condition.acknowledged_by = actor
+        # ``occurrence_count``/``severity`` are stats-sweep counters, stale by
+        # up to a sweep interval plus STATS_LAG_SECONDS — a condition acked
+        # mid-burst could have occurrence_count still 0, which would make it
+        # re-trip the burst rule on the very next sweep. Count and rank
+        # directly off Alert rows created at or before this ack instead.
+        ack_count, ack_max_rank = (
+            await session.execute(
+                select(
+                    func.count(Alert.id),
+                    func.max(_ALERT_SEVERITY_RANK),
+                ).where(Alert.condition_id == condition.id, Alert.created <= now)
+            )
+        ).one()
+        condition.acknowledged_occurrence_count = ack_count or 0
+        occurrence_severity = _RANK_TO_SEVERITY.get(ack_max_rank or 0)
+        condition.acknowledged_severity = worst_severity(condition.severity, occurrence_severity)
+        condition.acknowledged_until = acknowledged_until
     elif status == STATUS_RESOLVED:
         condition.resolved_at = now
         condition.resolved_by = resolved_by or actor
@@ -626,6 +821,9 @@ async def set_status(
         # Back to untriaged: the old acknowledgement no longer describes it.
         condition.acknowledged_at = None
         condition.acknowledged_by = None
+        condition.acknowledged_severity = None
+        condition.acknowledged_occurrence_count = None
+        condition.acknowledged_until = None
         condition.resolved_at = None
         condition.closed_at = None
 

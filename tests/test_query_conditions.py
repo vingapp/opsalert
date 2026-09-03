@@ -112,6 +112,29 @@ class TestQueryConditions:
         assert items[0]["template"] == "production only"
         assert (await query_conditions(session, environment="staging"))[1] == 1
 
+    async def test_condition_serialization_includes_ack_fields(self, session, session_factory):
+        """opsalert#7: if these fields drop out of serialization, the admin
+        UI has no way to show why an acknowledged condition is a ticking
+        clock (an escalation or lease waiting to reopen it)."""
+        opsalert.configure(session_factory=session_factory)
+        await _fire_old(session, message="acked")
+        await session.commit()
+        now = datetime.now(UTC)
+        await sync_condition_stats(session, now=now)
+        await session.commit()
+        condition = await _condition_for(session, "acked")
+        until = now + timedelta(hours=1)
+        await set_status(
+            session, condition, "acknowledged", actor="chris", now=now, acknowledged_until=until
+        )
+        await session.commit()
+
+        items, _, _ = await query_conditions(session)
+        item = next(i for i in items if i["template"] == "acked")
+        assert item["acknowledged_severity"] == condition.acknowledged_severity
+        assert item["acknowledged_occurrence_count"] == condition.acknowledged_occurrence_count
+        assert item["acknowledged_until"] is not None
+
 
 class TestOccurrenceDrilldown:
     async def test_occurrences_can_be_filtered_by_condition(self, session):
@@ -237,6 +260,37 @@ class TestAttention:
 
         result = await query_attention(session)
         assert result["conditions"][0]["reopened"] is True
+
+    async def test_escalated_condition_reported_by_attention(self, session, session_factory):
+        """opsalert#7: pins the wake path end to end. If the attention feed
+        doesn't pick up an escalation reopen, the wake path is broken even
+        though the condition object itself looks correct."""
+        opsalert.configure(session_factory=session_factory)
+        await _fire_old(session, message="worsening")
+        await session.commit()
+        now = datetime.now(UTC)
+        await sync_condition_stats(session, now=now)
+        await session.commit()
+        condition = await _condition_for(session, "worsening")
+        await set_status(session, condition, "acknowledged", actor="chris", now=now)
+        await session.commit()
+
+        later = now + timedelta(minutes=5)
+        alert = await fire_alert(session, severity="critical", category="cat", message="worsening")
+        alert.created = later
+        await session.flush()
+        await session.commit()
+
+        from opsalert.lifecycle import apply_lifecycle_rules
+
+        result = await apply_lifecycle_rules(session, now=later + timedelta(minutes=1))
+        await session.commit()
+        assert result["escalated"] == 1
+
+        attention = await query_attention(session)
+        matches = [c for c in attention["conditions"] if c["id"] == condition.id]
+        assert len(matches) == 1
+        assert matches[0]["reopened"] is True
 
     async def test_a_condition_adopted_below_a_chattier_siblings_high_water_mark(
         self, session, session_factory
