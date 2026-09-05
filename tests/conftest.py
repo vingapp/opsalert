@@ -67,7 +67,18 @@ def _reset_ingest():
     # we clear state, otherwise a dying thread could write to _sample_state
     # after we clear it.
     if ingest._thread is not None and ingest._thread.is_alive():
-        ingest._thread.join(timeout=5.0)
+        ingest._thread.join(timeout=10.0)
+        if ingest._thread.is_alive():
+            # Thread refused to die — _sample_state may be contaminated.
+            # The generation bump prevents it from producing new batches,
+            # but it could still be mid-write.
+            import warnings
+
+            warnings.warn(
+                "opsalert ingest thread did not exit after 10s; "
+                "test isolation may be compromised",
+                stacklevel=2,
+            )
 
     # Dispose any existing engine
     if ingest._engine is not None:
@@ -76,10 +87,11 @@ def _reset_ingest():
         except Exception:
             pass
 
-    ingest._queue.clear()
-    ingest._per_fp.clear()
-    ingest._dropped.clear()
-    ingest._sample_state.clear()
+    with ingest._condition:
+        ingest._queue.clear()
+        ingest._per_fp.clear()
+        ingest._dropped.clear()
+        ingest._sample_state.clear()
     ingest._thread = None
     ingest._engine = None
     ingest._error_logged = False

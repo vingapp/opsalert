@@ -46,6 +46,9 @@ class Event:
     template: str
     environment: str | None
     signature_key: str
+    # Sampling decision — stamped when the event is popped from the queue,
+    # so replay never re-decides.
+    sampled_in: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -293,12 +296,15 @@ def _check_flush_done() -> None:
     Only waits for the queue to drain. Pending drop records (_dropped) are
     eventual-consistency bookkeeping that will land when the DB is back;
     the flush result reports the drop count so the caller knows.
+
+    Clears _flush_event so the writer thread does not busy-spin.
     """
     if not _flush_event.is_set():
         return
     with _condition:
         q_empty = len(_queue) == 0
     if q_empty:
+        _flush_event.clear()
         _flush_done_event.set()
 
 
@@ -315,8 +321,12 @@ def _writer_loop() -> None:
 
     my_gen = _generation
     batch_size = cfg.ingest_batch_size
+    sample_limit = cfg.ingest_sample_per_minute
     flush_interval = cfg.ingest_flush_interval_s
     max_retry_s = cfg.ingest_max_retry_s
+
+    # Clear stale sample state from any prior generation.
+    _sample_state.clear()
 
     while _generation == my_gen:
         batch: list[Event] = []
@@ -333,9 +343,12 @@ def _writer_loop() -> None:
             # Re-check flush after waking
             _check_flush_done()
 
-            # Pop up to batch_size events under the lock
+            # Pop events and snapshot drops under the lock; stamp sampling
+            # decisions outside the lock so enqueue() is never blocked by
+            # the sampling bookkeeping.
             with _condition:
-                for _ in range(min(batch_size, len(_queue))):
+                n = min(batch_size, len(_queue))
+                for _ in range(n):
                     ev = _queue.popleft()
                     batch.append(ev)
                     fp = ev.signature_key
@@ -355,6 +368,19 @@ def _writer_loop() -> None:
                         template=dr.template,
                         severity=dr.severity,
                     )
+
+            # Stamp sampling decisions outside the lock (no contention
+            # with enqueue). _sample_state is only accessed by the writer
+            # thread so no lock is needed.
+            for ev in batch:
+                fp = ev.signature_key
+                minute_key = (fp, _ts_minute(ev.ts))
+                current_count = _sample_state.get(minute_key, 0)
+                _sample_state[minute_key] = current_count + 1
+                ev.sampled_in = current_count < sample_limit
+
+            # Prune sample state to last 2 minutes
+            _prune_sample_state(datetime.now(UTC))
 
             if not batch and not drops_snapshot:
                 _check_flush_done()
@@ -397,11 +423,21 @@ def _writer_loop() -> None:
                     break  # Success — exit retry loop
 
                 except Exception as exc:
-                    from sqlalchemy.exc import OperationalError
+                    from sqlalchemy.exc import (
+                        DataError,
+                        DBAPIError,
+                        IntegrityError,
+                        ProgrammingError,
+                    )
 
-                    is_operational = isinstance(exc, OperationalError)
+                    # Retry transient DB errors (connection lost, lock timeout,
+                    # etc.) but not permanent ones (bad SQL, constraint
+                    # violation, data type mismatch).
+                    is_retryable = isinstance(exc, DBAPIError) and not isinstance(
+                        exc, (IntegrityError, ProgrammingError, DataError)
+                    )
 
-                    if is_operational and cumulative_retry < max_retry_s and _generation == my_gen:
+                    if is_retryable and cumulative_retry < max_retry_s and _generation == my_gen:
                         time.sleep(min(backoff, 30.0))
                         cumulative_retry += backoff
                         backoff = min(backoff * 2, 30.0)
@@ -461,10 +497,13 @@ def write_batch(
 ) -> BatchResult:
     """Write a batch of events to the database in one transaction.
 
-    Groups events by signature_key, resolves conditions, applies per-minute
-    sampling, and handles drops.
+    Groups events by signature_key, resolves conditions, and inserts rows.
+    Sampling decisions are pre-stamped on each ``Event.sampled_in`` at pop
+    time so this function never mutates ``_sample_state`` -- replay is safe.
+    When every insert in a group hits a duplicate (ambiguous commit replay),
+    the group's counter UPDATEs are skipped entirely.
     """
-    from sqlalchemy import update
+    from sqlalchemy import case, update
 
     from opsalert.model import Alert, AlertCondition
 
@@ -475,11 +514,6 @@ def write_batch(
     groups: dict[str, list[Event]] = {}
     for ev in events:
         groups.setdefault(ev.signature_key, []).append(ev)
-
-    from opsalert._config import get_config
-
-    cfg = get_config()
-    sample_limit = cfg.ingest_sample_per_minute
 
     for fp, group in groups.items():
         # Resolve condition id (lookup-or-create, sync).
@@ -494,33 +528,36 @@ def write_batch(
             )
             condition_id = None
 
-        # Apply per-minute sampling
         last_inserted_id = None
         group_sampled = 0
+        group_inserted = 0
+        all_duplicates = True
         max_ts = group[0].ts
 
         for ev in group:
             if ev.ts > max_ts:
                 max_ts = ev.ts
 
-            minute_key = (fp, _ts_minute(ev.ts))
-
-            current_count = _sample_state.get(minute_key, 0)
-            _sample_state[minute_key] = current_count + 1
-
-            if current_count < sample_limit:
-                # INSERT this event as an Alert row
+            if ev.sampled_in:
                 row_id = _insert_alert(conn, ev, condition_id)
                 if row_id is not None:
                     last_inserted_id = row_id
                     written += 1
+                    group_inserted += 1
+                    all_duplicates = False
+                # row_id is None => duplicate (replay); don't count as new
             else:
                 group_sampled += 1
+
+        # Skip all UPDATEs when every insert hit a duplicate — those
+        # UPDATEs were already applied in the ambiguous prior commit.
+        if all_duplicates and group_inserted == 0:
+            sampled_out_count += group_sampled
+            continue
 
         if group_sampled > 0:
             sampled_out_count += group_sampled
             if last_inserted_id is not None:
-                # Update the last inserted row's sampled_out
                 conn.execute(
                     update(Alert)
                     .where(Alert.id == last_inserted_id)
@@ -528,13 +565,17 @@ def write_batch(
                 )
 
             if condition_id is not None:
-                # Update the condition's sampled_out and last_seen
+                # last_seen = max(last_seen, max_ts) via CASE
                 conn.execute(
                     update(AlertCondition)
                     .where(AlertCondition.id == condition_id)
                     .values(
                         sampled_out=AlertCondition.sampled_out + group_sampled,
-                        last_seen=max_ts,
+                        last_seen=case(
+                            (AlertCondition.last_seen.is_(None), max_ts),
+                            (AlertCondition.last_seen < max_ts, max_ts),
+                            else_=AlertCondition.last_seen,
+                        ),
                     )
                 )
 
@@ -556,9 +597,6 @@ def write_batch(
                 .where(AlertCondition.id == condition_id)
                 .values(dropped_count=AlertCondition.dropped_count + dr.count)
             )
-
-    # Prune sample state to last 2 minutes
-    _prune_sample_state(now)
 
     return BatchResult(written=written, sampled_out=sampled_out_count)
 
@@ -723,15 +761,15 @@ def flush(timeout: float = 5.0) -> FlushResult:
     global _dropped_total
 
     try:
+        # If there are queued events and no thread, start one so they drain.
+        with _condition:
+            has_work = bool(_queue)
+        if has_work and (_thread is None or not _thread.is_alive()):
+            _start_thread()
+
         if _thread is None or not _thread.is_alive():
-            # Thread never started or died -- count remaining queue as dropped
+            # Truly nothing to do (no thread, no queue).
             with _condition:
-                remaining = len(_queue)
-                for ev in list(_queue):
-                    _record_drop(ev)
-                _dropped_total += remaining
-                _queue.clear()
-                _per_fp.clear()
                 total_dropped = _dropped_total
             return FlushResult(
                 written=_written_total,

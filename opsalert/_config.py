@@ -129,7 +129,7 @@ def derive_sync_url() -> str | None:
         if isinstance(factory, async_sessionmaker):
             bind = factory.kw.get("bind")
             if bind is not None:
-                url_str = str(bind.url)
+                url_str = bind.url.render_as_string(hide_password=False)
                 return _swap_driver(url_str)
     except (ImportError, AttributeError, Exception):
         pass
