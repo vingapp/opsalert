@@ -456,21 +456,30 @@ class TestPayloadShape:
         assert msg.payload is not None
         payload = msg.payload
         assert payload["version"] == "4"
-        assert payload["status"] in ("firing", "resolved")
+        assert payload["status"] == "firing"
         assert isinstance(payload["alerts"], list)
         assert len(payload["alerts"]) >= 1
         alert_item = payload["alerts"][0]
-        assert "labels" in alert_item
+        # Labels per spec: alertname, severity, category
         labels = alert_item["labels"]
         assert "alertname" in labels
-        assert "severity" in labels
         assert labels["severity"] == "error"
         assert labels["category"] == "sendgrid"
-        assert "annotations" in alert_item
+        # Annotations per spec: summary, issue_url, emit_site, condition_id
         annotations = alert_item["annotations"]
         assert "summary" in annotations
+        assert "issue_url" in annotations
+        assert "emit_site" in annotations
+        assert "condition_id" in annotations
+        # startsAt = first_seen iso (not last_created)
         assert "startsAt" in alert_item
+        # endsAt = resolved_at or ""
+        assert alert_item["endsAt"] == ""
+        # fingerprint = signature_key (not condition id)
         assert "fingerprint" in alert_item
+        assert alert_item["fingerprint"] != ""
+        # signature_key is a hex hash, not a numeric id
+        assert not alert_item["fingerprint"].isdigit()
 
     async def test_webhook_posts_payload_as_is(self, session, session_factory):
         """WebhookTransport.send POSTs the payload dict directly when present."""

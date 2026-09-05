@@ -843,23 +843,32 @@ class TestAttentionDisposition:
         assert "parked then back" in templates
 
     async def test_attention_ordering_by_users_24h(self, session, session_factory):
-        """Ordering: users_24h desc, severity rank, age."""
+        """Ordering: users_24h desc, severity rank, age.
+
+        users_24h is read from alert_condition_subject (day >= today-1),
+        not from parsing context_json.
+        """
+        from opsalert.lifecycle import record_subjects
+
         opsalert.configure(session_factory=session_factory)
-        import json
 
-        # Condition A: 1 user
-        a = await _fire_old(session, severity="error", message="few users")
-        a.context_json = json.dumps({"_user_id": "u1"})
-        await session.flush()
-
-        # Condition B: 3 users
-        for uid in ("u1", "u2", "u3"):
-            b = await _fire_old(session, severity="warn", message="many users")
-            b.context_json = json.dumps({"_user_id": uid})
-            await session.flush()
-
+        # Condition A: 1 subject
+        await _fire_old(session, severity="error", message="few users")
+        # Condition B: 3 subjects
+        await _fire_old(session, severity="warn", message="many users")
         await session.commit()
         await sync_condition_stats(session)
+        await session.commit()
+
+        today = datetime.now(UTC).date()
+        cond_a = await _condition_for(session, "few users")
+        cond_b = await _condition_for(session, "many users")
+        await record_subjects(session, cond_a.id, [("user", "u1")], today)
+        await record_subjects(
+            session, cond_b.id,
+            [("user", "u1"), ("user", "u2"), ("user", "u3")],
+            today,
+        )
         await session.commit()
 
         result = await query_attention(session)

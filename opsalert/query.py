@@ -665,33 +665,38 @@ def _decode_attention_cursor(
 async def _count_users_24h(
     session: "AsyncSession", candidate_ids: list[int]
 ) -> dict[int, int]:
-    """Count distinct _user_id values in context_json for each condition in the last 24h."""
-    cutoff = datetime.now(UTC) - timedelta(hours=24)
+    """Count distinct subjects per condition from alert_condition_subject.
+
+    Uses ``day >= today - 1`` (two calendar days) as the 24h proxy.
+    One grouped query over the candidate set, reading the subject index
+    instead of parsing context_json.
+    """
+    from opsalert.model import AlertConditionSubject
+
+    today = datetime.now(UTC).date()
+    yesterday = today - timedelta(days=1)
+
     rows = (
         await session.execute(
-            select(Alert.condition_id, Alert.context_json)
-            .where(
-                Alert.condition_id.in_(candidate_ids),
-                Alert.created >= cutoff,
-                Alert.context_json.is_not(None),
+            select(
+                AlertConditionSubject.condition_id,
+                func.count(
+                    func.distinct(
+                        AlertConditionSubject.subject_kind
+                        + ":"
+                        + AlertConditionSubject.subject_key
+                    )
+                ).label("cnt"),
             )
+            .where(
+                AlertConditionSubject.condition_id.in_(candidate_ids),
+                AlertConditionSubject.day >= yesterday,
+            )
+            .group_by(AlertConditionSubject.condition_id)
         )
     ).all()
 
-    # Parse user ids per condition.
-    condition_users: dict[int, set[str]] = {}
-    for row in rows:
-        if not row.context_json:
-            continue
-        try:
-            ctx = json.loads(row.context_json)
-        except (ValueError, TypeError):
-            continue
-        user_id = ctx.get("_user_id")
-        if user_id is not None:
-            condition_users.setdefault(row.condition_id, set()).add(str(user_id))
-
-    return {cid: len(users) for cid, users in condition_users.items()}
+    return {row.condition_id: row.cnt for row in rows}
 
 
 async def query_attention(

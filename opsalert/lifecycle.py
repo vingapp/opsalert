@@ -30,9 +30,9 @@ selects every mapped column and a missing column fails the query outright.
 import json
 import logging
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from sqlalchemy import case, func, select, update
-from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from opsalert.model import Alert, AlertCondition, AlertConditionSubject
 from opsalert.signature import condition_signature, normalize_message
@@ -167,7 +167,9 @@ def reopen_condition(condition: AlertCondition, *, now: datetime | None = None) 
     condition.acknowledged_until = None
     condition.acknowledged_peak_15m = None
     condition.acknowledged_subject_count = None
-    condition.acknowledged_release = None
+    # acknowledged_release is KEPT through reopen: it is "release at last ack"
+    # and remains a valid baseline for is_regression in the attention feed.
+    # Cleared only on new→ack re-stamp, resolve, and close.
     logger.warning(
         "opsalert: condition %s (%s) reopened — it fired again after being closed out",
         condition.id,
@@ -406,6 +408,7 @@ async def _fold_new_occurrences(session, *, horizon: datetime) -> tuple[int, int
         condition = await session.get(AlertCondition, row.cid)
         if condition is None:
             continue
+        prev_watermark = condition.stats_synced_through or 0
         _apply_counts(
             condition,
             count=row.n,
@@ -419,12 +422,14 @@ async def _fold_new_occurrences(session, *, horizon: datetime) -> tuple[int, int
         condition.median_interval_seconds = await _median_interval(
             session, condition_id=row.cid, horizon=horizon
         )
-        # Fold release strings from occurrence context.
-        await _fold_release(session, condition, horizon=horizon)
+        # Fold release strings from occurrence context — only new rows.
+        await _fold_release(
+            session, condition, horizon=horizon, prev_watermark=prev_watermark,
+        )
         # Only rows we actually counted move the watermark, and every one of
         # them is older than the lag horizon — so no in-flight row can be
         # stranded below it.
-        condition.stats_synced_through = max(condition.stats_synced_through or 0, row.max_id)
+        condition.stats_synced_through = max(prev_watermark, row.max_id)
         updated += 1
         counted += row.n
 
@@ -502,26 +507,30 @@ async def _median_interval(session, *, condition_id: int, horizon: datetime) -> 
 
 
 async def _fold_release(
-    session, condition: AlertCondition, *, horizon: datetime
+    session, condition: AlertCondition, *, horizon: datetime, prev_watermark: int
 ) -> None:
     """Fold ``_release`` from occurrence context into the condition.
 
-    Scans occurrences for the condition (before ``horizon``) ordered by
-    ``created`` to find the earliest and latest release string. Only
-    occurrences whose ``context_json`` carries a ``_release`` key are
-    considered.
+    Scans ONLY rows above ``prev_watermark`` (the stats_synced_through
+    value before this sweep's fold) and before ``horizon``, so repeated
+    sweeps never rescan the same rows. ``first_seen_release`` is set only
+    when NULL; ``last_seen_release`` = the last non-null in the window.
     """
     rows = (
         await session.execute(
-            select(Alert.context_json, Alert.created)
+            select(Alert.context_json)
             .where(
                 Alert.condition_id == condition.id,
+                Alert.id > prev_watermark,
                 Alert.created < horizon,
                 Alert.context_json.is_not(None),
             )
-            .order_by(Alert.created.asc())
+            .order_by(Alert.id.asc())
         )
     ).all()
+
+    if not rows:
+        return
 
     first_release: str | None = None
     last_release: str | None = None
@@ -534,9 +543,8 @@ async def _fold_release(
             first_release = release
         last_release = release
 
-    if first_release is not None:
-        if condition.first_seen_release is None:
-            condition.first_seen_release = first_release
+    if first_release is not None and condition.first_seen_release is None:
+        condition.first_seen_release = first_release
     if last_release is not None:
         condition.last_seen_release = last_release
 
@@ -827,6 +835,32 @@ def _append_note(existing: str | None, line: str) -> str:
 # =============================================================================
 
 
+def subject_upsert_statement(dialect: str, values: dict[str, Any]):
+    """Build a dialect-appropriate INSERT IGNORE for alert_condition_subject.
+
+    MySQL uses ``INSERT IGNORE`` (``on_duplicate_key_update`` with a no-op
+    set so the row is silently skipped on conflict). SQLite uses
+    ``ON CONFLICT DO NOTHING``. Exposed as a builder so O2/ingest can use
+    it from a sync connection.
+    """
+    if dialect == "mysql":
+        from sqlalchemy.dialects.mysql import insert as mysql_insert
+
+        return (
+            mysql_insert(AlertConditionSubject)
+            .values(**values)
+            .on_duplicate_key_update(condition_id=values["condition_id"])
+        )
+
+    from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+    return (
+        sqlite_insert(AlertConditionSubject)
+        .values(**values)
+        .on_conflict_do_nothing()
+    )
+
+
 async def record_subjects(
     session,
     condition_id: int,
@@ -838,17 +872,17 @@ async def record_subjects(
     ``subjects`` is a list of ``(kind, key)`` tuples.  ``day`` is the
     calendar date the subjects were observed on.
     """
+    from opsalert.store import _dialect_name
+
+    dialect = _dialect_name(session)
     for kind, key in subjects:
-        stmt = (
-            sqlite_insert(AlertConditionSubject)
-            .values(
-                condition_id=condition_id,
-                subject_kind=kind,
-                subject_key=key,
-                day=day,
-            )
-            .on_conflict_do_nothing()
-        )
+        values = {
+            "condition_id": condition_id,
+            "subject_kind": kind,
+            "subject_key": key,
+            "day": day,
+        }
+        stmt = subject_upsert_statement(dialect, values)
         await session.execute(stmt)
 
 
@@ -970,6 +1004,9 @@ async def set_status(
         condition.closed_at = now
 
     if status in (STATUS_RESOLVED, STATUS_CLOSED):
+        # Clear the ack-time release baseline: the episode is over, and
+        # a future ack will re-stamp from the new state.
+        condition.acknowledged_release = None
         # Retire the undelivered backlog (opsalert#1). Resolving is a human
         # saying "I have seen this and dealt with it" — emailing the history
         # afterwards has no audience, and leaving it unnotified either

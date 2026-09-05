@@ -1288,3 +1288,199 @@ class TestReopenedDeliveredImmediately:
         assert stats["reopened"] == 1
         # The key assertion: it was sent as immediate, not swallowed by digest.
         assert stats["immediate_sent"] >= 1
+
+
+class TestSubjectUpsertDialects:
+    """Compile tests for subject_upsert_statement on both dialects."""
+
+    def test_mysql_compiles_to_on_duplicate_key(self):
+        from opsalert.lifecycle import subject_upsert_statement
+
+        stmt = subject_upsert_statement("mysql", {
+            "condition_id": 1,
+            "subject_kind": "user",
+            "subject_key": "u1",
+            "day": datetime.now(UTC).date(),
+        })
+        from sqlalchemy.dialects import mysql
+        compiled = str(stmt.compile(dialect=mysql.dialect()))
+        assert "ON DUPLICATE KEY" in compiled
+
+    def test_sqlite_compiles_to_on_conflict(self):
+        from opsalert.lifecycle import subject_upsert_statement
+
+        stmt = subject_upsert_statement("sqlite", {
+            "condition_id": 1,
+            "subject_kind": "user",
+            "subject_key": "u1",
+            "day": datetime.now(UTC).date(),
+        })
+        from sqlalchemy.dialects import sqlite
+        compiled = str(stmt.compile(dialect=sqlite.dialect()))
+        assert "ON CONFLICT" in compiled
+
+
+class TestDeliveryStateUpsertDialects:
+    """Compile tests for delivery_state_upsert_statement on both dialects."""
+
+    def test_mysql_compiles_to_on_duplicate_key(self):
+        from opsalert.delivery import delivery_state_upsert_statement
+
+        stmt = delivery_state_upsert_statement("mysql", datetime.now(UTC))
+        from sqlalchemy.dialects import mysql
+        compiled = str(stmt.compile(dialect=mysql.dialect()))
+        assert "ON DUPLICATE KEY" in compiled
+
+    def test_sqlite_compiles_to_on_conflict(self):
+        from opsalert.delivery import delivery_state_upsert_statement
+
+        stmt = delivery_state_upsert_statement("sqlite", datetime.now(UTC))
+        from sqlalchemy.dialects import sqlite
+        compiled = str(stmt.compile(dialect=sqlite.dialect()))
+        assert "ON CONFLICT" in compiled
+
+
+class TestFoldReleaseNoRescan:
+    """_fold_release only scans rows above the previous watermark."""
+
+    async def test_second_sweep_no_new_rows_skips_release_query(self, session):
+        """A second sweep with no new occurrences issues no release query.
+
+        We verify by checking that first_seen_release and last_seen_release
+        do not change after a second sweep when there are no new rows.
+        """
+        now = datetime.now(UTC)
+        a = await fire_alert(
+            session, severity="error", category="cat", message="boom",
+            context={"_release": "v1.0"},
+        )
+        a.created = now - timedelta(minutes=10)
+        await session.flush()
+        await session.commit()
+
+        await sync_condition_stats(session, now=now)
+        await session.commit()
+
+        condition = await _the_condition(session)
+        assert condition.first_seen_release == "v1.0"
+        assert condition.last_seen_release == "v1.0"
+        watermark_after_first = condition.stats_synced_through
+
+        # Second sweep — no new rows.
+        await sync_condition_stats(session, now=now)
+        await session.commit()
+
+        await session.refresh(condition)
+        # Watermark unchanged since no new rows above it.
+        assert condition.stats_synced_through == watermark_after_first
+        # Release values unchanged.
+        assert condition.first_seen_release == "v1.0"
+        assert condition.last_seen_release == "v1.0"
+
+    async def test_new_release_folds_without_overwriting_first(self, session):
+        """A new occurrence with a different release updates last_seen_release
+        but not first_seen_release."""
+        now = datetime.now(UTC)
+        a = await fire_alert(
+            session, severity="error", category="cat", message="boom",
+            context={"_release": "v1.0"},
+        )
+        a.created = now - timedelta(minutes=20)
+        await session.flush()
+        await session.commit()
+
+        await sync_condition_stats(session, now=now)
+        await session.commit()
+
+        condition = await _the_condition(session)
+        assert condition.first_seen_release == "v1.0"
+        assert condition.last_seen_release == "v1.0"
+
+        # New occurrence with different release.
+        b = await fire_alert(
+            session, severity="error", category="cat", message="boom",
+            context={"_release": "v2.0"},
+        )
+        b.created = now - timedelta(minutes=5)
+        await session.flush()
+        await session.commit()
+
+        await sync_condition_stats(session, now=now)
+        await session.commit()
+
+        await session.refresh(condition)
+        assert condition.first_seen_release == "v1.0"
+        assert condition.last_seen_release == "v2.0"
+
+
+class TestRegressionFullFlow:
+    """Full-flow test: ack at release A, occurrences at release B,
+    lifecycle reopens, attention shows is_regression=True."""
+
+    async def test_ack_at_a_occurrences_at_b_attention_is_regression(
+        self, session, session_factory
+    ):
+        import opsalert
+        from opsalert.query import query_attention
+
+        opsalert.configure(session_factory=session_factory)
+        now = datetime.now(UTC)
+
+        # Fire and sync — condition gets last_seen_release = "v1.0".
+        a = await fire_alert(
+            session, severity="error", category="cat", message="regressor",
+            context={"_release": "v1.0"},
+        )
+        a.created = now - timedelta(minutes=20)
+        await session.flush()
+        await session.commit()
+        await sync_condition_stats(session, now=now)
+        await session.commit()
+
+        condition = (
+            await session.execute(
+                select(AlertCondition).where(
+                    AlertCondition.message_template == "regressor"
+                )
+            )
+        ).scalar_one()
+        assert condition.last_seen_release == "v1.0"
+
+        # Ack — stamps acknowledged_release = "v1.0".
+        await set_status(
+            session, condition, "acknowledged", actor="chris", now=now,
+            issue_url="https://github.com/test/1",
+        )
+        await session.commit()
+        assert condition.acknowledged_release == "v1.0"
+
+        # New occurrence at release B.
+        later = now + timedelta(hours=1)
+        b = await fire_alert(
+            session, severity="error", category="cat", message="regressor",
+            context={"_release": "v2.0"},
+        )
+        b.created = later - timedelta(minutes=5)
+        await session.flush()
+        await session.commit()
+        await sync_condition_stats(session, now=later)
+        await session.commit()
+
+        await session.refresh(condition)
+        assert condition.last_seen_release == "v2.0"
+
+        # Lifecycle detects the regression and reopens.
+        result = await apply_lifecycle_rules(session, now=later + timedelta(minutes=1))
+        await session.commit()
+        assert result["escalated"] == 1
+        await session.refresh(condition)
+        assert condition.status == "new"
+        assert "regression" in (condition.notes or "").lower()
+        # acknowledged_release is KEPT through reopen.
+        assert condition.acknowledged_release == "v1.0"
+
+        # Attention shows is_regression=True.
+        attention = await query_attention(session)
+        match = [c for c in attention["conditions"] if c["template"] == "regressor"]
+        assert len(match) == 1
+        assert match[0]["is_regression"] is True
