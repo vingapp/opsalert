@@ -68,8 +68,108 @@ def _bounded_traceback(tb: Any, budget: int = _TRACEBACK_BUDGET) -> str:
     return "".join(head) + f"  ... {elided} frames elided ...\n" + "".join(tail)
 
 
-def enrich_context(context: dict[str, Any] | None) -> dict[str, Any]:
-    """Auto-capture runtime debugging info into alert context."""
+def compute_emit_site(stacklevel: int = 1) -> str:
+    """Return "module:function" of the caller at ``stacklevel``.
+
+    stacklevel=1 means the direct caller of the function that called this.
+    stacklevel=2 means the caller's caller, etc.
+
+    Skips opsalert internal frames first, then applies the stacklevel.
+    """
+    frame = sys._getframe()
+    try:
+        f = frame
+        # First skip opsalert internal frames
+        while f is not None:
+            module_name = f.f_globals.get("__name__", "")
+            if module_name not in _SKIP_MODULES:
+                break
+            f = f.f_back
+        # Then skip stacklevel-1 additional frames
+        for _ in range(stacklevel - 1):
+            if f is not None:
+                f = f.f_back
+        if f is not None:
+            module_name = f.f_globals.get("__name__", "")
+            return f"{module_name}:{f.f_code.co_name}"
+        return ""
+    finally:
+        del frame
+
+
+def _build_structured_frames(
+    tb: Any,
+    in_app_prefixes: tuple[str, ...] = (),
+    budget: int = 50,
+) -> list[dict[str, Any]]:
+    """Build structured frame list from a traceback.
+
+    Walks tb objects directly to get real module names via
+    ``tb.tb_frame.f_globals["__name__"]``.  Returns at most ``budget``
+    frames, keeping in-app frames preferentially.
+    """
+    if tb is None:
+        return []
+
+    from opsalert.signature import _is_in_app
+
+    result: list[dict[str, Any]] = []
+    current_tb = tb
+    while current_tb is not None:
+        frame_obj = current_tb.tb_frame
+        module = frame_obj.f_globals.get("__name__", "")
+        function = frame_obj.f_code.co_name
+        filename = frame_obj.f_code.co_filename
+        lineno = current_tb.tb_lineno
+        in_app = _is_in_app(module, filename, in_app_prefixes)
+        result.append({
+            "module": module,
+            "function": function,
+            "lineno": lineno,
+            "in_app": in_app,
+        })
+        current_tb = current_tb.tb_next
+
+    if len(result) <= budget:
+        return result
+
+    # Keep in-app frames preferentially + head/tail of the rest
+    in_app_frames = [(i, f) for i, f in enumerate(result) if f["in_app"]]
+    if len(in_app_frames) >= budget:
+        return [f for _, f in in_app_frames[:budget]]
+
+    remaining = budget - len(in_app_frames)
+    in_app_indices = {i for i, _ in in_app_frames}
+    other_frames = [(i, f) for i, f in enumerate(result) if i not in in_app_indices]
+
+    # Keep head and tail of other frames
+    half = remaining // 2
+    kept_other = other_frames[:half] + other_frames[-(remaining - half):]
+    all_kept = sorted(in_app_frames + kept_other, key=lambda x: x[0])
+    return [f for _, f in all_kept]
+
+
+def _build_exception_chain_for_enrichment(
+    exc: BaseException | None,
+) -> list[str]:
+    """Build the exception chain for enrichment context."""
+    from opsalert.signature import build_exception_chain
+
+    return build_exception_chain(exc)
+
+
+def enrich_context(
+    context: dict[str, Any] | None,
+    *,
+    exc: BaseException | None = None,
+    stacklevel: int = 1,
+) -> dict[str, Any]:
+    """Auto-capture runtime debugging info into alert context.
+
+    ``exc`` is the explicit exception to enrich from; when None, falls back
+    to ``sys.exc_info()``. ``stacklevel`` controls how many wrapper frames
+    to skip for ``_emit_site``.
+    """
     enriched = dict(context) if context else {}
 
     # --- Caller frame ---
@@ -88,13 +188,52 @@ def enrich_context(context: dict[str, Any] | None) -> dict[str, Any]:
     finally:
         del frame
 
+    # --- Emit site (module:function only, stacklevel-aware) ---
+    try:
+        enriched["_emit_site"] = compute_emit_site(stacklevel=stacklevel)
+    except Exception:
+        pass
+
     # --- Active exception ---
-    exc_info = sys.exc_info()
-    if exc_info[1] is not None:
-        enriched["_exc_type"] = type(exc_info[1]).__name__
-        enriched["_exc_message"] = str(exc_info[1])[:500]
-        if exc_info[2]:
-            enriched["_traceback"] = _bounded_traceback(exc_info[2])
+    resolved_exc = exc
+    if resolved_exc is None:
+        exc_info = sys.exc_info()
+        resolved_exc = exc_info[1]
+    else:
+        exc_info = (type(resolved_exc), resolved_exc, resolved_exc.__traceback__)
+
+    if resolved_exc is not None:
+        enriched["_exc_type"] = type(resolved_exc).__name__
+        try:
+            enriched["_exc_message"] = str(resolved_exc)[:500]
+        except Exception:
+            enriched["_exc_message"] = "<unrenderable>"
+        tb = getattr(resolved_exc, "__traceback__", None) or (
+            exc_info[2] if exc_info else None
+        )
+        if tb:
+            enriched["_traceback"] = _bounded_traceback(tb)
+            # Structured frames for event_json
+            try:
+                from opsalert._config import get_config as _gc
+                _in_app = _gc().in_app_prefixes
+            except (RuntimeError, ImportError):
+                _in_app = ()
+            enriched["_frames"] = _build_structured_frames(tb, _in_app)
+
+        # Exception chain
+        enriched["_exception_chain"] = _build_exception_chain_for_enrichment(
+            resolved_exc
+        )
+
+    # --- Release from config ---
+    try:
+        from opsalert._config import get_config as _gc2
+        _release = _gc2().release
+        if _release is not None:
+            enriched["_release"] = _release
+    except (RuntimeError, ImportError):
+        pass
 
     # --- Celery task ---
     try:
@@ -107,15 +246,26 @@ def enrich_context(context: dict[str, Any] | None) -> dict[str, Any]:
         pass
 
     # --- Request trace ---
+    # The trace_provider contract accepts either a 2-tuple (trace_id,
+    # trace_origin) or a 3-tuple (trace_id, trace_origin, span_id) so
+    # debork and vingapi can share one provider without silently losing
+    # trace ids.
     try:
         from opsalert._config import get_config
         cfg = get_config()
         if cfg.trace_provider is not None:
-            tid, torigin = cfg.trace_provider()
-            if tid is not None:
-                enriched["_trace_id"] = tid
-            if torigin is not None:
-                enriched["_trace_origin"] = torigin
+            result = cfg.trace_provider()
+            if isinstance(result, tuple):
+                if len(result) >= 2:
+                    tid, torigin = result[0], result[1]
+                    if tid is not None:
+                        enriched["_trace_id"] = tid
+                    if torigin is not None:
+                        enriched["_trace_origin"] = torigin
+                if len(result) >= 3:
+                    span_id = result[2]
+                    if span_id is not None:
+                        enriched["_span_id"] = span_id
     except Exception:
         pass
 

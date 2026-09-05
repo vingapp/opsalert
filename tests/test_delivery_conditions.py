@@ -144,7 +144,7 @@ class TestAcknowledged:
         await session.commit()
         await sync_condition_stats(session)
         condition = await _condition(session)
-        await set_status(session, condition, "acknowledged", actor="chris")
+        await set_status(session, condition, "acknowledged", actor="chris", issue_url="https://github.com/test/1")
         await session.commit()
 
         stats = await deliver_alerts(session)
@@ -164,7 +164,7 @@ class TestAcknowledged:
         await session.commit()
         await sync_condition_stats(session)
         condition = await _condition(session)
-        await set_status(session, condition, "acknowledged", actor="chris")
+        await set_status(session, condition, "acknowledged", actor="chris", issue_url="https://github.com/test/1")
         await session.commit()
 
         await _fire_old(session, severity="error", category="cat", message="boom")
@@ -323,10 +323,23 @@ class TestCorruptConditionIsolation:
     """F3 — one unusable row must not take the sweep down with it."""
 
     async def test_a_broken_condition_is_skipped_and_the_rest_deliver(
-        self, session, session_factory
+        self, session, session_factory, tmp_path
     ):
+        from sqlalchemy import create_engine
+        from sqlalchemy import text as sa_text
+
+        from opsalert.ingest import flush
+        from opsalert.model import OpsAlertBase as _Base
+
+        # Set up a file-backed ingest DB so the self-reporting alert from
+        # delivery.py (which goes through the ingest queue) can be verified.
+        ingest_path = tmp_path / "delivery_self_report.db"
+        ingest_url = f"sqlite:///{ingest_path}"
+        ingest_engine = create_engine(ingest_url)
+        _Base.metadata.create_all(ingest_engine)
+
         transport = _TrackingTransport()
-        _configure(session_factory, transport)
+        _configure(session_factory, transport, ingest_url=ingest_url)
 
         await fire_alert(session, severity="error", category="good", message="deliver me")
         broken_alert = await fire_alert(
@@ -350,11 +363,18 @@ class TestCorruptConditionIsolation:
             await session.execute(select(Alert).where(Alert.notified.is_(False)))
         ).scalars().all()
         assert "unreadable" in [a.message for a in still_waiting]
-        # ...and the skip itself became an alert of its own, rather than a log
-        # line nobody reads (F3).
-        assert "Unusable alert condition row skipped during delivery" in [
-            a.message for a in still_waiting
-        ]
+        # ...and the skip itself became an alert of its own, written by the
+        # ingest thread to its own DB (not the async session).
+        flush(timeout=5.0)
+        with ingest_engine.connect() as conn:
+            self_report = conn.execute(
+                sa_text("SELECT message FROM opsalert WHERE category='alert_delivery'")
+            ).fetchone()
+        assert self_report is not None, (
+            "the self-reporting alert was not written to the ingest DB"
+        )
+        assert "Unusable alert condition row skipped during delivery" in self_report[0]
+        ingest_engine.dispose()
 
 
 class TestResolveWithUndeliveredBacklog:
@@ -444,7 +464,7 @@ class TestResolveWithUndeliveredBacklog:
         await sync_condition_stats(session)
         condition = await _condition(session)
 
-        await set_status(session, condition, "acknowledged", actor="chris")
+        await set_status(session, condition, "acknowledged", actor="chris", issue_url="https://github.com/test/1")
         await set_status(session, condition, "closed", actor="chris")
         await session.commit()
 
@@ -644,7 +664,7 @@ class TestDigestSeverity:
         await _fire_old(session, severity="critical", category="cat", message="db down")
         await session.commit()
         await sync_condition_stats(session)
-        await set_status(session, await _condition(session), "acknowledged", actor="chris")
+        await set_status(session, await _condition(session), "acknowledged", actor="chris", issue_url="https://github.com/test/1")
         await session.commit()
 
         stats = await deliver_alerts(session)

@@ -363,6 +363,8 @@ async def fire_alert(
     source: str | None = None,
     context: dict[str, Any] | None = None,
     params: dict[str, Any] | None = None,
+    kind: str | None = None,
+    exc: BaseException | None = None,
 ) -> Alert:
     """Create an alert record. Every call creates one row.
 
@@ -371,23 +373,67 @@ async def fire_alert(
     text, and the raw template is the condition's identity — exact, rather
     than guessed by the normalizer. Without ``params`` the message is stored
     as given and identity falls back to :func:`normalize_message`.
+
+    ``kind`` and ``exc`` enable v2 identity through the same functions as
+    the dispatch path.
     """
     stamped = stamp_environment(context)
     rendered = render_template(message, params)
     template = message if params else normalize_message(message)
     if params:
-        # Persist the identity the emit path used, so an orphaned occurrence
-        # (F1) is adopted under EXACTLY this condition and never a fork. The
-        # no-params case needs nothing: the stored message IS the message the
-        # sweeper normalizes, so it reproduces the same template.
         stamped = {**(stamped or {}), TEMPLATE_CONTEXT_KEY: template}
 
-    condition_id = await resolve_condition_id(
+    # Every new row is v2.  kind=None triggers the same legacy fallback
+    # as _dispatch: kind = f"{category}.legacy" with the template in the
+    # fingerprint parts so two messages that v1 kept separate stay separate.
+    from opsalert.signature import (
+        build_exception_chain,
+        event_fingerprint_parts,
+        event_signature,
+        extract_origin_frame,
+    )
+
+    actual_kind = kind if kind is not None else f"{category}.legacy"
+    is_legacy = kind is None
+
+    try:
+        from opsalert._config import get_config
+        cfg = get_config()
+        in_app_prefixes = cfg.in_app_prefixes
+    except (RuntimeError, ImportError):
+        in_app_prefixes = ()
+
+    exception_chain = build_exception_chain(exc)
+    origin_frame = extract_origin_frame(exc, in_app_prefixes=in_app_prefixes)
+
+    template_for_fp = template if is_legacy else None
+    fp_parts = event_fingerprint_parts(
+        kind=actual_kind,
+        environment=(stamped or {}).get("environment"),
+        exception_chain=exception_chain,
+        origin_frame=origin_frame,
+        template=template_for_fp,
+    )
+    sig_key = event_signature(
+        kind=actual_kind,
+        environment=(stamped or {}).get("environment"),
+        exception_chain=exception_chain,
+        origin_frame=origin_frame,
+        template=template_for_fp,
+    )
+
+    condition_id = await _resolve_v2_condition(
         session,
+        signature_key=sig_key,
         category=category,
         source=source,
         environment=(stamped or {}).get("environment"),
+        kind=actual_kind,
+        is_legacy=is_legacy,
         template=template,
+        fingerprint_version=2,
+        fingerprint_json=json.dumps(fp_parts),
+        message_example=(rendered or "")[:500],
         severity=str(severity),
     )
 
@@ -398,7 +444,82 @@ async def fire_alert(
         source=source,
         context_json=serialize_context(stamped),
         condition_id=condition_id,
+        kind=actual_kind,
+        fingerprint_version=2,
+        fingerprint_json=json.dumps(fp_parts),
     )
     session.add(alert)
     await session.flush()
     return alert
+
+
+async def _resolve_v2_condition(
+    session: "AsyncSession",
+    *,
+    signature_key: str,
+    category: str,
+    source: str | None,
+    environment: str | None,
+    kind: str,
+    is_legacy: bool = False,
+    template: str = "",
+    fingerprint_version: int,
+    fingerprint_json: str | None,
+    message_example: str,
+    severity: str,
+) -> int | None:
+    """Resolve a v2 condition (with kind)."""
+    now = datetime.now(UTC)
+    # Explicit kind: message_template = kind (search matches it).
+    # Legacy fallback: message_template = normalized message template.
+    msg_template = template[:500] if is_legacy else kind[:500]
+    values = {
+        "signature_key": signature_key,
+        "category": category,
+        "source": source,
+        "environment": environment,
+        "message_template": msg_template,
+        "status": "new",
+        "severity": severity,
+        "latest_severity": severity,
+        "status_changed_at": now,
+        "first_seen": now,
+        "created": now,
+        "updated": now,
+        "kind": kind,
+        "fingerprint_version": fingerprint_version,
+        "fingerprint_json": fingerprint_json,
+        "message_example": message_example,
+    }
+
+    factory = None
+    try:
+        from opsalert._config import get_config
+        factory = get_config().session_factory
+    except (RuntimeError, ImportError):
+        factory = None
+
+    if factory is not None and _dialect_name(session) != "sqlite":
+        try:
+            async with factory() as isolated:
+                condition_id = await _lookup_or_create(
+                    isolated, signature_key=signature_key, values=values
+                )
+                await isolated.commit()
+                return condition_id
+        except Exception:
+            logger.exception(
+                "opsalert: isolated v2 condition resolution failed for kind=%s", kind
+            )
+            return None
+
+    try:
+        async with session.begin_nested():
+            return await _lookup_or_create(
+                session, signature_key=signature_key, values=values
+            )
+    except Exception:
+        logger.exception(
+            "opsalert: v2 condition resolution failed for kind=%s", kind
+        )
+        return None

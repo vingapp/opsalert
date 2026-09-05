@@ -6,7 +6,12 @@ import pytest
 from sqlalchemy import delete, select
 
 import opsalert
-from opsalert.lifecycle import set_disposition, set_status, sync_condition_stats
+from opsalert.lifecycle import (
+    reopen_condition,
+    set_disposition,
+    set_status,
+    sync_condition_stats,
+)
 from opsalert.model import Alert, AlertCondition
 from opsalert.query import (
     _decode_attention_cursor,
@@ -41,7 +46,7 @@ class TestQueryConditions:
         await _fire_old(session, severity="warn", category="other", message="odd param")
         await session.commit()
         await sync_condition_stats(session)
-        await set_status(session, await _condition_for(session, "odd param"), "acknowledged")
+        await set_status(session, await _condition_for(session, "odd param"), "acknowledged", issue_url="https://github.com/test/1")
         await session.commit()
 
         items, total, aggregates = await query_conditions(session)
@@ -74,7 +79,7 @@ class TestQueryConditions:
         await _fire_old(session, message="b")
         await session.commit()
         await sync_condition_stats(session)
-        await set_status(session, await _condition_for(session, "a"), "acknowledged")
+        await set_status(session, await _condition_for(session, "a"), "acknowledged", issue_url="https://github.com/test/1")
         await session.commit()
 
         items, total, aggregates = await query_conditions(session, status="acknowledged")
@@ -151,9 +156,12 @@ class TestOccurrenceDrilldown:
 class TestAttention:
     """A8 — the watchdog line, and the per-condition cursor behind it (opsalert#4)."""
 
-    async def test_only_immediate_new_conditions_are_returned(
+    async def test_new_conditions_returned_except_collect_first_sight(
         self, session, session_factory
     ):
+        """Attention returns all new conditions regardless of disposition,
+        except collect on first sight (never reopened). Acknowledged is excluded
+        (not new)."""
         opsalert.configure(session_factory=session_factory)
         await _fire_old(session, message="loud")  # error → immediate
         await _fire_old(session, severity="warn", message="quiet")  # warn → digest
@@ -162,12 +170,18 @@ class TestAttention:
         await session.commit()
         await sync_condition_stats(session)
         await set_disposition(session, await _condition_for(session, "parked"), "collect")
-        await set_status(session, await _condition_for(session, "handled"), "acknowledged")
+        await set_status(session, await _condition_for(session, "handled"), "acknowledged", issue_url="https://github.com/test/1")
         await session.commit()
 
         result = await query_attention(session)
 
-        assert [c["template"] for c in result["conditions"]] == ["loud"]
+        templates = [c["template"] for c in result["conditions"]]
+        # "loud" and "quiet" are new; "parked" is collect first sight (excluded);
+        # "handled" is acknowledged (not new, excluded).
+        assert "loud" in templates
+        assert "quiet" in templates
+        assert "parked" not in templates
+        assert "handled" not in templates
 
     async def test_an_owner_override_can_promote_a_warning(self, session, session_factory):
         opsalert.configure(session_factory=session_factory)
@@ -272,7 +286,7 @@ class TestAttention:
         await sync_condition_stats(session, now=now)
         await session.commit()
         condition = await _condition_for(session, "worsening")
-        await set_status(session, condition, "acknowledged", actor="chris", now=now)
+        await set_status(session, condition, "acknowledged", actor="chris", now=now, issue_url="https://github.com/test/1")
         await session.commit()
 
         later = now + timedelta(minutes=5)
@@ -505,7 +519,7 @@ class TestAttention:
         assert [c["template"] for c in first["conditions"]] == ["loud"]
 
         condition = await _condition_for(session, "loud")
-        await set_status(session, condition, "acknowledged", actor="chris")
+        await set_status(session, condition, "acknowledged", actor="chris", issue_url="https://github.com/test/1")
         await session.commit()
 
         quiet = await query_attention(session, cursor=first["cursor"])
@@ -592,17 +606,22 @@ class TestAttention:
 
         assert [c["template"] for c in result["conditions"]] == ["loud"]
         assert _decode_attention_cursor(result["cursor"])[0] == {
-            (await _condition_for(session, "loud")).id: 1
+            (await _condition_for(session, "loud")).id: (1, 0)
         }
 
     async def test_an_empty_attention_set_hands_the_cursor_straight_back(
         self, session, session_factory
     ):
-        """Nothing to report must not disturb what the caller already knows."""
+        """Nothing to report must not disturb what the caller already knows.
+
+        Updated: collect on first sight is the only disposition excluded, so
+        use a collect-dispositioned condition for the empty-set test.
+        """
         opsalert.configure(session_factory=session_factory)
-        await _fire_old(session, severity="warn", message="quiet")  # digest, never here
+        await _fire_old(session, severity="error", message="quiet")
         await session.commit()
         await sync_condition_stats(session)
+        await set_disposition(session, await _condition_for(session, "quiet"), "collect")
         await session.commit()
 
         bootstrap = await query_attention(session)
@@ -667,7 +686,7 @@ class TestAttention:
         lowered = await query_attention(session, cursor=first["cursor"])
         assert lowered["conditions"] == []
         condition_id = (await _condition_for(session, "loud")).id
-        assert _decode_attention_cursor(lowered["cursor"])[0] == {condition_id: 2}
+        assert _decode_attention_cursor(lowered["cursor"])[0] == {condition_id: (2, 0)}
 
         await _fire_old(session, message="loud")
         await session.commit()
@@ -726,7 +745,8 @@ class TestNextFixExcludesHandledConditions:
         await session.commit()
         await sync_condition_stats(session)
         await set_status(
-            session, await _condition_for(session, "acknowledged problem"), "acknowledged"
+            session, await _condition_for(session, "acknowledged problem"), "acknowledged",
+            issue_url="https://github.com/test/1",
         )
         await session.commit()
 
@@ -739,7 +759,8 @@ class TestNextFixExcludesHandledConditions:
         await session.commit()
         await sync_condition_stats(session)
         await set_status(
-            session, await _condition_for(session, "acknowledged problem"), "acknowledged"
+            session, await _condition_for(session, "acknowledged problem"), "acknowledged",
+            issue_url="https://github.com/test/1",
         )
         await session.commit()
 
@@ -764,3 +785,163 @@ class TestNextFixExcludesHandledConditions:
 
         result = await query_next_fix(session)
         assert result["message"] == "orphan"
+
+
+class TestAttentionDisposition:
+    """#12 / OPEN 2: attention returns new + reopened regardless of disposition,
+    EXCEPT collect on first sight (never reopened)."""
+
+    async def test_attention_returns_digest_warn_new_condition(
+        self, session, session_factory
+    ):
+        """A digest WARN new condition appears in attention."""
+        opsalert.configure(session_factory=session_factory)
+        await _fire_old(session, severity="warn", message="digest warn")
+        await session.commit()
+        await sync_condition_stats(session)
+        await session.commit()
+
+        result = await query_attention(session)
+        templates = [c["template"] for c in result["conditions"]]
+        assert "digest warn" in templates
+
+    async def test_attention_excludes_collect_on_first_sight(
+        self, session, session_factory
+    ):
+        """A collect-dispositioned condition that has never been reopened is
+        excluded from attention — that is the spelling of 'I know about this
+        and do not want to hear about it'."""
+        opsalert.configure(session_factory=session_factory)
+        await _fire_old(session, severity="error", message="parked")
+        await session.commit()
+        await sync_condition_stats(session)
+        await set_disposition(session, await _condition_for(session, "parked"), "collect")
+        await session.commit()
+
+        result = await query_attention(session)
+        templates = [c["template"] for c in result["conditions"]]
+        assert "parked" not in templates
+
+    async def test_attention_includes_collect_after_reopen(
+        self, session, session_factory
+    ):
+        """A collect condition that was reopened IS in attention — a recurrence
+        of something parked may need re-evaluation."""
+        opsalert.configure(session_factory=session_factory)
+        await _fire_old(session, severity="error", message="parked then back")
+        await session.commit()
+        await sync_condition_stats(session)
+        condition = await _condition_for(session, "parked then back")
+        await set_disposition(session, condition, "collect")
+        # Simulate a reopen.
+        condition.reopened_count = 1
+        condition.status = "new"
+        await session.commit()
+
+        result = await query_attention(session)
+        templates = [c["template"] for c in result["conditions"]]
+        assert "parked then back" in templates
+
+    async def test_attention_ordering_by_users_24h(self, session, session_factory):
+        """Ordering: users_24h desc, severity rank, age.
+
+        users_24h is read from alert_condition_subject (day >= today-1),
+        not from parsing context_json.
+        """
+        from opsalert.lifecycle import record_subjects
+
+        opsalert.configure(session_factory=session_factory)
+
+        # Condition A: 1 subject
+        await _fire_old(session, severity="error", message="few users")
+        # Condition B: 3 subjects
+        await _fire_old(session, severity="warn", message="many users")
+        await session.commit()
+        await sync_condition_stats(session)
+        await session.commit()
+
+        today = datetime.now(UTC).date()
+        cond_a = await _condition_for(session, "few users")
+        cond_b = await _condition_for(session, "many users")
+        await record_subjects(session, cond_a.id, [("user", "u1")], today)
+        await record_subjects(
+            session, cond_b.id,
+            [("user", "u1"), ("user", "u2"), ("user", "u3")],
+            today,
+        )
+        await session.commit()
+
+        result = await query_attention(session)
+        # "many users" should come first despite lower severity — more users.
+        assert len(result["conditions"]) >= 2
+        assert result["conditions"][0]["template"] == "many users"
+
+    async def test_attention_cursor_re_reports_on_reopen(
+        self, session, session_factory
+    ):
+        """Cursor extends to (occurrence_count, reopened_count): a reopen
+        re-surfaces the condition even with no new occurrences."""
+        opsalert.configure(session_factory=session_factory)
+        await _fire_old(session, message="loud")
+        await session.commit()
+        await sync_condition_stats(session)
+        await session.commit()
+
+        first = await query_attention(session)
+        assert len(first["conditions"]) == 1
+        cursor = first["cursor"]
+
+        # Nothing new — should be empty.
+        second = await query_attention(session, cursor=cursor)
+        assert second["conditions"] == []
+
+        # Now reopen the condition (without adding occurrences).
+        condition = await _condition_for(session, "loud")
+        await set_status(
+            session, condition, "resolved", actor="chris",
+        )
+        reopen_condition(condition)
+        await session.commit()
+
+        third = await query_attention(session, cursor=second["cursor"])
+        assert len(third["conditions"]) == 1
+        assert third["conditions"][0]["template"] == "loud"
+
+    async def test_attention_is_regression_computed(self, session, session_factory):
+        """is_regression = last_seen_release != acknowledged_release, both non-null."""
+        opsalert.configure(session_factory=session_factory)
+        await _fire_old(session, message="regressed")
+        await session.commit()
+        await sync_condition_stats(session)
+        condition = await _condition_for(session, "regressed")
+        condition.last_seen_release = "v2.0"
+        condition.acknowledged_release = "v1.0"
+        await session.commit()
+
+        result = await query_attention(session)
+        match = [c for c in result["conditions"] if c["template"] == "regressed"]
+        assert len(match) == 1
+        assert match[0]["is_regression"] is True
+
+    async def test_attention_has_release_and_users_fields(self, session, session_factory):
+        """Attention conditions include users_24h, first_seen_release,
+        last_seen_release, is_regression."""
+        opsalert.configure(session_factory=session_factory)
+        await _fire_old(session, message="release info")
+        await session.commit()
+        await sync_condition_stats(session)
+        condition = await _condition_for(session, "release info")
+        condition.first_seen_release = "v1.0"
+        condition.last_seen_release = "v1.0"
+        await session.commit()
+
+        result = await query_attention(session)
+        match = [c for c in result["conditions"] if c["template"] == "release info"]
+        assert len(match) == 1
+        item = match[0]
+        assert "users_24h" in item
+        assert "first_seen_release" in item
+        assert item["first_seen_release"] == "v1.0"
+        assert "last_seen_release" in item
+        assert item["last_seen_release"] == "v1.0"
+        assert "is_regression" in item
