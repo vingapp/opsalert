@@ -73,6 +73,16 @@ class Alert(OpsAlertBase):
         ForeignKey("alert_condition.id", ondelete="SET NULL"), nullable=True
     )
 
+    # Ingest event id — a 32-char hex UUID. UNIQUE so replay safety can
+    # detect duplicates after an ambiguous commit.
+    event_id: Mapped[str | None] = mapped_column(String(32), unique=True, nullable=True)
+
+    # How many sibling events this row "stands for" beyond itself. Written
+    # by the ingest sampling logic; aggregations in O2/O3 read it.
+    sampled_out: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
+
     # Email delivery tracking
     notified: Mapped[bool] = mapped_column(
         Boolean, default=False, server_default="0", nullable=False
@@ -188,6 +198,14 @@ class AlertCondition(OpsAlertBase):
     # seen timestamps are. Used by the regression reopen rule (O3).
     first_seen_release: Mapped[str | None] = mapped_column(String(40), nullable=True)
     last_seen_release: Mapped[str | None] = mapped_column(String(40), nullable=True)
+
+    # Ingest drop and sampling accounting on the condition
+    dropped_count: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
+    sampled_out: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
 
     # Derived statistics — outlive the occurrences they were computed from
     first_seen: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

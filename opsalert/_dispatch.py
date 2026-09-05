@@ -1,56 +1,24 @@
-"""Dispatch — fire-and-forget alert creation.
+"""Dispatch — fire-and-forget alert creation via ingest queue.
 
-Auto-detects async (FastAPI) vs sync (Celery) context.
-Never raises — all failures logged, caller unaffected.
-Acquires own session via configured session_factory.
-Auto-enriches context with runtime debugging info.
+Enriches the context, builds an Event with the identity header, and enqueues
+it on the bounded in-process queue. One daemon thread writes batches to the
+DB (see :mod:`opsalert.ingest`).
 
-The call shape is unchanged: ``warn/error/critical(category, message=,
-source=, context=)``. The optional ``params=`` makes an emission structured —
-``message`` becomes a format template and ``params`` its values — which gives
-the alert's condition an exact identity instead of one guessed from the text.
+No event loop interaction. No session factory call. No DB access on the
+caller thread. The call shape is unchanged: ``warn/error/critical(category,
+message=, source=, context=)``.
 """
-import asyncio
 import logging
+import uuid
+from datetime import UTC, datetime
 from typing import Any
 
 from opsalert._config import get_config
 from opsalert._enrichment import enrich_context
-from opsalert.store import fire_alert
+from opsalert.signature import condition_signature, normalize_message, render_template
+from opsalert.store import stamp_environment
 
 logger = logging.getLogger(__name__)
-
-# Fire-and-forget tasks are kept referenced until they finish. asyncio holds
-# only a WEAK reference to a running task, so a bare ``loop.create_task(...)``
-# can be garbage-collected mid-flight — losing the alert silently, which is the
-# one outcome this package exists to prevent.
-_INFLIGHT: set = set()
-
-
-async def _fire(
-    severity: str,
-    category: str,
-    message: str,
-    source: str | None,
-    context: dict[str, Any] | None,
-    params: dict[str, Any] | None = None,
-) -> None:
-    """Internal async implementation — acquires session and fires alert."""
-    try:
-        cfg = get_config()
-        async with cfg.session_factory() as session:
-            await fire_alert(
-                session,
-                severity=severity,
-                category=category,
-                message=message,
-                source=source,
-                context=context,
-                params=params,
-            )
-            await session.commit()
-    except Exception:
-        logger.exception("Failed to fire alert: severity=%s category=%s", severity, category)
 
 
 def _fire_sync(
@@ -63,9 +31,8 @@ def _fire_sync(
 ) -> None:
     """Fire an alert from any context (sync or async).
 
-    Tries to get the running event loop first (FastAPI context),
-    falls back to creating a new one (Celery/sync context).
-    Never raises — all failures are logged, caller unaffected.
+    Builds an Event and enqueues it. Never raises — all failures are logged,
+    caller unaffected.
 
     No-ops when:
     - testing mode is enabled (alerts would leak outside test transaction)
@@ -80,19 +47,32 @@ def _fire_sync(
         return
 
     context = enrich_context(context)
+    stamped = stamp_environment(context)
 
-    try:
-        loop = asyncio.get_running_loop()
-        task = loop.create_task(_fire(severity, category, message, source, context, params))
-        _INFLIGHT.add(task)
-        task.add_done_callback(_INFLIGHT.discard)
-    except RuntimeError:
-        try:
-            asyncio.run(_fire(severity, category, message, source, context, params))
-        except Exception:
-            logger.exception(
-                "Failed to run alert fire: severity=%s category=%s", severity, category
-            )
+    # Compute the identity header
+    rendered = render_template(message, params)
+    template = message if params else normalize_message(message)
+    environment = (stamped or {}).get("environment")
+
+    sig_key = condition_signature(category, source, environment, template)
+
+    from opsalert.ingest import Event, enqueue
+
+    event = Event(
+        event_id=uuid.uuid4().hex,
+        ts=datetime.now(UTC),
+        severity=severity,
+        category=category,
+        message=rendered,
+        source=source,
+        context=stamped,
+        params=params,
+        template=template,
+        environment=environment,
+        signature_key=sig_key,
+    )
+
+    enqueue(event)
 
 
 def warn(

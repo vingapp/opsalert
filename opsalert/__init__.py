@@ -26,6 +26,7 @@ from opsalert._config import configure, get_config, reset_config
 from opsalert._dispatch import critical, error, warn
 from opsalert.cleanup import cleanup_alerts
 from opsalert.delivery import deliver_alerts
+from opsalert.ingest import flush
 from opsalert.lifecycle import (
     apply_lifecycle_rules,
     effective_disposition,
@@ -72,6 +73,7 @@ __all__ = [
     "warn",
     "error",
     "critical",
+    "flush",
     # Direct store access
     "fire_alert",
     # Query API
