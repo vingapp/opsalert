@@ -490,6 +490,11 @@ def _condition_dict(condition: AlertCondition) -> dict:
         "resolved_at": condition.resolved_at,
         "closed_at": condition.closed_at,
         "created": condition.created,
+        # v2 identity
+        "kind": condition.kind,
+        "fingerprint_version": condition.fingerprint_version,
+        "message_example": condition.message_example,
+        "resolution_url": condition.resolution_url,
     }
 
 

@@ -59,6 +59,13 @@ class OpsAlertConfig:
     # actually reproduce.
     identity_provider: Callable[[], tuple[Any | None, Any | None]] | None = None
 
+    # --- Identity v2 ---
+    # Module prefixes that identify in-app frames (e.g. ("src.",) for vingapi).
+    # When empty, in-app = not stdlib/site-packages.
+    in_app_prefixes: tuple[str, ...] = ()
+    # Release identifier stamped on every occurrence (git sha, tag, etc.)
+    release: str | None = None
+
     # --- Ingest settings ---
     # Explicit sync database URL for the ingest writer thread. When set,
     # the writer connects with this URL. When None, the writer attempts to

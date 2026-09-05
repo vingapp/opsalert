@@ -49,6 +49,18 @@ class Event:
     # Sampling decision — stamped when the event is popped from the queue,
     # so replay never re-decides.
     sampled_in: bool = True
+    # --- Identity v2 fields ---
+    kind: str | None = None
+    fingerprint_version: int = 2
+    fingerprint_json: str | None = None
+    emit_site: str | None = None
+    exception_class: str | None = None
+    trace_id: str | None = None
+    span_id: str | None = None
+    user_id: int | None = None
+    org_id: int | None = None
+    release: str | None = None
+    subjects: list[tuple[str, str]] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +89,9 @@ class DropRecord:
     environment: str | None
     template: str
     severity: str
+    # v2 identity
+    kind: str | None = None
+    fingerprint_json: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -231,6 +246,8 @@ def _record_drop(event: Event) -> None:
             environment=event.environment,
             template=event.template,
             severity=event.severity,
+            kind=event.kind,
+            fingerprint_json=event.fingerprint_json,
         )
 
 
@@ -367,6 +384,8 @@ def _writer_loop() -> None:
                         environment=dr.environment,
                         template=dr.template,
                         severity=dr.severity,
+                        kind=dr.kind,
+                        fingerprint_json=dr.fingerprint_json,
                     )
 
             # Stamp sampling decisions outside the lock (no contention
@@ -582,6 +601,38 @@ def write_batch(
                     )
                 )
 
+    # Record subjects for every event (sampled in or out) — "sampling
+    # never hides a new user". Subjects are recorded against the condition,
+    # so we need a condition_id for each group.
+    for fp, group in groups.items():
+        # Find the condition_id for this group (already resolved above)
+        try:
+            group_condition_id = _resolve_condition_sync(conn, group[0])
+        except Exception:
+            group_condition_id = None
+
+        if group_condition_id is not None:
+            for ev in group:
+                if ev.subjects:
+                    day = ev.ts.date()
+                    for subject_kind, subject_key in ev.subjects:
+                        try:
+                            from opsalert.lifecycle import subject_upsert_statement
+                            stmt = subject_upsert_statement(
+                                conn.dialect.name,
+                                {
+                                    "condition_id": group_condition_id,
+                                    "subject_kind": subject_kind,
+                                    "subject_key": subject_key,
+                                    "day": day,
+                                },
+                            )
+                            conn.execute(stmt)
+                        except Exception:
+                            logger.exception(
+                                "opsalert.ingest: subject recording failed"
+                            )
+
     # Handle drops
     for fp, dr in drops.items():
         if dr.count <= 0:
@@ -618,6 +669,86 @@ def _prune_sample_state(now: datetime) -> None:
         del _sample_state[k]
 
 
+def _build_event_json(event: Event) -> str | None:
+    """Build a Sentry-shaped event JSON from the enriched context."""
+    ctx = event.context or {}
+    data: dict[str, Any] = {
+        "event_id": event.event_id,
+        "timestamp": event.ts.isoformat(),
+        "level": event.severity,
+        "logger": event.category,
+        "platform": "python",
+        "message": event.message,
+    }
+    if event.release:
+        data["release"] = event.release
+    if event.environment:
+        data["environment"] = event.environment
+    # Fingerprint parts
+    if event.fingerprint_json:
+        try:
+            data["fingerprint"] = json.loads(event.fingerprint_json)
+        except (ValueError, TypeError):
+            data["fingerprint"] = []
+
+    # Tags
+    tags: dict[str, Any] = {}
+    if event.kind:
+        tags["kind"] = event.kind
+    tags["category"] = event.category
+    if event.source:
+        tags["source"] = event.source
+    if event.emit_site:
+        tags["emit_site"] = event.emit_site
+    trace_id = ctx.get("_trace_id") or event.trace_id
+    if trace_id:
+        tags["trace_id"] = str(trace_id)
+    span_id = ctx.get("_span_id") or event.span_id
+    if span_id:
+        tags["span_id"] = str(span_id)
+    data["tags"] = tags
+
+    # User
+    user: dict[str, Any] = {}
+    uid = ctx.get("_user_id") or event.user_id
+    if uid is not None:
+        user["id"] = uid
+    sid = ctx.get("_session_id")
+    if sid is not None:
+        user["session_id"] = sid
+    if user:
+        data["user"] = user
+
+    # Exception
+    exc_type = ctx.get("_exc_type")
+    if exc_type:
+        exc_val: dict[str, Any] = {
+            "type": exc_type,
+            "value": ctx.get("_exc_message", ""),
+        }
+        frames = ctx.get("_frames")
+        if frames:
+            exc_val["stacktrace"] = {"frames": frames}
+        data["exception"] = {"values": [exc_val]}
+
+    # Extra — remaining context keys not already captured
+    _reserved = {
+        "_caller", "_emit_site", "_exc_type", "_exc_message", "_traceback",
+        "_frames", "_exception_chain", "_trace_id", "_trace_origin",
+        "_user_id", "_org_id", "_task_name", "_task_id", "_release",
+        "_message_template", "_span_id", "_session_id", "_identifier_hash",
+        "environment",
+    }
+    extra = {k: v for k, v in ctx.items() if k not in _reserved}
+    if extra:
+        data["extra"] = extra
+
+    try:
+        return json.dumps(data, default=str)
+    except Exception:
+        return None
+
+
 def _insert_alert(conn: Any, event: Event, condition_id: int | None) -> int | None:
     """Insert a single Alert row. Returns the row id or None."""
     from sqlalchemy.exc import IntegrityError
@@ -638,6 +769,18 @@ def _insert_alert(conn: Any, event: Event, condition_id: int | None) -> int | No
                 sampled_out=0,
                 notified=False,
                 created=event.ts,
+                # v2 columns
+                kind=event.kind,
+                emit_site=event.emit_site,
+                exception_class=event.exception_class,
+                trace_id=event.trace_id,
+                span_id=event.span_id,
+                user_id=event.user_id,
+                org_id=event.org_id,
+                release=event.release,
+                fingerprint_version=event.fingerprint_version,
+                fingerprint_json=event.fingerprint_json,
+                event_json=_build_event_json(event),
             )
         )
         return result.inserted_primary_key[0]
@@ -663,12 +806,21 @@ def _resolve_condition_sync(conn: Any, event: Event) -> int | None:
     if existing is not None:
         return existing
 
+    # Explicit kind: message_template = kind (search matches it).
+    # Legacy fallback (.legacy): message_template = the normalized message
+    # template so search by message content still works.
+    is_legacy_kind = event.kind and event.kind.endswith(".legacy")
+    if event.kind and not is_legacy_kind:
+        msg_template = event.kind
+    else:
+        msg_template = (event.template or "")[:500]
+
     values = {
         "signature_key": fp,
         "category": event.category,
         "source": event.source,
         "environment": event.environment,
-        "message_template": (event.template or "")[:500],
+        "message_template": msg_template[:500],
         "status": "new",
         "severity": event.severity,
         "latest_severity": event.severity,
@@ -676,6 +828,12 @@ def _resolve_condition_sync(conn: Any, event: Event) -> int | None:
         "first_seen": now,
         "created": now,
         "updated": now,
+        # v2 fields
+        "kind": event.kind,
+        "fingerprint_version": event.fingerprint_version,
+        "fingerprint_json": event.fingerprint_json,
+        "emit_site": event.emit_site,
+        "message_example": (event.message or "")[:500],
     }
 
     # Detect dialect
@@ -704,7 +862,20 @@ def _resolve_condition_sync_from_drop(conn: Any, dr: DropRecord) -> int | None:
     from opsalert.signature import condition_signature
     from opsalert.store import upsert_statement
 
-    fp = condition_signature(dr.category, dr.source, dr.environment, dr.template)
+    # Use the v2 signature from the event that was dropped, if available
+    if dr.kind:
+        from opsalert.signature import event_signature
+
+        template_for_fp = dr.template if dr.kind.endswith(".legacy") else None
+        fp = event_signature(
+            kind=dr.kind,
+            environment=dr.environment,
+            exception_chain=[],
+            origin_frame="",
+            template=template_for_fp,
+        )
+    else:
+        fp = condition_signature(dr.category, dr.source, dr.environment, dr.template)
 
     # SELECT first
     existing = conn.execute(
@@ -713,13 +884,14 @@ def _resolve_condition_sync_from_drop(conn: Any, dr: DropRecord) -> int | None:
     if existing is not None:
         return existing
 
+    msg_template = dr.kind if dr.kind else (dr.template or "")[:500]
     now = datetime.now(UTC)
     values = {
         "signature_key": fp,
         "category": dr.category,
         "source": dr.source,
         "environment": dr.environment,
-        "message_template": (dr.template or "")[:500],
+        "message_template": msg_template[:500],
         "status": "new",
         "severity": dr.severity,
         "latest_severity": dr.severity,
@@ -727,6 +899,9 @@ def _resolve_condition_sync_from_drop(conn: Any, dr: DropRecord) -> int | None:
         "first_seen": now,
         "created": now,
         "updated": now,
+        "kind": dr.kind,
+        "fingerprint_version": 2 if dr.kind else 1,
+        "fingerprint_json": dr.fingerprint_json,
     }
 
     dialect = conn.dialect.name

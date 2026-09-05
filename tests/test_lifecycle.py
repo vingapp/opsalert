@@ -158,7 +158,17 @@ class TestOrphanAdoption:
         The watermark scan can never see it — that is exactly why adoption is
         unbounded and counts what it links. Gating the repair on the same
         bookkeeping that failed would make the loss permanent.
+
+        The orphan carries v2 identity fields (as the ingest queue would
+        stamp them) so adoption matches it to the v2 condition.
         """
+        import json
+
+        from opsalert.signature import (
+            event_fingerprint_parts,
+            normalize_message,
+        )
+
         await _fire_backdated(session, message="boom")
         await session.commit()
         await sync_condition_stats(session)
@@ -166,12 +176,25 @@ class TestOrphanAdoption:
 
         condition = await _the_condition(session)
         condition.stats_synced_through = 10_000  # far above any row we will make
+        # Build the same v2 identity the ingest queue would stamp on a
+        # condition-resolution failure (F1).
+        tmpl = normalize_message("boom")
+        fp_parts = event_fingerprint_parts(
+            kind="cat.legacy",
+            environment=None,
+            exception_chain=[],
+            origin_frame="",
+            template=tmpl,
+        )
         session.add(
             Alert(
                 severity="error",
                 category="cat",
                 message="boom",
                 created=datetime.now(UTC) - LONG_AGO,
+                fingerprint_version=2,
+                fingerprint_json=json.dumps(fp_parts),
+                kind="cat.legacy",
             )
         )
         await session.commit()
