@@ -235,6 +235,9 @@ async def _adopt_orphans(session, *, now: datetime, batch_size: int = 500) -> in
                     Alert.message,
                     Alert.severity,
                     Alert.context_json,
+                    Alert.fingerprint_version,
+                    Alert.fingerprint_json,
+                    Alert.kind,
                 )
                 .where(Alert.condition_id.is_(None), Alert.id > last_id)
                 .order_by(Alert.id)
@@ -250,35 +253,77 @@ async def _adopt_orphans(session, *, now: datetime, batch_size: int = 500) -> in
             try:
                 context = _context_dict(row.context_json)
                 environment = _context_str(context, "environment")
-                # A params emission stored its emit-time template on the row
-                # (opsalert#2): reuse it VERBATIM, so the orphan lands under
-                # the same identity the fire path would have produced.
-                # Normalizing the rendered message is only for old rows that
-                # never carried one — and for those, message == what the emit
-                # path normalized, so the identities still agree.
-                template = _context_str(context, TEMPLATE_CONTEXT_KEY) or normalize_message(
-                    row.message or ""
-                )
-                signature_key = condition_signature(
-                    row.category, row.source, environment, template
-                )
-                condition_id = await _lookup_or_create(
-                    session,
-                    signature_key=signature_key,
-                    values={
-                        "signature_key": signature_key,
-                        "category": row.category,
-                        "source": row.source,
-                        "environment": environment,
-                        "message_template": template[:500],
-                        "status": STATUS_NEW,
-                        "severity": row.severity,
-                        "latest_severity": row.severity,
-                        "status_changed_at": now,
-                        "created": now,
-                        "updated": now,
-                    },
-                )
+
+                # V2 rows adopt by their stored signature_key (no recompute)
+                if (row.fingerprint_version or 1) >= 2 and row.fingerprint_json:
+                    try:
+                        parts = json.loads(row.fingerprint_json)
+                    except (ValueError, TypeError):
+                        parts = []
+
+                    # Reconstruct the signature from stored parts
+                    payload = "\x1f".join(
+                        str(p).replace("\x1f", " ") for p in parts
+                    )
+                    import hashlib
+                    signature_key = hashlib.sha256(
+                        payload.encode("utf-8")
+                    ).hexdigest()
+
+                    kind = row.kind or (parts[1] if len(parts) > 1 else None)
+                    msg_template = kind if kind else (row.message or "")[:500]
+
+                    condition_id = await _lookup_or_create(
+                        session,
+                        signature_key=signature_key,
+                        values={
+                            "signature_key": signature_key,
+                            "category": row.category,
+                            "source": row.source,
+                            "environment": environment,
+                            "message_template": msg_template[:500],
+                            "status": STATUS_NEW,
+                            "severity": row.severity,
+                            "latest_severity": row.severity,
+                            "status_changed_at": now,
+                            "created": now,
+                            "updated": now,
+                            "kind": kind,
+                            "fingerprint_version": 2,
+                            "fingerprint_json": row.fingerprint_json,
+                        },
+                    )
+                else:
+                    # V1 rows: recompute identity as before
+                    # A params emission stored its emit-time template on the row
+                    # (opsalert#2): reuse it VERBATIM, so the orphan lands under
+                    # the same identity the fire path would have produced.
+                    # Normalizing the rendered message is only for old rows that
+                    # never carried one — and for those, message == what the emit
+                    # path normalized, so the identities still agree.
+                    template = _context_str(
+                        context, TEMPLATE_CONTEXT_KEY
+                    ) or normalize_message(row.message or "")
+                    signature_key = condition_signature(
+                        row.category, row.source, environment, template
+                    )
+                    condition_id = await _lookup_or_create(
+                        session,
+                        signature_key=signature_key,
+                        values={
+                            "signature_key": signature_key,
+                            "category": row.category,
+                            "source": row.source,
+                            "environment": environment,
+                            "message_template": template[:500],
+                            "status": STATUS_NEW,
+                            "severity": row.severity,
+                            "latest_severity": row.severity,
+                            "status_changed_at": now,
+                            "created": now,
+                            "updated": now,
+                        },
+                    )
             except Exception:
                 logger.exception("opsalert: could not adopt orphan occurrence %s", row.id)
                 continue

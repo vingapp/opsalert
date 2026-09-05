@@ -8,7 +8,17 @@ resolved, the issue URL, how often it fires, whether it came back.
 """
 from datetime import UTC, datetime
 
-from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Index, Integer, String, Text
+from sqlalchemy import (
+    Boolean,
+    Date,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    SmallInteger,
+    String,
+    Text,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -83,6 +93,21 @@ class Alert(OpsAlertBase):
         Integer, default=0, server_default="0", nullable=False
     )
 
+    # --- Identity v2 columns ---
+    kind: Mapped[str | None] = mapped_column(String(120), nullable=True, index=True)
+    emit_site: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    exception_class: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    trace_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    span_id: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
+    user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    org_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    release: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    fingerprint_version: Mapped[int] = mapped_column(
+        SmallInteger, default=1, server_default="1", nullable=False
+    )
+    fingerprint_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    event_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     # Email delivery tracking
     notified: Mapped[bool] = mapped_column(
         Boolean, default=False, server_default="0", nullable=False
@@ -142,6 +167,16 @@ class AlertCondition(OpsAlertBase):
     source: Mapped[str | None] = mapped_column(String(100), nullable=True)
     environment: Mapped[str | None] = mapped_column(String(50), nullable=True)
     message_template: Mapped[str] = mapped_column(String(500), nullable=False)
+
+    # Identity v2
+    kind: Mapped[str | None] = mapped_column(String(120), nullable=True, index=True)
+    fingerprint_version: Mapped[int] = mapped_column(
+        SmallInteger, default=1, server_default="1", nullable=False
+    )
+    fingerprint_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    emit_site: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    message_example: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    resolution_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
 
     # Lifecycle
     status: Mapped[str] = mapped_column(
