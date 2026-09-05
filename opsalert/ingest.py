@@ -530,8 +530,8 @@ def write_batch(
 
         last_inserted_id = None
         group_sampled = 0
-        group_inserted = 0
-        all_duplicates = True
+        group_attempted = 0  # inserts attempted (sampled_in events)
+        group_inserted = 0   # inserts that succeeded (not duplicate)
         max_ts = group[0].ts
 
         for ev in group:
@@ -539,19 +539,22 @@ def write_batch(
                 max_ts = ev.ts
 
             if ev.sampled_in:
+                group_attempted += 1
                 row_id = _insert_alert(conn, ev, condition_id)
                 if row_id is not None:
                     last_inserted_id = row_id
                     written += 1
                     group_inserted += 1
-                    all_duplicates = False
                 # row_id is None => duplicate (replay); don't count as new
             else:
                 group_sampled += 1
 
-        # Skip all UPDATEs when every insert hit a duplicate — those
-        # UPDATEs were already applied in the ambiguous prior commit.
-        if all_duplicates and group_inserted == 0:
+        # Skip UPDATEs only when at least one insert was ATTEMPTED and
+        # every attempted insert hit a duplicate — those UPDATEs were
+        # already applied in the ambiguous prior commit. When NO insert
+        # was attempted (all sampled_out), the condition UPDATEs must
+        # still fire.
+        if group_attempted > 0 and group_inserted == 0:
             sampled_out_count += group_sampled
             continue
 
