@@ -12,7 +12,9 @@ from opsalert.lifecycle import (
     ACK_BURST_MIN,
     AUTO_CLOSE_FLOOR,
     apply_lifecycle_rules,
+    distinct_subjects,
     effective_disposition,
+    record_subjects,
     set_disposition,
     set_status,
     sync_condition_stats,
@@ -432,7 +434,7 @@ class TestHumanTransitions:
         """P8 — a state change nobody can attribute is not an audit trail."""
         condition = await self._condition(session)
         before = datetime.now(UTC)
-        await set_status(session, condition, "acknowledged", actor="chris")
+        await set_status(session, condition, "acknowledged", actor="chris", issue_url="https://github.com/test/1")
         await session.commit()
 
         assert condition.status == "acknowledged"
@@ -459,7 +461,7 @@ class TestHumanTransitions:
     async def test_reopening_clears_a_stale_acknowledgement(self, session):
         """The person who acknowledged the last episode has not seen this one."""
         condition = await self._condition(session)
-        await set_status(session, condition, "acknowledged", actor="chris")
+        await set_status(session, condition, "acknowledged", actor="chris", issue_url="https://github.com/test/1")
         await set_status(session, condition, "new", actor="chris")
         await session.commit()
 
@@ -479,7 +481,7 @@ class TestHumanTransitions:
 
     async def test_status_can_be_set_by_id(self, session):
         condition = await self._condition(session)
-        await set_status(session, condition.id, "acknowledged", actor="chris")
+        await set_status(session, condition.id, "acknowledged", actor="chris", issue_url="https://github.com/test/1")
         assert condition.status == "acknowledged"
 
     async def test_an_unknown_disposition_is_refused(self, session):
@@ -514,7 +516,7 @@ class TestAckEscalation:
         compare the current state against and can never fire."""
         now = datetime.now(UTC)
         condition = await self._synced_condition(session, occurrences=3, severity="warn", now=now)
-        await set_status(session, condition, "acknowledged", actor="chris", now=now)
+        await set_status(session, condition, "acknowledged", actor="chris", now=now, issue_url="https://github.com/test/1")
         await session.commit()
 
         assert condition.acknowledged_severity == "warn"
@@ -541,7 +543,7 @@ class TestAckEscalation:
         comparing new occurrences against a stale count/severity forever."""
         now = datetime.now(UTC)
         condition = await self._synced_condition(session, occurrences=1, severity="warn", now=now)
-        await set_status(session, condition, "acknowledged", actor="chris", now=now)
+        await set_status(session, condition, "acknowledged", actor="chris", now=now, issue_url="https://github.com/test/1")
         await session.commit()
         assert condition.acknowledged_occurrence_count == 1
         assert condition.acknowledged_severity == "warn"
@@ -549,7 +551,7 @@ class TestAckEscalation:
         later = now + timedelta(hours=1)
         await _fire_backdated(session, severity="error", age=timedelta(minutes=5), now=later)
         await session.commit()
-        await set_status(session, condition, "acknowledged", actor="chris", now=later)
+        await set_status(session, condition, "acknowledged", actor="chris", now=later, issue_url="https://github.com/test/1")
         await session.commit()
 
         assert condition.acknowledged_occurrence_count == 2
@@ -560,7 +562,7 @@ class TestAckEscalation:
         after acknowledgement stays silently acknowledged."""
         now = datetime.now(UTC)
         condition = await self._synced_condition(session, occurrences=2, severity="warn", now=now)
-        await set_status(session, condition, "acknowledged", actor="chris", now=now)
+        await set_status(session, condition, "acknowledged", actor="chris", now=now, issue_url="https://github.com/test/1")
         await session.commit()
 
         later = now + timedelta(minutes=10)
@@ -588,7 +590,7 @@ class TestAckEscalation:
         await sync_condition_stats(session, now=now)
         await session.commit()
         condition = await _the_condition(session)
-        await set_status(session, condition, "acknowledged", actor="chris", now=now)
+        await set_status(session, condition, "acknowledged", actor="chris", now=now, issue_url="https://github.com/test/1")
         await session.commit()
         assert condition.acknowledged_severity == "error"
 
@@ -614,7 +616,7 @@ class TestAckEscalation:
         await session.commit()
         condition = await _the_condition(session)
         assert condition.occurrence_count == 24
-        await set_status(session, condition, "acknowledged", actor="chris", now=now)
+        await set_status(session, condition, "acknowledged", actor="chris", now=now, issue_url="https://github.com/test/1")
         await session.commit()
 
         later = now + timedelta(hours=2)
@@ -639,7 +641,7 @@ class TestAckEscalation:
         await sync_condition_stats(session, now=now)
         await session.commit()
         condition = await _the_condition(session)
-        await set_status(session, condition, "acknowledged", actor="chris", now=now)
+        await set_status(session, condition, "acknowledged", actor="chris", now=now, issue_url="https://github.com/test/1")
         await session.commit()
 
         later = now + timedelta(hours=2)
@@ -654,21 +656,22 @@ class TestAckEscalation:
         assert condition.status == "acknowledged"
 
     async def test_burst_within_baseline_does_not_reopen(self, session):
-        """The burst rule must compare against the RATE, not a raw count —
-        otherwise a condition that has always been this chatty gets
-        punished for behaving exactly as it always has."""
+        """The burst rule compares against max(10, 1.5 * pre-ack peak) —
+        a condition whose pre-ack peak was high enough does not reopen
+        for a post-ack burst that is within 1.5x of that peak."""
         now = datetime.now(UTC)
         await _fire_backdated(session, severity="warn", age=timedelta(minutes=30), now=now)
         await session.commit()
         await sync_condition_stats(session, now=now)
         await session.commit()
         condition = await _the_condition(session)
-        await set_status(session, condition, "acknowledged", actor="chris", now=now)
-        condition.acknowledged_occurrence_count = 600
-        condition.first_seen = now - timedelta(hours=1)
+        await set_status(session, condition, "acknowledged", actor="chris", now=now, issue_url="https://github.com/test/1")
+        # Pre-ack peak of 20 → threshold = max(10, 30) = 30.
+        condition.acknowledged_peak_15m = 20
         await session.commit()
 
         later = now + timedelta(hours=2)
+        # 15 in 15m < threshold of 30 → no reopen.
         for _ in range(15):
             await _fire_backdated(session, severity="warn", age=timedelta(minutes=1), now=later)
         await session.commit()
@@ -693,7 +696,7 @@ class TestAckEscalation:
         condition = await _the_condition(session)
         assert condition.occurrence_count == 0  # never synced — the stale value
 
-        await set_status(session, condition, "acknowledged", actor="chris", now=now)
+        await set_status(session, condition, "acknowledged", actor="chris", now=now, issue_url="https://github.com/test/1")
         await session.commit()
         assert condition.acknowledged_occurrence_count == 12
 
@@ -733,7 +736,7 @@ class TestAckEscalation:
         nobody — collect never wakes anyone regardless of status."""
         now = datetime.now(UTC)
         condition = await self._synced_condition(session, occurrences=1, severity="warn", now=now)
-        await set_status(session, condition, "acknowledged", actor="chris", now=now)
+        await set_status(session, condition, "acknowledged", actor="chris", now=now, issue_url="https://github.com/test/1")
         await set_disposition(session, condition, "collect", actor="chris")
         await session.commit()
 
@@ -842,7 +845,7 @@ class TestAckEscalation:
         await sync_condition_stats(session, now=now)
         await session.commit()
         condition = await _the_condition(session)
-        await set_status(session, condition, "acknowledged", actor="chris", now=now)
+        await set_status(session, condition, "acknowledged", actor="chris", now=now, issue_url="https://github.com/test/1")
         # Simulate a pre-migration row: baseline unknowable.
         condition.acknowledged_severity = None
         condition.acknowledged_occurrence_count = None
@@ -861,10 +864,12 @@ class TestAckEscalation:
         assert result["escalated"] == 0
         assert condition.status == "acknowledged"
 
-        # NULL count still baselines at 0 — a burst of >= ACK_BURST_MIN does
-        # reopen it even with severity escalation unavailable.
+        # NULL peak baselines at 0 — threshold = max(10, 0) = 10, so any
+        # burst > 10 reopens even with severity escalation unavailable.
+        condition.acknowledged_peak_15m = None
+        await session.commit()
         even_later = later + timedelta(minutes=20)
-        for _ in range(10):
+        for _ in range(11):
             await _fire_backdated(
                 session, severity="warn", age=timedelta(minutes=1), now=even_later
             )
@@ -889,3 +894,593 @@ class TestEffectiveDisposition:
 
     def test_an_unknown_stored_disposition_falls_back_to_the_default(self):
         assert effective_disposition("error", "garbage") == "immediate"
+
+
+class TestAckRequiresIssue:
+    """Acknowledged = owned: ack without issue_url is refused unless snoozing."""
+
+    async def _condition(self, session):
+        await _fire_backdated(session)
+        await session.commit()
+        return await _the_condition(session)
+
+    async def test_ack_without_issue_raises_ack_requires_issue(self, session):
+        """If ack does not require an issue, acknowledged conditions have no
+        owner on record and the ack is operationally meaningless."""
+        condition = await self._condition(session)
+        with pytest.raises(ValueError, match="ack_requires_issue"):
+            await set_status(session, condition, "acknowledged", actor="chris")
+
+    async def test_ack_with_issue_url_ok(self, session):
+        """Providing an issue at ack time satisfies the requirement."""
+        condition = await self._condition(session)
+        await set_status(
+            session, condition, "acknowledged", actor="chris",
+            issue_url="https://github.com/vingapp/opsalert/issues/7",
+        )
+        await session.commit()
+        assert condition.status == "acknowledged"
+        assert condition.issue_url == "https://github.com/vingapp/opsalert/issues/7"
+
+    async def test_ack_with_existing_issue_url_ok(self, session):
+        """A condition that already has an issue_url can be acked without passing one."""
+        condition = await self._condition(session)
+        condition.issue_url = "https://github.com/vingapp/opsalert/issues/7"
+        await session.flush()
+        await set_status(session, condition, "acknowledged", actor="chris")
+        await session.commit()
+        assert condition.status == "acknowledged"
+
+    async def test_ack_with_acknowledged_until_and_no_issue_ok_snooze(self, session):
+        """acknowledged_until with no issue = snooze, not a full ack."""
+        now = datetime.now(UTC)
+        condition = await self._condition(session)
+        await set_status(
+            session, condition, "acknowledged", actor="chris",
+            now=now,
+            acknowledged_until=now + timedelta(hours=1),
+        )
+        await session.commit()
+        assert condition.status == "acknowledged"
+        assert condition.acknowledged_until is not None
+
+
+class TestBurstPreAckPeak:
+    """Burst detection uses pre-ack 15-min peak instead of lifetime-mean."""
+
+    async def _synced_condition(self, session, *, occurrences=1, severity="warn", now=None):
+        now = now or datetime.now(UTC)
+        for _ in range(occurrences):
+            await _fire_backdated(session, severity=severity, now=now)
+        await session.commit()
+        await sync_condition_stats(session, now=now)
+        await session.commit()
+        return await _the_condition(session)
+
+    async def test_burst_uses_pre_ack_peak(self, session):
+        """Build 24h of occurrences with a known 15m peak; a post-ack window
+        at 1.4x does not trip, 1.6x does.
+
+        Threshold = max(10, 1.5 * acknowledged_peak_15m).
+        Peak of 20 → threshold = max(10, 30) = 30.
+        28 in 15m does not trip (28 <= 30); 31 does (31 > 30).
+        """
+        now = datetime.now(UTC)
+        # Build a known peak: 20 occurrences in a single 15-minute window.
+        # Background: 1 per hour for 24 hours.
+        for h in range(24):
+            await _fire_backdated(
+                session, severity="warn",
+                age=timedelta(hours=24 - h), now=now,
+            )
+        # A burst of 20 in a 15-minute window 12 hours ago = the peak.
+        for _ in range(20):
+            await _fire_backdated(
+                session, severity="warn",
+                age=timedelta(hours=12, minutes=5), now=now,
+            )
+        await session.commit()
+        await sync_condition_stats(session, now=now)
+        await session.commit()
+        condition = await _the_condition(session)
+        await set_status(
+            session, condition, "acknowledged", actor="chris", now=now,
+            issue_url="https://github.com/test/1",
+        )
+        await session.commit()
+        # acknowledged_peak_15m should be >= 20
+        assert condition.acknowledged_peak_15m is not None
+        assert condition.acknowledged_peak_15m >= 20
+
+        # 28 in 15m: should NOT trip (28 <= 30)
+        later = now + timedelta(hours=2)
+        for _ in range(28):
+            await _fire_backdated(
+                session, severity="warn", age=timedelta(minutes=1), now=later,
+            )
+        await session.commit()
+        result = await apply_lifecycle_rules(session, now=later + timedelta(minutes=1))
+        await session.commit()
+        assert result["escalated"] == 0
+        assert condition.status == "acknowledged"
+
+        # The pre-ack peak can include a background occurrence landing in the
+        # same 15-min bucket, so the actual peak may be 21 (20+1). Threshold =
+        # max(10, floor(1.5*21)) = 31. Add enough to reach 32 total = 4 more.
+        for _ in range(4):
+            await _fire_backdated(
+                session, severity="warn", age=timedelta(minutes=1), now=later,
+            )
+        await session.commit()
+        result2 = await apply_lifecycle_rules(session, now=later + timedelta(minutes=1))
+        await session.commit()
+        assert result2["escalated"] == 1
+        assert condition.status == "new"
+
+    async def test_burst_below_10_never_trips(self, session):
+        """Even with a peak of 0 (NULL), <= 10 in 15m never trips."""
+        now = datetime.now(UTC)
+        condition = await self._synced_condition(session, occurrences=1, severity="warn", now=now)
+        await set_status(
+            session, condition, "acknowledged", actor="chris", now=now,
+            issue_url="https://github.com/test/1",
+        )
+        await session.commit()
+
+        later = now + timedelta(hours=1)
+        for _ in range(9):
+            await _fire_backdated(
+                session, severity="warn", age=timedelta(minutes=1), now=later,
+            )
+        await session.commit()
+        result = await apply_lifecycle_rules(session, now=later + timedelta(minutes=1))
+        await session.commit()
+        assert result["escalated"] == 0
+        assert condition.status == "acknowledged"
+
+
+class TestSubjectReopen:
+    """Reopens when >= 5 new distinct subjects appear since ack."""
+
+    async def _synced_and_acked(self, session, *, now=None, n_subjects=3):
+        now = now or datetime.now(UTC)
+        await _fire_backdated(session, severity="warn", now=now)
+        await session.commit()
+        await sync_condition_stats(session, now=now)
+        await session.commit()
+        condition = await _the_condition(session)
+        # Seed some subjects before ack.
+        today = now.date()
+        await record_subjects(
+            session, condition.id,
+            [("user", f"u{i}") for i in range(n_subjects)],
+            today,
+        )
+        await session.commit()
+        await set_status(
+            session, condition, "acknowledged", actor="chris", now=now,
+            issue_url="https://github.com/test/1",
+        )
+        await session.commit()
+        return condition, now
+
+    async def test_subjects_reopen_at_5_new_not_4(self, session):
+        """4 new subjects since ack must not reopen; 5 must."""
+        condition, now = await self._synced_and_acked(session, now=datetime.now(UTC), n_subjects=3)
+        assert condition.acknowledged_subject_count == 3
+
+        # Add 4 new subjects — should not reopen.
+        later = now + timedelta(hours=1)
+        today = later.date()
+        await record_subjects(
+            session, condition.id,
+            [("user", f"new{i}") for i in range(4)],
+            today,
+        )
+        await session.commit()
+        result = await apply_lifecycle_rules(session, now=later)
+        await session.commit()
+        assert result["escalated"] == 0
+        assert condition.status == "acknowledged"
+
+        # Add 1 more (total 5 new) — SHOULD reopen.
+        await record_subjects(
+            session, condition.id,
+            [("user", "new4")],
+            today,
+        )
+        await session.commit()
+        result2 = await apply_lifecycle_rules(session, now=later + timedelta(minutes=1))
+        await session.commit()
+        assert result2["escalated"] == 1
+        assert condition.status == "new"
+        assert "subjects" in (condition.notes or "")
+
+
+class TestRegressionReopen:
+    """Reopens when last_seen_release differs from acknowledged_release."""
+
+    async def _synced_condition(self, session, *, severity="warn", now=None):
+        now = now or datetime.now(UTC)
+        await _fire_backdated(session, severity=severity, now=now)
+        await session.commit()
+        await sync_condition_stats(session, now=now)
+        await session.commit()
+        return await _the_condition(session)
+
+    async def test_regression_reopens(self, session):
+        """A condition whose last_seen_release is newer than
+        acknowledged_release is a regression and must reopen."""
+        now = datetime.now(UTC)
+        condition = await self._synced_condition(session, now=now)
+        condition.last_seen_release = "v1.0"
+        await session.flush()
+        await set_status(
+            session, condition, "acknowledged", actor="chris", now=now,
+            issue_url="https://github.com/test/1",
+        )
+        await session.commit()
+        assert condition.acknowledged_release == "v1.0"
+
+        # A newer release appears.
+        condition.last_seen_release = "v2.0"
+        await session.flush()
+        await session.commit()
+
+        result = await apply_lifecycle_rules(session, now=now + timedelta(hours=1))
+        await session.commit()
+        assert result["escalated"] == 1
+        assert condition.status == "new"
+        assert "regression" in (condition.notes or "").lower()
+
+    async def test_null_release_skipped(self, session):
+        """NULL on either side skips the regression rule."""
+        now = datetime.now(UTC)
+        condition = await self._synced_condition(session, now=now)
+        await set_status(
+            session, condition, "acknowledged", actor="chris", now=now,
+            issue_url="https://github.com/test/1",
+        )
+        await session.commit()
+        # Both NULL — should not reopen.
+        assert condition.acknowledged_release is None
+        assert condition.last_seen_release is None
+
+        result = await apply_lifecycle_rules(session, now=now + timedelta(hours=1))
+        await session.commit()
+        assert result["escalated"] == 0
+        assert condition.status == "acknowledged"
+
+
+class TestRecordAndDistinctSubjects:
+    """Tests for record_subjects and distinct_subjects helpers."""
+
+    async def test_record_subjects_inserts_and_distinct_counts(self, session):
+        """record_subjects inserts rows; distinct_subjects counts since a date."""
+        # Create a condition first.
+        await _fire_backdated(session)
+        await session.commit()
+        condition = await _the_condition(session)
+
+        today = datetime.now(UTC).date()
+        await record_subjects(
+            session, condition.id,
+            [("user", "u1"), ("user", "u2"), ("org", "o1")],
+            today,
+        )
+        await session.commit()
+
+        count = await distinct_subjects(session, condition.id, since=today)
+        assert count == 3
+
+    async def test_record_subjects_is_idempotent(self, session):
+        """Duplicate inserts do not raise or double-count."""
+        await _fire_backdated(session)
+        await session.commit()
+        condition = await _the_condition(session)
+
+        today = datetime.now(UTC).date()
+        await record_subjects(
+            session, condition.id,
+            [("user", "u1"), ("user", "u1")],
+            today,
+        )
+        await session.commit()
+        # Again — no error.
+        await record_subjects(
+            session, condition.id,
+            [("user", "u1")],
+            today,
+        )
+        await session.commit()
+
+        count = await distinct_subjects(session, condition.id, since=today)
+        assert count == 1
+
+
+class TestSyncRelease:
+    """sync_condition_stats folds first_seen_release/last_seen_release."""
+
+    async def test_release_folded_from_occurrence_context(self, session):
+        """If occurrences carry _release in context, it folds into the condition."""
+        import json
+
+        now = datetime.now(UTC)
+        a1 = Alert(
+            severity="error", category="cat", message="boom",
+            context_json=json.dumps({"_release": "v1.0"}),
+            created=now - timedelta(hours=2),
+        )
+        session.add(a1)
+        await session.flush()
+        # Create condition for it.
+        from opsalert.store import fire_alert
+        a2 = await fire_alert(
+            session, severity="error", category="cat", message="boom",
+            context={"_release": "v2.0"},
+        )
+        a2.created = now - timedelta(minutes=10)
+        # Also link a1 to the same condition.
+        a1.condition_id = a2.condition_id
+        await session.flush()
+        await session.commit()
+
+        await sync_condition_stats(session, now=now)
+        await session.commit()
+
+        condition = await _the_condition(session)
+        assert condition.first_seen_release == "v1.0"
+        assert condition.last_seen_release == "v2.0"
+
+
+class TestReopenedDeliveredImmediately:
+    """#11: a reopened condition is delivered immediately, regardless of
+    severity or disposition."""
+
+    async def test_reopened_warn_digest_delivered_immediately(
+        self, session, session_factory
+    ):
+        """A WARN condition with digest disposition that reopens must still
+        deliver immediately — a recurrence of something thought fixed is not
+        a digest item."""
+        import opsalert
+        from opsalert.delivery import deliver_alerts
+        from opsalert.types import AlertMessage
+
+        class _TrackingTransport(opsalert.Transport):
+            def __init__(self):
+                self.sent: list[AlertMessage] = []
+
+            def send(self, message, *, to, from_addr, from_name):
+                self.sent.append(message)
+                return True
+
+        transport = _TrackingTransport()
+        opsalert.configure(
+            session_factory=session_factory,
+            transport=transport,
+            delivery_to_email="ops@test.com",
+            delivery_from_email="alert@test.com",
+            delivery_throttle_minutes=0,
+        )
+
+        # Create a warn condition with digest disposition, resolve it.
+        await _fire_backdated(session, severity="warn")
+        await session.commit()
+        await sync_condition_stats(session)
+        condition = await _the_condition(session)
+        await set_disposition(session, condition, "digest")
+        await set_status(
+            session, condition, "resolved", actor="chris",
+        )
+        # Mark existing occurrences as notified.
+        from sqlalchemy import update
+        await session.execute(update(Alert).values(notified=True))
+        await session.commit()
+
+        # It recurs — fires again.
+        await fire_alert(session, severity="warn", category="cat", message="boom")
+        await session.commit()
+
+        stats = await deliver_alerts(session)
+        await session.commit()
+
+        assert stats["reopened"] == 1
+        # The key assertion: it was sent as immediate, not swallowed by digest.
+        assert stats["immediate_sent"] >= 1
+
+
+class TestSubjectUpsertDialects:
+    """Compile tests for subject_upsert_statement on both dialects."""
+
+    def test_mysql_compiles_to_on_duplicate_key(self):
+        from opsalert.lifecycle import subject_upsert_statement
+
+        stmt = subject_upsert_statement("mysql", {
+            "condition_id": 1,
+            "subject_kind": "user",
+            "subject_key": "u1",
+            "day": datetime.now(UTC).date(),
+        })
+        from sqlalchemy.dialects import mysql
+        compiled = str(stmt.compile(dialect=mysql.dialect()))
+        assert "ON DUPLICATE KEY" in compiled
+
+    def test_sqlite_compiles_to_on_conflict(self):
+        from opsalert.lifecycle import subject_upsert_statement
+
+        stmt = subject_upsert_statement("sqlite", {
+            "condition_id": 1,
+            "subject_kind": "user",
+            "subject_key": "u1",
+            "day": datetime.now(UTC).date(),
+        })
+        from sqlalchemy.dialects import sqlite
+        compiled = str(stmt.compile(dialect=sqlite.dialect()))
+        assert "ON CONFLICT" in compiled
+
+
+class TestDeliveryStateUpsertDialects:
+    """Compile tests for delivery_state_upsert_statement on both dialects."""
+
+    def test_mysql_compiles_to_on_duplicate_key(self):
+        from opsalert.delivery import delivery_state_upsert_statement
+
+        stmt = delivery_state_upsert_statement("mysql", datetime.now(UTC))
+        from sqlalchemy.dialects import mysql
+        compiled = str(stmt.compile(dialect=mysql.dialect()))
+        assert "ON DUPLICATE KEY" in compiled
+
+    def test_sqlite_compiles_to_on_conflict(self):
+        from opsalert.delivery import delivery_state_upsert_statement
+
+        stmt = delivery_state_upsert_statement("sqlite", datetime.now(UTC))
+        from sqlalchemy.dialects import sqlite
+        compiled = str(stmt.compile(dialect=sqlite.dialect()))
+        assert "ON CONFLICT" in compiled
+
+
+class TestFoldReleaseNoRescan:
+    """_fold_release only scans rows above the previous watermark."""
+
+    async def test_second_sweep_no_new_rows_skips_release_query(self, session):
+        """A second sweep with no new occurrences issues no release query.
+
+        We verify by checking that first_seen_release and last_seen_release
+        do not change after a second sweep when there are no new rows.
+        """
+        now = datetime.now(UTC)
+        a = await fire_alert(
+            session, severity="error", category="cat", message="boom",
+            context={"_release": "v1.0"},
+        )
+        a.created = now - timedelta(minutes=10)
+        await session.flush()
+        await session.commit()
+
+        await sync_condition_stats(session, now=now)
+        await session.commit()
+
+        condition = await _the_condition(session)
+        assert condition.first_seen_release == "v1.0"
+        assert condition.last_seen_release == "v1.0"
+        watermark_after_first = condition.stats_synced_through
+
+        # Second sweep — no new rows.
+        await sync_condition_stats(session, now=now)
+        await session.commit()
+
+        await session.refresh(condition)
+        # Watermark unchanged since no new rows above it.
+        assert condition.stats_synced_through == watermark_after_first
+        # Release values unchanged.
+        assert condition.first_seen_release == "v1.0"
+        assert condition.last_seen_release == "v1.0"
+
+    async def test_new_release_folds_without_overwriting_first(self, session):
+        """A new occurrence with a different release updates last_seen_release
+        but not first_seen_release."""
+        now = datetime.now(UTC)
+        a = await fire_alert(
+            session, severity="error", category="cat", message="boom",
+            context={"_release": "v1.0"},
+        )
+        a.created = now - timedelta(minutes=20)
+        await session.flush()
+        await session.commit()
+
+        await sync_condition_stats(session, now=now)
+        await session.commit()
+
+        condition = await _the_condition(session)
+        assert condition.first_seen_release == "v1.0"
+        assert condition.last_seen_release == "v1.0"
+
+        # New occurrence with different release.
+        b = await fire_alert(
+            session, severity="error", category="cat", message="boom",
+            context={"_release": "v2.0"},
+        )
+        b.created = now - timedelta(minutes=5)
+        await session.flush()
+        await session.commit()
+
+        await sync_condition_stats(session, now=now)
+        await session.commit()
+
+        await session.refresh(condition)
+        assert condition.first_seen_release == "v1.0"
+        assert condition.last_seen_release == "v2.0"
+
+
+class TestRegressionFullFlow:
+    """Full-flow test: ack at release A, occurrences at release B,
+    lifecycle reopens, attention shows is_regression=True."""
+
+    async def test_ack_at_a_occurrences_at_b_attention_is_regression(
+        self, session, session_factory
+    ):
+        import opsalert
+        from opsalert.query import query_attention
+
+        opsalert.configure(session_factory=session_factory)
+        now = datetime.now(UTC)
+
+        # Fire and sync — condition gets last_seen_release = "v1.0".
+        a = await fire_alert(
+            session, severity="error", category="cat", message="regressor",
+            context={"_release": "v1.0"},
+        )
+        a.created = now - timedelta(minutes=20)
+        await session.flush()
+        await session.commit()
+        await sync_condition_stats(session, now=now)
+        await session.commit()
+
+        condition = (
+            await session.execute(
+                select(AlertCondition).where(
+                    AlertCondition.message_template == "regressor"
+                )
+            )
+        ).scalar_one()
+        assert condition.last_seen_release == "v1.0"
+
+        # Ack — stamps acknowledged_release = "v1.0".
+        await set_status(
+            session, condition, "acknowledged", actor="chris", now=now,
+            issue_url="https://github.com/test/1",
+        )
+        await session.commit()
+        assert condition.acknowledged_release == "v1.0"
+
+        # New occurrence at release B.
+        later = now + timedelta(hours=1)
+        b = await fire_alert(
+            session, severity="error", category="cat", message="regressor",
+            context={"_release": "v2.0"},
+        )
+        b.created = later - timedelta(minutes=5)
+        await session.flush()
+        await session.commit()
+        await sync_condition_stats(session, now=later)
+        await session.commit()
+
+        await session.refresh(condition)
+        assert condition.last_seen_release == "v2.0"
+
+        # Lifecycle detects the regression and reopens.
+        result = await apply_lifecycle_rules(session, now=later + timedelta(minutes=1))
+        await session.commit()
+        assert result["escalated"] == 1
+        await session.refresh(condition)
+        assert condition.status == "new"
+        assert "regression" in (condition.notes or "").lower()
+        # acknowledged_release is KEPT through reopen.
+        assert condition.acknowledged_release == "v1.0"
+
+        # Attention shows is_regression=True.
+        attention = await query_attention(session)
+        match = [c for c in attention["conditions"] if c["template"] == "regressor"]
+        assert len(match) == 1
+        assert match[0]["is_regression"] is True

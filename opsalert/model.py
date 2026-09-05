@@ -8,7 +8,7 @@ resolved, the issue URL, how often it fires, whether it came back.
 """
 from datetime import UTC, datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text
+from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Index, Integer, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -168,11 +168,26 @@ class AlertCondition(OpsAlertBase):
     acknowledged_until: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # Peak 15-min window occurrence count in the 24 h before the ack — the
+    # baseline for burst detection (opsalert#7 O3). NULL on rows acked before
+    # this column existed; lifecycle treats NULL as 0 so any burst >= 10 trips.
+    acknowledged_peak_15m: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Number of distinct subjects at ack time — the baseline for the subject
+    # reopen rule: >= 5 new subjects beyond this count reopens the condition.
+    acknowledged_subject_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Release string at ack time — the baseline for the regression reopen rule.
+    acknowledged_release: Mapped[str | None] = mapped_column(String(40), nullable=True)
     status_changed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Release strings — earliest and latest ``_release`` context key seen on
+    # occurrences. Folded by ``sync_condition_stats`` the same way first/last
+    # seen timestamps are. Used by the regression reopen rule (O3).
+    first_seen_release: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    last_seen_release: Mapped[str | None] = mapped_column(String(40), nullable=True)
 
     # Derived statistics — outlive the occurrences they were computed from
     first_seen: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -205,3 +220,37 @@ class AlertCondition(OpsAlertBase):
             f"<AlertCondition(id={self.id}, category={self.category!r}, "
             f"status={self.status!r}, count={self.occurrence_count})>"
         )
+
+
+class AlertConditionSubject(OpsAlertBase):
+    """Distinct subjects observed for a condition on a given day.
+
+    Populated by ingest (O2); lifecycle reads ``distinct_subjects()`` to
+    decide whether enough new subjects have appeared since the ack to
+    justify reopening the condition.
+    """
+
+    __tablename__ = "alert_condition_subject"
+
+    condition_id: Mapped[int] = mapped_column(
+        ForeignKey("alert_condition.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    subject_kind: Mapped[str] = mapped_column(String(10), primary_key=True)
+    subject_key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    day: Mapped[datetime] = mapped_column(Date, primary_key=True)
+
+
+class AlertDeliveryState(OpsAlertBase):
+    """Singleton row holding cross-sweep delivery state.
+
+    ``id`` is always 1 — there is exactly one delivery loop per deployment,
+    and a table beats module-level state because it survives process restarts.
+    """
+
+    __tablename__ = "alert_delivery_state"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    last_digest_sent_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )

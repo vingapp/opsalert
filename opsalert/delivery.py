@@ -43,7 +43,7 @@ from opsalert.lifecycle import (
     effective_disposition,
     reopen_condition,
 )
-from opsalert.model import Alert, AlertCondition
+from opsalert.model import Alert, AlertCondition, AlertDeliveryState
 from opsalert.types import DIGEST_SEVERITIES, IMMEDIATE_SEVERITIES, AlertMessage, AlertSeverity
 
 logger = logging.getLogger(__name__)
@@ -101,6 +101,12 @@ class _ConditionBatch:
     count: int
     max_id: int
     last_created: datetime | None
+    # Fields for the Alertmanager payload (loaded from the condition row).
+    signature_key: str = ""
+    first_seen: datetime | None = None
+    resolved_at: datetime | None = None
+    issue_url: str | None = None
+    source: str | None = None
 
 
 @dataclass
@@ -135,6 +141,58 @@ def _environment_html(environment: str | None) -> str:
 def _environment_text(environment: str | None) -> str:
     """Leading ``Environment: staging`` line for a plain-text body."""
     return f"Environment: {environment}\n" if environment else ""
+
+
+def _alertmanager_payload(
+    *,
+    batches: list["_ConditionBatch"],
+    status: str = "firing",
+    environment: str | None = None,
+) -> dict:
+    """Build an Alertmanager v4 webhook payload from condition batches.
+
+    Shape per spec: ``{"version":"4","status":"firing"|"resolved","alerts":[
+    {"labels":{"alertname","severity","category","environment","release"},
+    "annotations":{"summary","issue_url","emit_site","condition_id"},
+    "startsAt":first_seen iso,"endsAt":resolved_at iso or "",
+    "fingerprint":signature_key}]}``.
+
+    ``kind`` does not exist until O2; use ``message_template`` for ``alertname``
+    now, read ``kind`` when the attribute exists.
+    """
+    alerts = []
+    for batch in batches:
+        alertname = batch.template or batch.category
+        labels: dict[str, str] = {
+            "alertname": alertname,
+            "severity": batch.severity,
+            "category": batch.category,
+        }
+        if environment:
+            labels["environment"] = environment
+        annotations: dict[str, str] = {
+            "summary": batch.latest_message,
+            "condition_id": str(batch.condition_id),
+            "issue_url": batch.issue_url or "",
+            "emit_site": batch.source or "",
+        }
+        alert_item: dict = {
+            "labels": labels,
+            "annotations": annotations,
+            "startsAt": (
+                batch.first_seen.isoformat() if batch.first_seen else ""
+            ),
+            "endsAt": (
+                batch.resolved_at.isoformat() if batch.resolved_at else ""
+            ),
+            "fingerprint": batch.signature_key,
+        }
+        alerts.append(alert_item)
+    return {
+        "version": "4",
+        "status": status,
+        "alerts": alerts,
+    }
 
 
 async def deliver_alerts(session) -> dict:
@@ -326,6 +384,11 @@ async def _load_condition_batches(session) -> tuple[list[_ConditionBatch], int]:
                 func.count(Alert.id).label("count"),
                 func.max(Alert.id).label("max_id"),
                 func.max(Alert.created).label("last_created"),
+                AlertCondition.signature_key,
+                AlertCondition.first_seen,
+                AlertCondition.resolved_at,
+                AlertCondition.issue_url,
+                AlertCondition.source,
             )
             .join(Alert, Alert.condition_id == AlertCondition.id)
             .where(Alert.notified.is_(False))
@@ -336,6 +399,11 @@ async def _load_condition_batches(session) -> tuple[list[_ConditionBatch], int]:
                 AlertCondition.severity,
                 AlertCondition.status,
                 AlertCondition.disposition,
+                AlertCondition.signature_key,
+                AlertCondition.first_seen,
+                AlertCondition.resolved_at,
+                AlertCondition.issue_url,
+                AlertCondition.source,
             )
         )
     ).all()
@@ -362,6 +430,11 @@ async def _load_condition_batches(session) -> tuple[list[_ConditionBatch], int]:
                     count=int(row.count),
                     max_id=int(row.max_id),
                     last_created=row.last_created,
+                    signature_key=str(row.signature_key or ""),
+                    first_seen=row.first_seen,
+                    resolved_at=row.resolved_at,
+                    issue_url=row.issue_url,
+                    source=row.source,
                 )
             )
         except Exception as exc:
@@ -392,6 +465,44 @@ def _report_delivery_skip(condition_id: object, exc: Exception) -> None:
         )
     except Exception:
         logger.exception("opsalert: could not report unusable condition %s", condition_id)
+
+
+def delivery_state_upsert_statement(dialect: str, now: datetime):
+    """Build a dialect-appropriate upsert for alert_delivery_state.
+
+    MySQL uses ``ON DUPLICATE KEY UPDATE``; SQLite uses
+    ``ON CONFLICT DO UPDATE``. Exposed as a builder for testability
+    and sync use.
+    """
+    if dialect == "mysql":
+        from sqlalchemy.dialects.mysql import insert as mysql_insert
+
+        return (
+            mysql_insert(AlertDeliveryState)
+            .values(id=1, last_digest_sent_at=now)
+            .on_duplicate_key_update(last_digest_sent_at=now)
+        )
+
+    from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+    return (
+        sqlite_insert(AlertDeliveryState)
+        .values(id=1, last_digest_sent_at=now)
+        .on_conflict_do_update(
+            index_elements=[AlertDeliveryState.id],
+            set_={"last_digest_sent_at": now},
+        )
+    )
+
+
+async def _update_digest_sent_at(session) -> None:
+    """Record the current time as last_digest_sent_at in alert_delivery_state."""
+    from opsalert.store import _dialect_name
+
+    now = datetime.now(UTC)
+    dialect = _dialect_name(session)
+    stmt = delivery_state_upsert_statement(dialect, now)
+    await session.execute(stmt)
 
 
 async def _mark_notified(session, pairs: list[tuple[int, int]]) -> None:
@@ -529,6 +640,11 @@ async def _deliver_immediate(
             category=category,
             alert_count=total,
             environment=environment,
+            payload=_alertmanager_payload(
+                batches=included,
+                status="firing",
+                environment=environment,
+            ),
         )
 
         sent = cfg.transport.send(message, to=to_email, from_addr=from_email, from_name=from_name)
@@ -703,6 +819,18 @@ async def _deliver_digest(
     cfg = get_config()
     environment = cfg.environment
 
+    # Digest interval gating (#10): skip if the last digest was sent too recently.
+    digest_interval_minutes = _resolve_setting("delivery_digest_interval_minutes", 360)
+    if digest_interval_minutes > 0:
+        state = await session.get(AlertDeliveryState, 1)
+        if state and state.last_digest_sent_at is not None:
+            last_sent = state.last_digest_sent_at
+            now_naive = datetime.now(UTC).replace(tzinfo=None)
+            last_naive = last_sent.replace(tzinfo=None) if last_sent.tzinfo else last_sent
+            elapsed = now_naive - last_naive
+            if elapsed < timedelta(minutes=digest_interval_minutes):
+                return stats
+
     digest_severities = [s.value for s in DIGEST_SEVERITIES]
 
     # Orphan (no condition) warn occurrences still ride the legacy grouping.
@@ -808,6 +936,8 @@ async def _deliver_digest(
                 )
                 .values(notified=True)
             )
+        # Record when the digest was sent for interval gating (#10).
+        await _update_digest_sent_at(session)
         # Same rule as immediate delivery: the digest email is out the door,
         # so its mark must not be able to roll back with the caller's
         # transaction. Commit it in place.

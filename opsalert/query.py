@@ -7,6 +7,7 @@ Next-fix: Highest-priority group with aggregated debugging data
 """
 import base64
 import json
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 from sqlalchemy import case, delete, desc, func, or_, select
@@ -15,7 +16,6 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
 from opsalert.lifecycle import (
-    DISPOSITION_IMMEDIATE,
     STATUS_NEW,
     effective_disposition,
 )
@@ -585,26 +585,30 @@ async def query_conditions(
 _ATTENTION_CURSOR_V2_PREFIX = "2."
 
 
-def _encode_attention_cursor(marks: dict[int, int]) -> str:
-    """Encode a {condition_id: occurrences_reported} map as an opaque cursor.
+def _encode_attention_cursor(marks: dict[int, int | tuple[int, int]]) -> str:
+    """Encode a {condition_id: (occurrence_count, reopened_count)} map as an opaque cursor.
 
-    Sorted by condition id so an unchanged mark set encodes to an identical
-    string — "the same cursor back" is byte-for-byte, not just semantically,
-    whenever nothing was reported and nothing was pruned.
+    Accepts either int (legacy) or tuple values. Sorted by condition id so
+    an unchanged mark set encodes to an identical string.
     """
-    payload = json.dumps(
-        {"m": {str(cid): count for cid, count in sorted(marks.items())}},
-        separators=(",", ":"),
-    )
+    serialized = {}
+    for cid, value in sorted(marks.items()):
+        if isinstance(value, tuple):
+            serialized[str(cid)] = list(value)
+        else:
+            # Legacy int-only mark — treat reopened_count as 0.
+            serialized[str(cid)] = [value, 0]
+    payload = json.dumps({"m": serialized}, separators=(",", ":"))
     encoded = base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii")
     return _ATTENTION_CURSOR_V2_PREFIX + encoded.rstrip("=")
 
 
 def _decode_attention_cursor(
     cursor: str | int | None,
-) -> tuple[dict[int, int] | None, int | None]:
+) -> tuple[dict[int, tuple[int, int]] | None, int | None]:
     """Decode a cursor into ``(marks, legacy_watermark)``.
 
+    Marks is ``{condition_id: (occurrence_count, reopened_count)}``.
     Exactly one of the two is not None, except on bootstrap (``None``/empty)
     where both are None. Anything that is neither a v2 string nor an integer
     raises ``ValueError`` — a malformed cursor must NOT degrade to a bootstrap,
@@ -639,17 +643,60 @@ def _decode_attention_cursor(
     if not isinstance(payload, dict) or not isinstance(payload.get("m"), dict):
         raise ValueError(f"Not a valid attention cursor: {cursor!r}")
 
-    marks: dict[int, int] = {}
+    marks: dict[int, tuple[int, int]] = {}
     for key, value in payload["m"].items():
         try:
             condition_id = int(key)
-            count = int(value)
+            if isinstance(value, list) and len(value) == 2:
+                occ_count = int(value[0])
+                reopen_count = int(value[1])
+            else:
+                # Legacy v2 cursor with int-only marks.
+                occ_count = int(value)
+                reopen_count = 0
         except (TypeError, ValueError) as exc:
             raise ValueError(f"Not a valid attention cursor: {cursor!r}") from exc
-        if count < 0:
+        if occ_count < 0:
             raise ValueError(f"Not a valid attention cursor: {cursor!r}")
-        marks[condition_id] = count
+        marks[condition_id] = (occ_count, reopen_count)
     return marks, None
+
+
+async def _count_users_24h(
+    session: "AsyncSession", candidate_ids: list[int]
+) -> dict[int, int]:
+    """Count distinct subjects per condition from alert_condition_subject.
+
+    Uses ``day >= today - 1`` (two calendar days) as the 24h proxy.
+    One grouped query over the candidate set, reading the subject index
+    instead of parsing context_json.
+    """
+    from opsalert.model import AlertConditionSubject
+
+    today = datetime.now(UTC).date()
+    yesterday = today - timedelta(days=1)
+
+    rows = (
+        await session.execute(
+            select(
+                AlertConditionSubject.condition_id,
+                func.count(
+                    func.distinct(
+                        AlertConditionSubject.subject_kind
+                        + ":"
+                        + AlertConditionSubject.subject_key
+                    )
+                ).label("cnt"),
+            )
+            .where(
+                AlertConditionSubject.condition_id.in_(candidate_ids),
+                AlertConditionSubject.day >= yesterday,
+            )
+            .group_by(AlertConditionSubject.condition_id)
+        )
+    ).all()
+
+    return {row.condition_id: row.cnt for row in rows}
 
 
 async def query_attention(
@@ -729,7 +776,7 @@ async def query_attention(
     polling interval, not permanent.
     """
     marks_in, legacy_since = _decode_attention_cursor(cursor)
-    marks: dict[int, int] = dict(marks_in or {})
+    marks: dict[int, tuple[int, int]] = dict(marks_in or {})
 
     scope = _scoped_environment(environment)
 
@@ -747,20 +794,24 @@ async def query_attention(
         .all()
     )
 
+    # Candidates: every new condition EXCEPT collect on first sight (never
+    # reopened). Collect after reopen IS included — a recurrence of something
+    # parked may need re-evaluation. All dispositions are included (not just
+    # immediate) per the updated attention spec (#12 / OPEN 2).
     candidates = [
         condition
         for condition in rows
-        if effective_disposition(condition.severity, condition.disposition)
-        == DISPOSITION_IMMEDIATE
+        if not (
+            effective_disposition(condition.severity, condition.disposition) == "collect"
+            and (condition.reopened_count or 0) == 0
+        )
     ]
 
     # One grouped query over the whole candidate set — the LIVE occurrence
-    # count per condition, unfiltered by id. The candidate set is the attention
-    # set (new AND immediate in one environment), which is small by
-    # construction; when it is not, the fleet has a much louder problem than
-    # this query.
+    # count per condition, unfiltered by id.
     live: dict[int, int] = {}
     legacy_new: dict[int, int] = {}
+    users_24h: dict[int, int] = {}
     if candidates:
         candidate_ids = [c.id for c in candidates]
         grouped = await session.execute(
@@ -780,38 +831,56 @@ async def query_attention(
             )
             legacy_new = {row[0]: row[1] or 0 for row in grouped_since}
 
-    next_marks: dict[int, int] = {}
+        # Count distinct users in the last 24h from _user_id in context_json.
+        users_24h = await _count_users_24h(session, candidate_ids)
+
+    next_marks: dict[int, tuple[int, int]] = {}
     qualifying: list[tuple[AlertCondition, int]] = []
     for condition in candidates:
         count = live.get(condition.id, 0)
+        reopened = condition.reopened_count or 0
         if legacy_since is not None:
-            # One-tick v1 semantics: fired above the watermark. Everything else
-            # was already reported under v1, so it starts at its live count
-            # rather than being re-reported on the next call.
             since_count = legacy_new.get(condition.id, 0)
             if since_count > 0:
                 qualifying.append((condition, since_count))
             else:
-                next_marks[condition.id] = count
+                next_marks[condition.id] = (count, reopened)
             continue
 
         mark = marks.get(condition.id)
         if mark is None:
             qualifying.append((condition, count))
-        elif count > mark:
-            qualifying.append((condition, count - mark))
         else:
-            # Not a refire. Carry the mark, lowered if occurrences were deleted
-            # underneath it, so the count can rise past it again.
-            next_marks[condition.id] = min(mark, count)
+            mark_count, mark_reopened = mark
+            # A reopen re-reports regardless of occurrence count.
+            if reopened > mark_reopened:
+                qualifying.append((condition, count - min(mark_count, count)))
+            elif count > mark_count:
+                qualifying.append((condition, count - mark_count))
+            else:
+                next_marks[condition.id] = (min(mark_count, count), reopened)
+
+    # Sort by users_24h desc, severity rank desc, age asc (first_seen asc).
+    _severity_rank = {
+        "critical": 3,
+        "error": 2,
+        "warn": 1,
+    }
+    qualifying.sort(
+        key=lambda pair: (
+            -(users_24h.get(pair[0].id, 0)),
+            -_severity_rank.get(pair[0].severity, 0),
+            pair[0].first_seen or pair[0].created,
+        )
+    )
 
     included = qualifying[:limit]
     included_ids = {condition.id for condition, _ in included}
     for condition, _ in qualifying:
+        reopened = condition.reopened_count or 0
         if condition.id in included_ids:
-            next_marks[condition.id] = live.get(condition.id, 0)
+            next_marks[condition.id] = (live.get(condition.id, 0), reopened)
         elif condition.id in marks:
-            # Truncated: unchanged, so the next call reports it again.
             next_marks[condition.id] = marks[condition.id]
 
     conditions = [
@@ -824,6 +893,14 @@ async def query_attention(
             "count_since_cursor": count_since,
             "last_seen": condition.last_seen,
             "reopened": (condition.reopened_count or 0) > 0,
+            "users_24h": users_24h.get(condition.id, 0),
+            "first_seen_release": condition.first_seen_release,
+            "last_seen_release": condition.last_seen_release,
+            "is_regression": (
+                condition.last_seen_release is not None
+                and condition.acknowledged_release is not None
+                and condition.last_seen_release != condition.acknowledged_release
+            ),
         }
         for condition, count_since in included
     ]
