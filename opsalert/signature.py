@@ -212,8 +212,12 @@ def extract_origin_frame(
 ) -> str:
     """Return ``"module:function"`` of the innermost in-app frame.
 
+    Walks the traceback objects directly via ``tb.tb_frame.f_globals["__name__"]``
+    to get the real module name -- never guesses from the file path.
+
     In-app = module name starts with any of ``in_app_prefixes``. When empty,
-    in-app = not stdlib/site-packages (heuristic via ``sysconfig`` paths).
+    in-app = not stdlib/site-packages (heuristic via ``sysconfig`` paths on
+    the frame's filename).
 
     Returns ``""`` when no exception or no in-app frame.
     Never raises.
@@ -222,9 +226,7 @@ def extract_origin_frame(
         return ""
 
     try:
-        import traceback as tb_module
-
-        # Walk the innermost exception's traceback
+        # Walk to the innermost exception in the chain
         innermost = exc
         seen: set[int] = set()
         while True:
@@ -242,39 +244,28 @@ def extract_origin_frame(
         if tb is None:
             return ""
 
-        frames = tb_module.extract_tb(tb)
+        # Walk tb objects to collect (module, function, filename) tuples
+        frames: list[tuple[str, str, str]] = []
+        current_tb = tb
+        while current_tb is not None:
+            frame = current_tb.tb_frame
+            module = frame.f_globals.get("__name__", "")
+            function = frame.f_code.co_name
+            filename = frame.f_code.co_filename
+            frames.append((module, function, filename))
+            current_tb = current_tb.tb_next
+
         if not frames:
             return ""
 
-        # Find the innermost in-app frame
-        for frame in reversed(frames):
-            module = _module_for_filename(frame.filename)
-            if _is_in_app(module, frame.filename, in_app_prefixes):
-                return f"{module}:{frame.name}"
+        # Find the innermost in-app frame (walk from the bottom)
+        for module, function, filename in reversed(frames):
+            if _is_in_app(module, filename, in_app_prefixes):
+                return f"{module}:{function}"
 
         return ""
     except Exception:
         return ""
-
-
-def _module_for_filename(filename: str) -> str:
-    """Best-effort module name from a traceback filename."""
-    import os
-
-    # Strip .py suffix
-    if filename.endswith(".py"):
-        filename = filename[:-3]
-    # Convert path separators to dots and try to find a module-like name
-    parts = filename.replace(os.sep, "/").split("/")
-    # Take the last few parts as a module name
-    # Look for 'src' or a common root
-    for i, part in enumerate(parts):
-        if part in ("src", "opsalert", "debork"):
-            return ".".join(parts[i:])
-    # Fallback: last two parts
-    if len(parts) >= 2:
-        return ".".join(parts[-2:])
-    return parts[-1] if parts else ""
 
 
 def _is_in_app(

@@ -104,25 +104,31 @@ def _build_structured_frames(
 ) -> list[dict[str, Any]]:
     """Build structured frame list from a traceback.
 
-    Returns at most ``budget`` frames, keeping in-app frames preferentially
-    (same strategy as _bounded_traceback: keep both ends, elide middle).
+    Walks tb objects directly to get real module names via
+    ``tb.tb_frame.f_globals["__name__"]``.  Returns at most ``budget``
+    frames, keeping in-app frames preferentially.
     """
     if tb is None:
         return []
 
-    from opsalert.signature import _is_in_app, _module_for_filename
+    from opsalert.signature import _is_in_app
 
-    raw_frames = tb_module.extract_tb(tb)
     result: list[dict[str, Any]] = []
-    for frame in raw_frames:
-        module = _module_for_filename(frame.filename)
-        in_app = _is_in_app(module, frame.filename, in_app_prefixes)
+    current_tb = tb
+    while current_tb is not None:
+        frame_obj = current_tb.tb_frame
+        module = frame_obj.f_globals.get("__name__", "")
+        function = frame_obj.f_code.co_name
+        filename = frame_obj.f_code.co_filename
+        lineno = current_tb.tb_lineno
+        in_app = _is_in_app(module, filename, in_app_prefixes)
         result.append({
             "module": module,
-            "function": frame.name,
-            "lineno": frame.lineno,
+            "function": function,
+            "lineno": lineno,
             "in_app": in_app,
         })
+        current_tb = current_tb.tb_next
 
     if len(result) <= budget:
         return result

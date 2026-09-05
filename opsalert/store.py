@@ -383,81 +383,71 @@ async def fire_alert(
     if params:
         stamped = {**(stamped or {}), TEMPLATE_CONTEXT_KEY: template}
 
-    # V2 identity when kind is provided
-    if kind is not None:
-        from opsalert.signature import (
-            build_exception_chain,
-            event_fingerprint_parts,
-            event_signature,
-            extract_origin_frame,
-        )
+    # Every new row is v2.  kind=None triggers the same legacy fallback
+    # as _dispatch: kind = f"{category}.legacy" with the template in the
+    # fingerprint parts so two messages that v1 kept separate stay separate.
+    from opsalert.signature import (
+        build_exception_chain,
+        event_fingerprint_parts,
+        event_signature,
+        extract_origin_frame,
+    )
 
-        try:
-            from opsalert._config import get_config
-            cfg = get_config()
-            in_app_prefixes = cfg.in_app_prefixes
-        except (RuntimeError, ImportError):
-            in_app_prefixes = ()
+    actual_kind = kind if kind is not None else f"{category}.legacy"
+    is_legacy = kind is None
 
-        exception_chain = build_exception_chain(exc)
-        origin_frame = extract_origin_frame(exc, in_app_prefixes=in_app_prefixes)
+    try:
+        from opsalert._config import get_config
+        cfg = get_config()
+        in_app_prefixes = cfg.in_app_prefixes
+    except (RuntimeError, ImportError):
+        in_app_prefixes = ()
 
-        fp_parts = event_fingerprint_parts(
-            kind=kind,
-            environment=(stamped or {}).get("environment"),
-            exception_chain=exception_chain,
-            origin_frame=origin_frame,
-        )
-        sig_key = event_signature(
-            kind=kind,
-            environment=(stamped or {}).get("environment"),
-            exception_chain=exception_chain,
-            origin_frame=origin_frame,
-        )
+    exception_chain = build_exception_chain(exc)
+    origin_frame = extract_origin_frame(exc, in_app_prefixes=in_app_prefixes)
 
-        condition_id = await _resolve_v2_condition(
-            session,
-            signature_key=sig_key,
-            category=category,
-            source=source,
-            environment=(stamped or {}).get("environment"),
-            kind=kind,
-            fingerprint_version=2,
-            fingerprint_json=json.dumps(fp_parts),
-            message_example=(rendered or "")[:500],
-            severity=str(severity),
-        )
+    template_for_fp = template if is_legacy else None
+    fp_parts = event_fingerprint_parts(
+        kind=actual_kind,
+        environment=(stamped or {}).get("environment"),
+        exception_chain=exception_chain,
+        origin_frame=origin_frame,
+        template=template_for_fp,
+    )
+    sig_key = event_signature(
+        kind=actual_kind,
+        environment=(stamped or {}).get("environment"),
+        exception_chain=exception_chain,
+        origin_frame=origin_frame,
+        template=template_for_fp,
+    )
 
-        alert = Alert(
-            severity=severity,
-            category=category,
-            message=rendered,
-            source=source,
-            context_json=serialize_context(stamped),
-            condition_id=condition_id,
-            kind=kind,
-            fingerprint_version=2,
-            fingerprint_json=json.dumps(fp_parts),
-        )
-    else:
-        condition_id = await resolve_condition_id(
-            session,
-            category=category,
-            source=source,
-            environment=(stamped or {}).get("environment"),
-            template=template,
-            severity=str(severity),
-        )
+    condition_id = await _resolve_v2_condition(
+        session,
+        signature_key=sig_key,
+        category=category,
+        source=source,
+        environment=(stamped or {}).get("environment"),
+        kind=actual_kind,
+        is_legacy=is_legacy,
+        template=template,
+        fingerprint_version=2,
+        fingerprint_json=json.dumps(fp_parts),
+        message_example=(rendered or "")[:500],
+        severity=str(severity),
+    )
 
-        alert = Alert(
-            severity=severity,
-            category=category,
-            message=rendered,
-            source=source,
-            context_json=serialize_context(stamped),
-            condition_id=condition_id,
-        )
-
+    alert = Alert(
+        severity=severity,
+        category=category,
+        message=rendered,
+        source=source,
+        context_json=serialize_context(stamped),
+        condition_id=condition_id,
+        kind=actual_kind,
+        fingerprint_version=2,
+        fingerprint_json=json.dumps(fp_parts),
+    )
     session.add(alert)
     await session.flush()
     return alert
@@ -471,6 +461,8 @@ async def _resolve_v2_condition(
     source: str | None,
     environment: str | None,
     kind: str,
+    is_legacy: bool = False,
+    template: str = "",
     fingerprint_version: int,
     fingerprint_json: str | None,
     message_example: str,
@@ -478,12 +470,15 @@ async def _resolve_v2_condition(
 ) -> int | None:
     """Resolve a v2 condition (with kind)."""
     now = datetime.now(UTC)
+    # Explicit kind: message_template = kind (search matches it).
+    # Legacy fallback: message_template = normalized message template.
+    msg_template = template[:500] if is_legacy else kind[:500]
     values = {
         "signature_key": signature_key,
         "category": category,
         "source": source,
         "environment": environment,
-        "message_template": kind[:500],  # v2: message_template = kind
+        "message_template": msg_template,
         "status": "new",
         "severity": severity,
         "latest_severity": severity,

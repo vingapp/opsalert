@@ -806,8 +806,14 @@ def _resolve_condition_sync(conn: Any, event: Event) -> int | None:
     if existing is not None:
         return existing
 
-    # For v2 conditions, message_template = kind (search matches it)
-    msg_template = event.kind if event.kind else (event.template or "")[:500]
+    # Explicit kind: message_template = kind (search matches it).
+    # Legacy fallback (.legacy): message_template = the normalized message
+    # template so search by message content still works.
+    is_legacy_kind = event.kind and event.kind.endswith(".legacy")
+    if event.kind and not is_legacy_kind:
+        msg_template = event.kind
+    else:
+        msg_template = (event.template or "")[:500]
 
     values = {
         "signature_key": fp,

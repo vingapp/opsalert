@@ -527,6 +527,75 @@ class TestFingerprintV2:
         # Should point to THIS function, not wrapper
         assert "test_stacklevel_skips_wrappers" in site
 
+    def test_origin_frame_uses_real_module_name(self, tmp_path):
+        """origin_frame must use __name__ from the frame, not guess from path.
+
+        A temp module under a directory named src/ whose __name__ is
+        'tmpmod.thing' must yield 'tmpmod.thing:do_raise', not a path-derived
+        module name.
+        """
+        import importlib
+        import importlib.util
+        import sys
+
+        from opsalert.signature import extract_origin_frame
+
+        # Create a temp module file under src/ — the path looks like
+        # src/thing.py but __name__ will be 'tmpmod.thing'.
+        src_dir = tmp_path / "src"
+        src_dir.mkdir()
+        mod_file = src_dir / "thing.py"
+        mod_file.write_text(
+            "def do_raise():\n"
+            "    raise ValueError('boom from tmpmod.thing')\n"
+        )
+
+        spec = importlib.util.spec_from_file_location("tmpmod.thing", str(mod_file))
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["tmpmod.thing"] = mod
+        try:
+            spec.loader.exec_module(mod)
+            try:
+                mod.do_raise()
+            except ValueError as e:
+                origin = extract_origin_frame(e, in_app_prefixes=("tmpmod.",))
+                assert origin == "tmpmod.thing:do_raise", (
+                    f"expected 'tmpmod.thing:do_raise', got {origin!r}"
+                )
+        finally:
+            sys.modules.pop("tmpmod.thing", None)
+
+
+# ---------------------------------------------------------------------------
+# fire_alert(session, kind=None) produces v2 identity
+# ---------------------------------------------------------------------------
+
+
+class TestAdminFireAlertV2LegacyFallback:
+    async def test_fire_alert_kind_none_produces_v2_identity(self, session, session_factory):
+        """fire_alert(session, kind=None) must create a v2 condition with
+        kind='<category>.legacy' and fingerprint_version=2, the same legacy
+        fallback as _dispatch."""
+        opsalert.configure(session_factory=session_factory)
+
+        alert = await fire_alert(
+            session,
+            severity=AlertSeverity.ERROR,
+            category="admin_cat",
+            message="admin fire with no kind",
+        )
+        await session.commit()
+
+        assert alert.condition_id is not None
+        condition = (
+            await session.execute(
+                select(AlertCondition).where(AlertCondition.id == alert.condition_id)
+            )
+        ).scalar_one()
+
+        assert condition.fingerprint_version == 2
+        assert condition.kind == "admin_cat.legacy"
+
 
 # ---------------------------------------------------------------------------
 # Lint helper

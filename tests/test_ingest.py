@@ -173,16 +173,18 @@ class TestDBRefusing:
 
 
 class TestHighVolumeSampling:
-    def test_5000_fires_sampling_and_accounting(self, tmp_path):
+    def test_5000_fires_sampling_and_accounting(self, tmp_path, monkeypatch):
         """(e) 5,000 fires of ONE sig within one minute:
-        - <= 20 rows for that condition
+        - exactly 20 rows for that condition
         - rows + sampled + dropped == 5,000
         - median per-call < 2ms (proves enqueue is cheap)
         - DB is only ever touched from the opsalert-ingest thread, never
           from the caller thread (structural proof of the contract)
         """
         import threading
+        from datetime import UTC, datetime
 
+        from opsalert import _dispatch as _dispatch_mod
         from opsalert import ingest as _ingest
 
         # Double-check clean state
@@ -197,6 +199,22 @@ class TestHighVolumeSampling:
             ingest_url=url,
             ingest_queue_max=2000,
         )
+
+        # Pin the clock so all 5,000 events share one minute — the sampling
+        # assertion is about the per-fingerprint-per-minute cap, and must not
+        # depend on which wall-clock minute the test happens to start in.
+        # Use the START of the current minute so _prune_sample_state (which
+        # uses real time) does not immediately evict the entries.
+        real_now = datetime.now(UTC)
+        fixed_now = real_now.replace(second=0, microsecond=0)
+        _real_datetime = datetime
+
+        class _PinnedDatetime(_real_datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return fixed_now
+
+        monkeypatch.setattr(_dispatch_mod, "datetime", _PinnedDatetime)
 
         # Instrument _get_engine to record which thread touches the DB.
         engine_thread_idents: list[int] = []
@@ -224,7 +242,7 @@ class TestHighVolumeSampling:
         with engine.connect() as conn:
             row_count = conn.execute(text("SELECT COUNT(*) FROM opsalert")).scalar()
 
-        assert row_count <= 20, f"expected <= 20 rows, got {row_count}"
+        assert row_count == 20, f"expected exactly 20 rows (pinned clock), got {row_count}"
 
         # Median per-call < 2ms — stable proof that enqueue is cheap.
         timings.sort()
