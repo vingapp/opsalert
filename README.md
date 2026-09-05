@@ -702,6 +702,7 @@ opsalert/
     lifecycle.py       sync_condition_stats(), apply_lifecycle_rules(), set_status()
     _dispatch.py       warn/error/critical — fire-and-forget entry points
     _enrichment.py     Auto-capture caller, exception, Celery task info
+    ingest.py          Bounded queue + writer thread (see Ingest section below)
     model.py           Alert + AlertCondition models (own DeclarativeBase)
     store.py           fire_alert() + condition resolution (isolated / SAVEPOINT)
     query.py           Dashboard selectors, conditions, attention, next-fix, delete
@@ -709,4 +710,51 @@ opsalert/
     cleanup.py         Watermark-gated TTL deletion
     transport.py       Transport ABC + CallableTransport, WebhookTransport, LogTransport
     types.py           AlertSeverity enum, AlertMessage dataclass
+```
+
+## Ingest
+
+`opsalert.warn/error/critical(...)` never touches the event loop, a session
+factory, the DB, or the caller's transaction. Each call enriches its context,
+builds an `Event`, and appends it to a bounded in-process queue. One daemon
+thread per process drains the queue in batches and writes them to the database.
+
+### Host requirements
+
+The host application must install a **sync database driver** for its database
+(e.g. `pymysql` for MySQL, `psycopg` for PostgreSQL). opsalert's own
+`dependencies` include only SQLAlchemy; the driver is installed by the host.
+
+### Configuration
+
+Pass `ingest_url` to `opsalert.configure()` to tell the writer thread where to
+write. When `ingest_url` is not set, the writer attempts to derive a sync URL
+from `session_factory` (only for `async_sessionmaker`). If neither works,
+events are counted as dropped and an `opsalert.internal` ERROR is logged once.
+
+```python
+opsalert.configure(
+    session_factory=my_async_factory,
+    ingest_url="mysql+pymysql://user:pass@host/db",
+)
+```
+
+Additional ingest settings (all optional):
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `ingest_queue_max` | 2000 | Maximum events in the in-process queue |
+| `ingest_sample_per_minute` | 20 | Max rows per fingerprint per minute |
+| `ingest_batch_size` | 100 | Events per DB write |
+| `ingest_flush_interval_s` | 0.25 | Seconds between batch writes |
+| `ingest_max_retry_s` | 120.0 | Max cumulative retry time per batch |
+
+### Shutdown
+
+Call `opsalert.flush()` at application shutdown to drain the queue before exit.
+It is also registered with `atexit` as a safety net.
+
+```python
+result = opsalert.flush(timeout=5.0)
+# result.written, result.sampled_out, result.dropped, result.remaining
 ```

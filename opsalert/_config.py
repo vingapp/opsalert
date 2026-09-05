@@ -59,6 +59,18 @@ class OpsAlertConfig:
     # actually reproduce.
     identity_provider: Callable[[], tuple[Any | None, Any | None]] | None = None
 
+    # --- Ingest settings ---
+    # Explicit sync database URL for the ingest writer thread. When set,
+    # the writer connects with this URL. When None, the writer attempts to
+    # derive a sync URL from session_factory (only for async_sessionmaker).
+    # If neither works, events are counted as dropped.
+    ingest_url: str | None = None
+    ingest_queue_max: int = 2000
+    ingest_sample_per_minute: int = 20
+    ingest_batch_size: int = 100
+    ingest_flush_interval_s: float = 0.25
+    ingest_max_retry_s: float = 120.0
+
 
 _config: OpsAlertConfig | None = None
 
@@ -93,3 +105,47 @@ def reset_config() -> None:
     """Reset config to None. For testing only."""
     global _config
     _config = None
+
+
+def derive_sync_url() -> str | None:
+    """Derive a sync DB URL from the configured session_factory.
+
+    Only works for ``async_sessionmaker`` — inspects its bind to get the async
+    URL and swaps the driver to a sync equivalent. For plain callables
+    (e.g. vingapi's ``fresh_async_session``), ``ingest_url`` must be set
+    explicitly.
+
+    asyncio is intentionally imported here (not in ingest.py).
+    """
+
+    cfg = get_config()
+    factory = cfg.session_factory
+    if factory is None:
+        return None
+
+    try:
+        from sqlalchemy.ext.asyncio import async_sessionmaker
+
+        if isinstance(factory, async_sessionmaker):
+            bind = factory.kw.get("bind")
+            if bind is not None:
+                url_str = str(bind.url)
+                return _swap_driver(url_str)
+    except (ImportError, AttributeError, Exception):
+        pass
+
+    return None
+
+
+def _swap_driver(url: str) -> str:
+    """Swap an async SQLAlchemy driver to its sync counterpart."""
+    swaps = [
+        ("mysql+asyncmy", "mysql+pymysql"),
+        ("mysql+aiomysql", "mysql+pymysql"),
+        ("sqlite+aiosqlite", "sqlite"),
+        ("postgresql+asyncpg", "postgresql+psycopg"),
+    ]
+    for async_drv, sync_drv in swaps:
+        if url.startswith(async_drv):
+            return sync_drv + url[len(async_drv):]
+    return url

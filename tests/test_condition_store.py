@@ -4,7 +4,6 @@ The contract under test is the uncomfortable one: conditionization is
 bookkeeping, and bookkeeping must never cost an alert. Every failure mode
 here ends with the occurrence stored and the caller unharmed.
 """
-import asyncio
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -18,15 +17,11 @@ from opsalert.signature import condition_signature, normalize_message
 from opsalert.store import fire_alert, resolve_condition_id
 
 
-async def _drain_fires():
-    """Wait for the fire-and-forget tasks dispatch put on the loop.
+def _drain_fires():
+    """Wait for enqueued events to be written by the ingest writer thread."""
+    from opsalert.ingest import flush
 
-    ``_INFLIGHT`` is the strong-reference set that keeps those tasks from being
-    garbage-collected mid-flight; draining it is how a test observes a
-    fire-and-forget call's result.
-    """
-    while opsalert._dispatch._INFLIGHT:
-        await asyncio.gather(*list(opsalert._dispatch._INFLIGHT))
+    flush(timeout=5.0)
 
 
 async def _conditions(session):
@@ -375,24 +370,39 @@ class TestResolutionFailureIsSurvivable:
             is None
         )
 
-    async def test_dispatch_api_still_never_raises(self, session_factory, monkeypatch):
-        """The hard contract, with condition resolution in the path."""
+    def test_dispatch_api_still_never_raises(self, tmp_path, monkeypatch):
+        """The hard contract: opsalert.error() never raises, even if the
+        ingest writer's condition resolution fails entirely."""
+        from sqlalchemy import create_engine, text
 
-        async def _boom(*args, **kwargs):
+        from opsalert import ingest
+        from opsalert.model import OpsAlertBase
+
+        db_path = tmp_path / "dispatch_never_raises.db"
+        url = f"sqlite:///{db_path}"
+        engine = create_engine(url)
+        OpsAlertBase.metadata.create_all(engine)
+
+        def _boom_sync(*args, **kwargs):
             raise RuntimeError("nope")
 
-        monkeypatch.setattr(store, "_lookup_or_create", _boom)
-        opsalert.configure(session_factory=session_factory)
+        monkeypatch.setattr(ingest, "_resolve_condition_sync", _boom_sync)
+        opsalert.configure(
+            session_factory=lambda: (_ for _ in ()).throw(RuntimeError("no")),
+            ingest_url=url,
+        )
 
         opsalert.error("cat", message="boom")  # must not raise
-        await _drain_fires()
+        _drain_fires()
 
-        async with session_factory() as fresh:
-            stored = (
-                await fresh.execute(select(Alert).where(Alert.category == "cat"))
-            ).scalar_one()
-        assert stored.message == "boom"
-        assert stored.condition_id is None
+        with engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT message, condition_id FROM opsalert WHERE category='cat'")
+            ).fetchone()
+        assert row is not None
+        assert row[0] == "boom"
+        assert row[1] is None  # condition resolution failed
+        engine.dispose()
 
     async def test_fire_alert_works_without_configure(self, session):
         """Storing must never depend on configuration state."""

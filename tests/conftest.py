@@ -41,7 +41,50 @@ async def session_factory(engine):
 
 @pytest.fixture(autouse=True)
 def reset_opsalert_config():
-    """Reset opsalert config before each test."""
+    """Reset opsalert config and ingest state before each test."""
     opsalert.reset_config()
+    _reset_ingest()
     yield
     opsalert.reset_config()
+    _reset_ingest()
+
+
+def _reset_ingest():
+    """Reset the ingest module state for test isolation.
+
+    Increments the generation counter so old threads exit their loops,
+    then waits for them to die before clearing state.
+    """
+    from opsalert import ingest
+
+    # Bump generation so old threads exit
+    ingest._generation += 1
+    # Wake any sleeping thread so it sees the generation change
+    with ingest._condition:
+        ingest._condition.notify_all()
+
+    # Wait for any existing thread to actually finish — must complete before
+    # we clear state, otherwise a dying thread could write to _sample_state
+    # after we clear it.
+    if ingest._thread is not None and ingest._thread.is_alive():
+        ingest._thread.join(timeout=5.0)
+
+    # Dispose any existing engine
+    if ingest._engine is not None:
+        try:
+            ingest._engine.dispose()
+        except Exception:
+            pass
+
+    ingest._queue.clear()
+    ingest._per_fp.clear()
+    ingest._dropped.clear()
+    ingest._sample_state.clear()
+    ingest._thread = None
+    ingest._engine = None
+    ingest._error_logged = False
+    ingest._flush_event.clear()
+    ingest._flush_done_event.clear()
+    ingest._written_total = 0
+    ingest._sampled_out_total = 0
+    ingest._dropped_total = 0
