@@ -1,4 +1,5 @@
 """Tests for alert delivery — immediate, throttled, and digest."""
+import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -6,7 +7,7 @@ from sqlalchemy import select
 
 import opsalert
 from opsalert.delivery import deliver_alerts
-from opsalert.model import Alert
+from opsalert.model import Alert, AlertDeliveryState
 from opsalert.store import fire_alert
 from opsalert.types import AlertMessage
 
@@ -386,3 +387,135 @@ class TestSentMarkDurability:
                     f"notified mark for delivered category {delivered_category!r} "
                     "was lost — this alert will be re-emailed every sweep"
                 )
+
+
+class TestDigestInterval:
+    """#10: _deliver_digest sends only when enough time has passed."""
+
+    async def test_digest_respects_interval_across_two_sweeps(
+        self, session, session_factory
+    ):
+        """Two consecutive sweeps with a short interval: the second is suppressed
+        because last_digest_sent_at is too recent."""
+        transport = _TrackingTransport()
+        opsalert.configure(
+            session_factory=session_factory,
+            transport=transport,
+            delivery_to_email="ops@test.com",
+            delivery_from_email="alert@test.com",
+            delivery_throttle_minutes=0,
+            delivery_digest_interval_minutes=60,
+        )
+
+        await fire_alert(session, severity="warn", category="cat", message="warning 1")
+        await session.commit()
+
+        stats1 = await deliver_alerts(session)
+        await session.commit()
+        assert stats1["digest_sent"] == 1
+
+        # Immediately fire another warn — digest should NOT send again.
+        await fire_alert(session, severity="warn", category="cat", message="warning 2")
+        await session.commit()
+
+        stats2 = await deliver_alerts(session)
+        await session.commit()
+        assert stats2["digest_sent"] == 0
+
+        # Verify delivery state persisted.
+        state = await session.get(AlertDeliveryState, 1)
+        assert state is not None
+        assert state.last_digest_sent_at is not None
+
+
+class TestPayloadShape:
+    """Alertmanager webhook payload on AlertMessage."""
+
+    async def test_payload_shape_validated_against_literal_expected_dict(
+        self, session, session_factory
+    ):
+        """The immediate delivery path constructs an Alertmanager-compatible
+        payload dict on AlertMessage."""
+        transport = _TrackingTransport()
+        opsalert.configure(
+            session_factory=session_factory,
+            transport=transport,
+            delivery_to_email="ops@test.com",
+            delivery_from_email="alert@test.com",
+            delivery_throttle_minutes=0,
+        )
+
+        await fire_alert(session, severity="error", category="sendgrid", message="500 error")
+        await session.commit()
+
+        await deliver_alerts(session)
+        await session.commit()
+
+        assert len(transport.sent) == 1
+        msg = transport.sent[0]
+        assert msg.payload is not None
+        payload = msg.payload
+        assert payload["version"] == "4"
+        assert payload["status"] in ("firing", "resolved")
+        assert isinstance(payload["alerts"], list)
+        assert len(payload["alerts"]) >= 1
+        alert_item = payload["alerts"][0]
+        assert "labels" in alert_item
+        labels = alert_item["labels"]
+        assert "alertname" in labels
+        assert "severity" in labels
+        assert labels["severity"] == "error"
+        assert labels["category"] == "sendgrid"
+        assert "annotations" in alert_item
+        annotations = alert_item["annotations"]
+        assert "summary" in annotations
+        assert "startsAt" in alert_item
+        assert "fingerprint" in alert_item
+
+    async def test_webhook_posts_payload_as_is(self, session, session_factory):
+        """WebhookTransport.send POSTs the payload dict directly when present."""
+        import urllib.request
+
+        captured = {}
+
+        class _FakeOpener:
+            def __init__(self, *_a, **_kw):
+                pass
+
+            def __enter__(self):
+                class _Resp:
+                    status = 200
+                return _Resp()
+
+            def __exit__(self, *_a):
+                pass
+
+        original_urlopen = urllib.request.urlopen
+
+        def fake_urlopen(req, **kwargs):
+            captured["data"] = json.loads(req.data)
+            captured["url"] = req.full_url
+            return _FakeOpener()
+
+        urllib.request.urlopen = fake_urlopen
+        try:
+            from opsalert.transport import WebhookTransport
+            transport = WebhookTransport("http://localhost:9093/api/v2/alerts")
+            payload = {
+                "version": "4",
+                "status": "firing",
+                "alerts": [{"labels": {"alertname": "test"}}],
+            }
+            msg = AlertMessage(
+                subject="test",
+                html_body="<p>test</p>",
+                text_body="test",
+                severity="error",
+                category="cat",
+                payload=payload,
+            )
+            result = transport.send(msg, to="ops@test.com", from_addr="a@b.com", from_name="test")
+            assert result is True
+            assert captured["data"] == payload
+        finally:
+            urllib.request.urlopen = original_urlopen

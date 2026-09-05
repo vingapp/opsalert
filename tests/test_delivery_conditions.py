@@ -144,7 +144,7 @@ class TestAcknowledged:
         await session.commit()
         await sync_condition_stats(session)
         condition = await _condition(session)
-        await set_status(session, condition, "acknowledged", actor="chris")
+        await set_status(session, condition, "acknowledged", actor="chris", issue_url="https://github.com/test/1")
         await session.commit()
 
         stats = await deliver_alerts(session)
@@ -164,7 +164,7 @@ class TestAcknowledged:
         await session.commit()
         await sync_condition_stats(session)
         condition = await _condition(session)
-        await set_status(session, condition, "acknowledged", actor="chris")
+        await set_status(session, condition, "acknowledged", actor="chris", issue_url="https://github.com/test/1")
         await session.commit()
 
         await _fire_old(session, severity="error", category="cat", message="boom")
@@ -444,7 +444,7 @@ class TestResolveWithUndeliveredBacklog:
         await sync_condition_stats(session)
         condition = await _condition(session)
 
-        await set_status(session, condition, "acknowledged", actor="chris")
+        await set_status(session, condition, "acknowledged", actor="chris", issue_url="https://github.com/test/1")
         await set_status(session, condition, "closed", actor="chris")
         await session.commit()
 
@@ -644,7 +644,7 @@ class TestDigestSeverity:
         await _fire_old(session, severity="critical", category="cat", message="db down")
         await session.commit()
         await sync_condition_stats(session)
-        await set_status(session, await _condition(session), "acknowledged", actor="chris")
+        await set_status(session, await _condition(session), "acknowledged", actor="chris", issue_url="https://github.com/test/1")
         await session.commit()
 
         stats = await deliver_alerts(session)

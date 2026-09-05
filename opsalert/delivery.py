@@ -43,7 +43,7 @@ from opsalert.lifecycle import (
     effective_disposition,
     reopen_condition,
 )
-from opsalert.model import Alert, AlertCondition
+from opsalert.model import Alert, AlertCondition, AlertDeliveryState
 from opsalert.types import DIGEST_SEVERITIES, IMMEDIATE_SEVERITIES, AlertMessage, AlertSeverity
 
 logger = logging.getLogger(__name__)
@@ -135,6 +135,44 @@ def _environment_html(environment: str | None) -> str:
 def _environment_text(environment: str | None) -> str:
     """Leading ``Environment: staging`` line for a plain-text body."""
     return f"Environment: {environment}\n" if environment else ""
+
+
+def _alertmanager_payload(
+    *,
+    batches: list["_ConditionBatch"],
+    status: str = "firing",
+    environment: str | None = None,
+) -> dict:
+    """Build an Alertmanager v4 webhook payload from condition batches."""
+    alerts = []
+    for batch in batches:
+        alertname = batch.template or batch.category
+        labels = {
+            "alertname": alertname,
+            "severity": batch.severity,
+            "category": batch.category,
+        }
+        if environment:
+            labels["environment"] = environment
+        annotations: dict[str, str] = {
+            "summary": batch.latest_message,
+            "condition_id": str(batch.condition_id),
+        }
+        alert_item: dict = {
+            "labels": labels,
+            "annotations": annotations,
+            "startsAt": (
+                batch.last_created.isoformat() if batch.last_created else ""
+            ),
+            "endsAt": "",
+            "fingerprint": str(batch.condition_id),
+        }
+        alerts.append(alert_item)
+    return {
+        "version": "4",
+        "status": status,
+        "alerts": alerts,
+    }
 
 
 async def deliver_alerts(session) -> dict:
@@ -394,6 +432,22 @@ def _report_delivery_skip(condition_id: object, exc: Exception) -> None:
         logger.exception("opsalert: could not report unusable condition %s", condition_id)
 
 
+async def _update_digest_sent_at(session) -> None:
+    """Record the current time as last_digest_sent_at in alert_delivery_state."""
+    from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+    now = datetime.now(UTC)
+    stmt = (
+        sqlite_insert(AlertDeliveryState)
+        .values(id=1, last_digest_sent_at=now)
+        .on_conflict_do_update(
+            index_elements=[AlertDeliveryState.id],
+            set_={"last_digest_sent_at": now},
+        )
+    )
+    await session.execute(stmt)
+
+
 async def _mark_notified(session, pairs: list[tuple[int, int]]) -> None:
     """Mark each condition's occurrences up to ``max_id`` as notified."""
     for start in range(0, len(pairs), _MARK_CHUNK):
@@ -529,6 +583,11 @@ async def _deliver_immediate(
             category=category,
             alert_count=total,
             environment=environment,
+            payload=_alertmanager_payload(
+                batches=included,
+                status="firing",
+                environment=environment,
+            ),
         )
 
         sent = cfg.transport.send(message, to=to_email, from_addr=from_email, from_name=from_name)
@@ -703,6 +762,18 @@ async def _deliver_digest(
     cfg = get_config()
     environment = cfg.environment
 
+    # Digest interval gating (#10): skip if the last digest was sent too recently.
+    digest_interval_minutes = _resolve_setting("delivery_digest_interval_minutes", 360)
+    if digest_interval_minutes > 0:
+        state = await session.get(AlertDeliveryState, 1)
+        if state and state.last_digest_sent_at is not None:
+            last_sent = state.last_digest_sent_at
+            now_naive = datetime.now(UTC).replace(tzinfo=None)
+            last_naive = last_sent.replace(tzinfo=None) if last_sent.tzinfo else last_sent
+            elapsed = now_naive - last_naive
+            if elapsed < timedelta(minutes=digest_interval_minutes):
+                return stats
+
     digest_severities = [s.value for s in DIGEST_SEVERITIES]
 
     # Orphan (no condition) warn occurrences still ride the legacy grouping.
@@ -808,6 +879,8 @@ async def _deliver_digest(
                 )
                 .values(notified=True)
             )
+        # Record when the digest was sent for interval gating (#10).
+        await _update_digest_sent_at(session)
         # Same rule as immediate delivery: the digest email is out the door,
         # so its mark must not be able to roll back with the caller's
         # transaction. Commit it in place.
