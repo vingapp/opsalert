@@ -30,7 +30,7 @@ selects every mapped column and a missing column fails the query outright.
 import json
 import logging
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, overload
 
 from sqlalchemy import case, func, select, update
 
@@ -122,8 +122,12 @@ _IMMEDIATE_BY_DEFAULT = frozenset({AlertSeverity.ERROR.value, AlertSeverity.CRIT
 
 
 def worst_severity(a: str | None, b: str | None) -> str:
-    """The more severe of two severity strings (unknown values rank lowest)."""
-    return a if _SEVERITY_ORDER.get(a or "", 0) >= _SEVERITY_ORDER.get(b or "", 0) else b
+    """The more severe of two severity strings (unknown values rank lowest).
+
+    Returns the coerced winner; two None inputs yield "".
+    """
+    winner = a if _SEVERITY_ORDER.get(a or "", 0) >= _SEVERITY_ORDER.get(b or "", 0) else b
+    return winner or ""
 
 
 def effective_disposition(severity: str | None, disposition: str | None) -> str:
@@ -139,6 +143,12 @@ def effective_disposition(severity: str | None, disposition: str | None) -> str:
     return DISPOSITION_IMMEDIATE if severity in _IMMEDIATE_BY_DEFAULT else DISPOSITION_DIGEST
 
 
+@overload
+def _naive(value: datetime) -> datetime: ...
+@overload
+def _naive(value: None) -> None: ...
+@overload
+def _naive(value: datetime | None) -> datetime | None: ...
 def _naive(value: datetime | None) -> datetime | None:
     """Drop tzinfo for comparison — some drivers hand back naive UTC."""
     if value is None:
@@ -542,7 +552,7 @@ async def _median_interval(session, *, condition_id: int, horizon: datetime) -> 
     if len(stamps) < 2:
         return None
 
-    ordered = sorted(_naive(s) for s in stamps)
+    ordered = sorted(_naive(s) for s in stamps if s is not None)
     gaps = sorted(
         (ordered[i + 1] - ordered[i]).total_seconds() for i in range(len(ordered) - 1)
     )

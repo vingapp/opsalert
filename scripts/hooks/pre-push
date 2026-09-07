@@ -1,0 +1,54 @@
+#!/bin/sh
+# Pre-push hook: ruff over opsalert/ + tests/, mypy, full test suite.
+#
+# Gated only when pushing TO a core branch (integration/staging/main) —
+# decided per pushed ref (stdin), not the checked-out branch.
+
+GATED=0
+while read -r _local_ref _local_sha remote_ref _remote_sha; do
+    case "$remote_ref" in
+        refs/heads/integration|refs/heads/staging|refs/heads/main) GATED=1 ;;
+    esac
+done
+if [ "$GATED" -eq 0 ]; then
+    echo "pre-push: no core branch (integration/staging/main) in this push — skipping gates."
+    exit 0
+fi
+
+RUFF=".venv/bin/ruff"
+MYPY=".venv/bin/mypy"
+PYTEST=".venv/bin/pytest"
+
+# Fail closed: every tool must be present in a provisioned tree.
+for _tool in "$RUFF" "$MYPY" "$PYTEST"; do
+    if [ ! -x "$_tool" ]; then
+        echo "pre-push: $_tool not found — gate from a provisioned tree (~/opsalert-landing)"
+        exit 1
+    fi
+done
+
+# ruff over all of opsalert/ AND tests/
+echo "pre-push: ruff check opsalert/ tests/..."
+if ! "$RUFF" check opsalert/ tests/; then
+    echo ""
+    echo "pre-push: ruff found issues. Fix (ruff check --fix) or use --no-verify."
+    exit 1
+fi
+
+# mypy type check
+echo "pre-push: running mypy..."
+if ! "$MYPY" opsalert/; then
+    echo ""
+    echo "pre-push: mypy found type errors. Fix them or use --no-verify."
+    exit 1
+fi
+
+# full test suite
+echo "pre-push: running pytest..."
+if ! "$PYTEST" tests/ -q -p no:cacheprovider; then
+    echo ""
+    echo "pre-push: tests failed. Fix them or use --no-verify."
+    exit 1
+fi
+
+exit 0

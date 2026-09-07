@@ -19,6 +19,7 @@ dev = [
     "pytest-cov>=6.0.0",
     "aiosqlite>=0.20",
     "ruff>=0.6",
+    "mypy>=1.10",
 ]
 
 [tool.pytest.ini_options]
@@ -28,6 +29,16 @@ asyncio_mode = "auto"
 dynamic_context = "test_function"
 source = ["opsalert"]
 
+
+[tool.mypy]
+python_version = "3.11"
+warn_unused_configs = true
+
+# celery is an optional runtime dependency (Celery task context detection);
+# no py.typed marker or type stubs available.
+[[tool.mypy.overrides]]
+module = "celery.*"
+ignore_missing_imports = true
 
 [tool.ruff]
 target-version = "py311"
