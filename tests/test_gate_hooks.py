@@ -443,3 +443,16 @@ class TestRealToolPrePush:
         )
         assert result.returncode == 1
         assert "ruff found issues" in result.stdout
+
+
+def test_tracked_hook_files_are_executable():
+    """Git installs a hook by symlink and silently ignores a target without the
+    execute bit ("hook was ignored because it's not set as executable"), which
+    is a gate failing open. Pin the tracked mode of every hook script."""
+    out = subprocess.run(
+        ["git", "ls-files", "-s", "scripts/hooks"],
+        cwd=REPO_ROOT, check=True, capture_output=True, text=True,
+    ).stdout
+    modes = {line.split()[3]: line.split()[0] for line in out.splitlines()}
+    assert modes, "no tracked hook scripts found"
+    assert all(mode == "100755" for mode in modes.values()), modes
