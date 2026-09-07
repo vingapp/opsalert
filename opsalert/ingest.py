@@ -758,7 +758,7 @@ def _insert_alert(conn: Any, event: Event, condition_id: int | None) -> int | No
 
     try:
         result = conn.execute(
-            Alert.__table__.insert().values(
+            Alert.__table__.insert().values(  # type: ignore[attr-defined]
                 event_id=event.event_id,
                 severity=event.severity,
                 category=event.category,

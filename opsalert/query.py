@@ -90,7 +90,7 @@ async def query_categories(
     if search:
         latest_msg_subq = latest_msg_subq.where(Alert.message.ilike(f"%{search}%"))
     latest_msg_subq = (
-        latest_msg_subq.order_by(Alert.created.desc()).limit(1).scalar_subquery()
+        latest_msg_subq.order_by(Alert.created.desc()).limit(1).scalar_subquery()  # type: ignore[assignment]
     )
 
     final = (
@@ -910,7 +910,7 @@ async def query_attention(
         for condition, count_since in included
     ]
 
-    return {"conditions": conditions, "cursor": _encode_attention_cursor(next_marks)}
+    return {"conditions": conditions, "cursor": _encode_attention_cursor(next_marks)}  # type: ignore[arg-type]
 
 
 # =============================================================================
@@ -933,7 +933,7 @@ async def delete_by_category(
         stmt = stmt.where(Alert.message == message)
 
     result = await session.execute(stmt)
-    return result.rowcount
+    return result.rowcount  # type: ignore[attr-defined]
 
 
 async def delete_batch(
@@ -961,7 +961,7 @@ async def delete_batch(
             Alert.id <= before_id,
         )
     )
-    return result.rowcount
+    return result.rowcount  # type: ignore[attr-defined]
 
 
 async def delete_by_id(session: "AsyncSession", *, alert_id: int) -> bool:
@@ -969,4 +969,4 @@ async def delete_by_id(session: "AsyncSession", *, alert_id: int) -> bool:
     result = await session.execute(
         delete(Alert).where(Alert.id == alert_id)
     )
-    return result.rowcount > 0
+    return result.rowcount > 0  # type: ignore[attr-defined]

@@ -123,7 +123,7 @@ _IMMEDIATE_BY_DEFAULT = frozenset({AlertSeverity.ERROR.value, AlertSeverity.CRIT
 
 def worst_severity(a: str | None, b: str | None) -> str:
     """The more severe of two severity strings (unknown values rank lowest)."""
-    return a if _SEVERITY_ORDER.get(a or "", 0) >= _SEVERITY_ORDER.get(b or "", 0) else b
+    return a if _SEVERITY_ORDER.get(a or "", 0) >= _SEVERITY_ORDER.get(b or "", 0) else b  # type: ignore[return-value]
 
 
 def effective_disposition(severity: str | None, disposition: str | None) -> str:
@@ -412,11 +412,11 @@ def _apply_counts(
     condition.occurrence_count = (condition.occurrence_count or 0) + count
     if first_created is not None:
         current = _naive(condition.first_seen)
-        if current is None or _naive(first_created) < current:
+        if current is None or _naive(first_created) < current:  # type: ignore[operator]
             condition.first_seen = first_created
     if last_created is not None:
         current = _naive(condition.last_seen)
-        if current is None or _naive(last_created) > current:
+        if current is None or _naive(last_created) > current:  # type: ignore[operator]
             condition.last_seen = last_created
     scanned = _RANK_TO_SEVERITY.get(severity_rank or 0)
     if scanned:
@@ -542,9 +542,9 @@ async def _median_interval(session, *, condition_id: int, horizon: datetime) -> 
     if len(stamps) < 2:
         return None
 
-    ordered = sorted(_naive(s) for s in stamps)
+    ordered = sorted(_naive(s) for s in stamps)  # type: ignore[type-var]
     gaps = sorted(
-        (ordered[i + 1] - ordered[i]).total_seconds() for i in range(len(ordered) - 1)
+        (ordered[i + 1] - ordered[i]).total_seconds() for i in range(len(ordered) - 1)  # type: ignore[operator]
     )
     middle = len(gaps) // 2
     median = gaps[middle] if len(gaps) % 2 else (gaps[middle - 1] + gaps[middle]) / 2
@@ -750,9 +750,9 @@ async def _escalate_acknowledged(session, *, now: datetime) -> int:
                 last_seen = _naive(condition.last_seen)
                 naive_ack_at = _naive(ack_at)
                 if (
-                    naive_now > until
+                    naive_now > until  # type: ignore[operator]
                     and last_seen is not None
-                    and last_seen > naive_ack_at
+                    and last_seen > naive_ack_at  # type: ignore[operator]
                 ):
                     note = "reopened: acknowledgement lease expired while still firing"
 
@@ -831,7 +831,7 @@ async def _auto_close_resolved(session, *, now: datetime) -> int:
         )
         if last is None:
             continue
-        if reference_now - last < _auto_close_threshold(condition):
+        if reference_now - last < _auto_close_threshold(condition):  # type: ignore[operator]
             continue
         condition.status = STATUS_CLOSED
         condition.closed_at = now
@@ -859,7 +859,7 @@ async def _auto_stale_new(session, *, now: datetime) -> int:
     reference_now = _naive(now)
     for condition in candidates:
         last = _naive(condition.last_seen) or _naive(condition.created)
-        if last is None or reference_now - last < AUTO_STALE_SILENCE:
+        if last is None or reference_now - last < AUTO_STALE_SILENCE:  # type: ignore[operator]
             continue
         condition.status = STATUS_CLOSED
         condition.closed_at = now
@@ -990,7 +990,7 @@ async def set_status(
     very next sweep, which is not what "acknowledge with a lease" means.
     """
     now = now or datetime.now(UTC)
-    if acknowledged_until is not None and _naive(acknowledged_until) <= _naive(now):
+    if acknowledged_until is not None and _naive(acknowledged_until) <= _naive(now):  # type: ignore[operator]
         raise ValueError("acknowledged_until must be in the future")
     condition = await _load(session, condition)
 

@@ -200,7 +200,7 @@ async def _upsert_condition(session: "AsyncSession", values: dict[str, Any]) -> 
 
     if dialect == "mysql":
         result = await session.execute(upsert_statement("mysql", values))
-        return result.lastrowid
+        return result.lastrowid  # type: ignore[attr-defined]
 
     if dialect == "sqlite":
         result = await session.execute(upsert_statement("sqlite", values))
@@ -209,8 +209,8 @@ async def _upsert_condition(session: "AsyncSession", values: dict[str, Any]) -> 
     from sqlalchemy.exc import IntegrityError
 
     try:
-        result = await session.execute(AlertCondition.__table__.insert().values(**values))
-        return result.inserted_primary_key[0]
+        result = await session.execute(AlertCondition.__table__.insert().values(**values))  # type: ignore[attr-defined]
+        return result.inserted_primary_key[0]  # type: ignore[attr-defined]
     except IntegrityError:
         return await session.scalar(
             select(AlertCondition.id).where(

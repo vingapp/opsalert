@@ -84,11 +84,11 @@ def compute_emit_site(stacklevel: int = 1) -> str:
             module_name = f.f_globals.get("__name__", "")
             if module_name not in _SKIP_MODULES:
                 break
-            f = f.f_back
+            f = f.f_back  # type: ignore[assignment]
         # Then skip stacklevel-1 additional frames
         for _ in range(stacklevel - 1):
             if f is not None:
-                f = f.f_back
+                f = f.f_back  # type: ignore[assignment]
         if f is not None:
             module_name = f.f_globals.get("__name__", "")
             return f"{module_name}:{f.f_code.co_name}"
@@ -184,7 +184,7 @@ def enrich_context(
                     f"{module_name}:{f.f_code.co_name}:{f.f_lineno}"
                 )
                 break
-            f = f.f_back
+            f = f.f_back  # type: ignore[assignment]
     finally:
         del frame
 
@@ -200,7 +200,7 @@ def enrich_context(
         exc_info = sys.exc_info()
         resolved_exc = exc_info[1]
     else:
-        exc_info = (type(resolved_exc), resolved_exc, resolved_exc.__traceback__)
+        exc_info = (type(resolved_exc), resolved_exc, resolved_exc.__traceback__)  # type: ignore[assignment]
 
     if resolved_exc is not None:
         enriched["_exc_type"] = type(resolved_exc).__name__

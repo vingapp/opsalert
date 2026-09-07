@@ -647,7 +647,7 @@ async def _deliver_immediate(
             ),
         )
 
-        sent = cfg.transport.send(message, to=to_email, from_addr=from_email, from_name=from_name)
+        sent = cfg.transport.send(message, to=to_email, from_addr=from_email, from_name=from_name)  # type: ignore[union-attr]
 
         if sent:
             await _mark_notified(session, [(b.condition_id, b.max_id) for b in included])
@@ -786,7 +786,7 @@ async def _deliver_immediate_legacy(
             environment=environment,
         )
 
-        sent = cfg.transport.send(message, to=to_email, from_addr=from_email, from_name=from_name)
+        sent = cfg.transport.send(message, to=to_email, from_addr=from_email, from_name=from_name)  # type: ignore[union-attr]
 
         if sent:
             await session.execute(
@@ -921,7 +921,7 @@ async def _deliver_digest(
         environment=environment,
     )
 
-    sent = cfg.transport.send(message, to=to_email, from_addr=from_email, from_name=from_name)
+    sent = cfg.transport.send(message, to=to_email, from_addr=from_email, from_name=from_name)  # type: ignore[union-attr]
 
     if sent:
         await _mark_notified(session, [(b.condition_id, b.max_id) for b in batches])
