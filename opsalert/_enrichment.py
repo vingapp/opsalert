@@ -193,7 +193,7 @@ def enrich_context(
     try:
         enriched["_emit_site"] = compute_emit_site(stacklevel=stacklevel)
     except Exception:
-        pass
+        logger.warning("enrichment: emit_site failed", exc_info=True)
 
     # --- Active exception ---
     resolved_exc = exc
@@ -209,6 +209,7 @@ def enrich_context(
         try:
             enriched["_exc_message"] = str(resolved_exc)[:500]
         except Exception:
+            logger.warning("enrichment: exc_message rendering failed", exc_info=True)
             enriched["_exc_message"] = "<unrenderable>"
         tb = getattr(resolved_exc, "__traceback__", None) or (
             exc_info[2] if exc_info else None
@@ -245,7 +246,7 @@ def enrich_context(
             enriched["_task_name"] = current_task.name
             enriched["_task_id"] = current_task.request.id
     except Exception:
-        pass
+        logger.warning("enrichment: celery task detection failed", exc_info=True)
 
     # --- Request trace ---
     # The trace_provider contract accepts either a 2-tuple (trace_id,
@@ -269,7 +270,7 @@ def enrich_context(
                     if span_id is not None:
                         enriched["_span_id"] = span_id
     except Exception:
-        pass
+        logger.warning("enrichment: trace provider failed", exc_info=True)
 
     # --- Requesting identity ---
     # Optional, and never fatal: attribution is a nice-to-have, the alert is
