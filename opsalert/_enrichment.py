@@ -8,6 +8,7 @@ Adds underscore-prefixed keys (won't collide with caller-provided data):
 import logging
 import sys
 import traceback as tb_module
+from types import FrameType, TracebackType
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -78,7 +79,7 @@ def compute_emit_site(stacklevel: int = 1) -> str:
     """
     frame = sys._getframe()
     try:
-        f = frame
+        f: FrameType | None = frame
         # First skip opsalert internal frames
         while f is not None:
             module_name = f.f_globals.get("__name__", "")
@@ -176,7 +177,7 @@ def enrich_context(
     # Walk the stack past this package to find the actual call site.
     frame = sys._getframe()
     try:
-        f = frame
+        f: FrameType | None = frame
         while f is not None:
             module_name = f.f_globals.get("__name__", "")
             if module_name not in _SKIP_MODULES:
@@ -192,10 +193,11 @@ def enrich_context(
     try:
         enriched["_emit_site"] = compute_emit_site(stacklevel=stacklevel)
     except Exception:
-        pass
+        logger.warning("enrichment: emit_site failed", exc_info=True)
 
     # --- Active exception ---
     resolved_exc = exc
+    exc_info: tuple[type[BaseException] | None, BaseException | None, TracebackType | None]
     if resolved_exc is None:
         exc_info = sys.exc_info()
         resolved_exc = exc_info[1]
@@ -207,6 +209,7 @@ def enrich_context(
         try:
             enriched["_exc_message"] = str(resolved_exc)[:500]
         except Exception:
+            logger.warning("enrichment: exc_message rendering failed", exc_info=True)
             enriched["_exc_message"] = "<unrenderable>"
         tb = getattr(resolved_exc, "__traceback__", None) or (
             exc_info[2] if exc_info else None
@@ -243,7 +246,7 @@ def enrich_context(
             enriched["_task_name"] = current_task.name
             enriched["_task_id"] = current_task.request.id
     except Exception:
-        pass
+        logger.warning("enrichment: celery task detection failed", exc_info=True)
 
     # --- Request trace ---
     # The trace_provider contract accepts either a 2-tuple (trace_id,
@@ -267,7 +270,7 @@ def enrich_context(
                     if span_id is not None:
                         enriched["_span_id"] = span_id
     except Exception:
-        pass
+        logger.warning("enrichment: trace provider failed", exc_info=True)
 
     # --- Requesting identity ---
     # Optional, and never fatal: attribution is a nice-to-have, the alert is

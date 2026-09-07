@@ -66,6 +66,30 @@ For users-of-uptake guidance see `~/CLAUDE.md`. The repo README has the contract
 .venv/bin/uptake-lint
 ```
 
+## Gates
+
+Promotion ladder: `lead/*` and `worker/*` branches are ungated. `integration` is
+gated by local hooks (pre-commit + pre-push) from `~/opsalert-landing`.
+`promote/staging-<stamp>` PRs run hosted Validate (`.github/workflows/validate.yml`).
+`promote/main-<stamp>` PRs are owner-merge only.
+
+**Fail-closed preconditions** (a hook that prints "skipping" has failed open):
+- `git symbolic-ref --short HEAD` prints a branch name (not detached).
+- `.venv/bin/{ruff,mypy,uptake-lint,pytest}` all exist and are executable.
+- Hooks are symlinks installed by `bash scripts/hooks/install.sh`.
+- The gate tree is a trusted Claude workspace
+  (`projects[<abs path>].hasTrustDialogAccepted: true` in
+  `~/.claude-accounts/dev-subseam/.claude.json`).
+- Session scopes need `TasksMax >= 8192` for uptake-lint's LLM review.
+- After any rebuild or rsync, purge stale bytecode:
+  `find . -path ./.venv -prune -o -name __pycache__ -exec rm -rf {} +`
+
+**`~/ving-gates/work/opsalert`** is vingapi's pinned editable install of this
+library. It is never landed from — it exists only so vingapi's `.venv` has a
+current copy. A release of this library is a vingapi `requirements.lock` pin bump.
+
+**Linked worktrees** gate in their own tree and need their own `.venv`.
+
 ## Conventions
 
 (Accreting.)

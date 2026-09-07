@@ -584,6 +584,8 @@ async def _deliver_immediate(
         "immediate_throttled_conditions": 0,
     }
     cfg = get_config()
+    if cfg.transport is None:
+        raise RuntimeError("delivery configured without a transport")
     environment = cfg.environment
 
     # A reopen is a state change, not a repeat: it is never throttled by the
@@ -648,7 +650,6 @@ async def _deliver_immediate(
         )
 
         sent = cfg.transport.send(message, to=to_email, from_addr=from_email, from_name=from_name)
-
         if sent:
             await _mark_notified(session, [(b.condition_id, b.max_id) for b in included])
             # Commit the mark NOW, per email. The transport has already
@@ -685,6 +686,8 @@ async def _deliver_immediate_legacy(
     what makes a fire-time resolution failure cost nothing but grouping (F1).
     """
     cfg = get_config()
+    if cfg.transport is None:
+        raise RuntimeError("delivery configured without a transport")
     environment = cfg.environment
     immediate_severities = [s.value for s in IMMEDIATE_SEVERITIES]
     throttle_cutoff = datetime.now(UTC) - timedelta(minutes=throttle_minutes)
@@ -787,7 +790,6 @@ async def _deliver_immediate_legacy(
         )
 
         sent = cfg.transport.send(message, to=to_email, from_addr=from_email, from_name=from_name)
-
         if sent:
             await session.execute(
                 update(Alert)
@@ -817,6 +819,8 @@ async def _deliver_digest(
     """One digest email covering digest-dispositioned conditions and orphans."""
     stats = {"digest_sent": 0, "digest_count": 0}
     cfg = get_config()
+    if cfg.transport is None:
+        raise RuntimeError("delivery configured without a transport")
     environment = cfg.environment
 
     # Digest interval gating (#10): skip if the last digest was sent too recently.
@@ -922,7 +926,6 @@ async def _deliver_digest(
     )
 
     sent = cfg.transport.send(message, to=to_email, from_addr=from_email, from_name=from_name)
-
     if sent:
         await _mark_notified(session, [(b.condition_id, b.max_id) for b in batches])
         if legacy_rows:

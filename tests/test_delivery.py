@@ -326,6 +326,36 @@ class TestDeliverNoTransport:
         assert stats["immediate_sent"] == 0
         assert stats["digest_sent"] == 0
 
+    async def test_internal_deliver_immediate_raises_without_transport(
+        self, session, session_factory
+    ):
+        """_deliver_immediate raises RuntimeError when transport is None."""
+        from opsalert.delivery import _deliver_immediate
+
+        opsalert.configure(session_factory=session_factory, transport=None)
+        with pytest.raises(RuntimeError, match="delivery configured without a transport"):
+            await _deliver_immediate(session, [], "to@x", "from@x", "Test", 60)
+
+    async def test_internal_deliver_digest_raises_without_transport(
+        self, session, session_factory
+    ):
+        """_deliver_digest raises RuntimeError when transport is None."""
+        from opsalert.delivery import _deliver_digest
+
+        opsalert.configure(session_factory=session_factory, transport=None)
+        with pytest.raises(RuntimeError, match="delivery configured without a transport"):
+            await _deliver_digest(session, [], "to@x", "from@x", "Test")
+
+    async def test_internal_deliver_legacy_raises_without_transport(
+        self, session, session_factory
+    ):
+        """_deliver_immediate_legacy raises RuntimeError when transport is None."""
+        from opsalert.delivery import _deliver_immediate_legacy
+
+        opsalert.configure(session_factory=session_factory, transport=None)
+        with pytest.raises(RuntimeError, match="delivery configured without a transport"):
+            await _deliver_immediate_legacy(session, "to@x", "from@x", "Test", 60, {})
+
 
 class _ExplodeAfterFirstTransport(opsalert.Transport):
     """Delivers the first message, then blows up — simulates a mid-sweep

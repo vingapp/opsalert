@@ -609,6 +609,12 @@ def write_batch(
         try:
             group_condition_id = _resolve_condition_sync(conn, group[0])
         except Exception:
+            logger.warning(
+                "ingest: condition resolution failed for group %s; "
+                "alert stored without condition",
+                fp,
+                exc_info=True,
+            )
             group_condition_id = None
 
         if group_condition_id is not None:
@@ -746,11 +752,13 @@ def _build_event_json(event: Event) -> str | None:
     try:
         return json.dumps(data, default=str)
     except Exception:
+        logger.warning("ingest: context not JSON-serialisable", exc_info=True)
         return None
 
 
 def _insert_alert(conn: Any, event: Event, condition_id: int | None) -> int | None:
     """Insert a single Alert row. Returns the row id or None."""
+    from sqlalchemy import insert
     from sqlalchemy.exc import IntegrityError
 
     from opsalert.model import Alert
@@ -758,7 +766,7 @@ def _insert_alert(conn: Any, event: Event, condition_id: int | None) -> int | No
 
     try:
         result = conn.execute(
-            Alert.__table__.insert().values(
+            insert(Alert).values(
                 event_id=event.event_id,
                 severity=event.severity,
                 category=event.category,
@@ -839,6 +847,8 @@ def _resolve_condition_sync(conn: Any, event: Event) -> int | None:
     # Detect dialect
     dialect = conn.dialect.name
 
+    from sqlalchemy.exc import IntegrityError
+
     try:
         stmt = upsert_statement(dialect, values)
         result = conn.execute(stmt)
@@ -847,8 +857,8 @@ def _resolve_condition_sync(conn: Any, event: Event) -> int | None:
         if dialect == "sqlite":
             return result.scalar_one()
         return result.inserted_primary_key[0]
-    except Exception:
-        # Fallback: select again
+    except IntegrityError:
+        # Race: another writer inserted first; select the winner.
         return conn.execute(
             select(AlertCondition.id).where(AlertCondition.signature_key == fp)
         ).scalar_one_or_none()
@@ -904,6 +914,8 @@ def _resolve_condition_sync_from_drop(conn: Any, dr: DropRecord) -> int | None:
         "fingerprint_json": dr.fingerprint_json,
     }
 
+    from sqlalchemy.exc import IntegrityError
+
     dialect = conn.dialect.name
     try:
         stmt = upsert_statement(dialect, values)
@@ -913,7 +925,8 @@ def _resolve_condition_sync_from_drop(conn: Any, dr: DropRecord) -> int | None:
         if dialect == "sqlite":
             return result.scalar_one()
         return result.inserted_primary_key[0]
-    except Exception:
+    except IntegrityError:
+        # Race: another writer inserted first; select the winner.
         return conn.execute(
             select(AlertCondition.id).where(AlertCondition.signature_key == fp)
         ).scalar_one_or_none()
@@ -979,6 +992,12 @@ def flush(timeout: float = 5.0) -> FlushResult:
         with _condition:
             remaining = len(_queue)
             total_dropped = _dropped_total
+        logger.error(
+            "ingest: flush failed; %d queued, %d dropped total",
+            remaining,
+            total_dropped,
+            exc_info=True,
+        )
         return FlushResult(
             written=_written_total,
             sampled_out=_sampled_out_total,
