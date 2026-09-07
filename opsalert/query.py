@@ -7,10 +7,12 @@ Next-fix: Highest-priority group with aggregated debugging data
 """
 import base64
 import json
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 from sqlalchemy import case, delete, desc, func, or_, select
+from sqlalchemy.engine import CursorResult
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -89,8 +91,8 @@ async def query_categories(
         latest_msg_subq = latest_msg_subq.where(Alert.source == source)
     if search:
         latest_msg_subq = latest_msg_subq.where(Alert.message.ilike(f"%{search}%"))
-    latest_msg_subq = (
-        latest_msg_subq.order_by(Alert.created.desc()).limit(1).scalar_subquery()  # type: ignore[assignment]
+    latest_msg_scalar = (
+        latest_msg_subq.order_by(Alert.created.desc()).limit(1).scalar_subquery()
     )
 
     final = (
@@ -99,7 +101,7 @@ async def query_categories(
             agg_cte.c.severity_rank,
             agg_cte.c.source,
             agg_cte.c.count,
-            latest_msg_subq.label("latest_message"),
+            latest_msg_scalar.label("latest_message"),
             agg_cte.c.latest_created,
         )
         .order_by(desc(agg_cte.c.latest_created))
@@ -590,7 +592,7 @@ async def query_conditions(
 _ATTENTION_CURSOR_V2_PREFIX = "2."
 
 
-def _encode_attention_cursor(marks: dict[int, int | tuple[int, int]]) -> str:
+def _encode_attention_cursor(marks: Mapping[int, int | tuple[int, int]]) -> str:
     """Encode a {condition_id: (occurrence_count, reopened_count)} map as an opaque cursor.
 
     Accepts either int (legacy) or tuple values. Sorted by condition id so
@@ -910,7 +912,7 @@ async def query_attention(
         for condition, count_since in included
     ]
 
-    return {"conditions": conditions, "cursor": _encode_attention_cursor(next_marks)}  # type: ignore[arg-type]
+    return {"conditions": conditions, "cursor": _encode_attention_cursor(next_marks)}
 
 
 # =============================================================================
@@ -933,7 +935,8 @@ async def delete_by_category(
         stmt = stmt.where(Alert.message == message)
 
     result = await session.execute(stmt)
-    return result.rowcount  # type: ignore[attr-defined]
+    assert isinstance(result, CursorResult)
+    return result.rowcount
 
 
 async def delete_batch(
@@ -961,7 +964,8 @@ async def delete_batch(
             Alert.id <= before_id,
         )
     )
-    return result.rowcount  # type: ignore[attr-defined]
+    assert isinstance(result, CursorResult)
+    return result.rowcount
 
 
 async def delete_by_id(session: "AsyncSession", *, alert_id: int) -> bool:
@@ -969,4 +973,5 @@ async def delete_by_id(session: "AsyncSession", *, alert_id: int) -> bool:
     result = await session.execute(
         delete(Alert).where(Alert.id == alert_id)
     )
-    return result.rowcount > 0  # type: ignore[attr-defined]
+    assert isinstance(result, CursorResult)
+    return result.rowcount > 0

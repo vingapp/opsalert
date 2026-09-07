@@ -1,13 +1,18 @@
 """Tests for git gate hooks (pre-commit and pre-push).
 
-These tests run each hook via subprocess in a temporary git repo to verify:
-- Exit 1 + provisioned-tree message when a required tool is missing.
-- Exit 0 + skip line on a non-core branch.
-- Gitleaks step runs before the staged-py check.
+Stub tests verify structural properties (skip on non-core, fail-closed on missing
+tool, gitleaks-before-staged-py) in isolated temp repos with fake tools.
+
+Real-tool tests exercise the hooks with the actual .venv toolchain against code
+that triggers specific gate steps (ruff, mypy, gitleaks). The green end-to-end
+path (all steps pass) is not tested here — every real gate run exercises it.
 """
 
 import os
+import random
+import shutil
 import stat
+import string
 import subprocess
 import textwrap
 from pathlib import Path
@@ -298,3 +303,143 @@ class TestPrePushCoreRefDetection:
             input="refs/heads/main abc123 refs/heads/main def456\n",
         )
         assert result.returncode == 1
+
+
+# ── Real-tool tests ──────────────────────────────────────────────
+
+
+@pytest.fixture()
+def real_tree(tmp_path: Path) -> Path:
+    """Set up a temp git repo with the real toolchain for hook testing.
+
+    Copies scripts/, pyproject.toml, opsalert/, .gitleaks.toml into a fresh
+    git repo, symlinks the real .venv, runs install.sh, and checks out
+    integration.
+    """
+    repo = tmp_path / "real"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "user.email", "test@test.com"], cwd=repo, check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test"], cwd=repo, check=True, capture_output=True
+    )
+
+    # Copy repo contents
+    for item in ("scripts", "opsalert", "pyproject.toml", ".gitleaks.toml"):
+        src = REPO_ROOT / item
+        dst = repo / item
+        if src.is_dir():
+            shutil.copytree(src, dst)
+        else:
+            shutil.copy2(src, dst)
+
+    # Symlink the real .venv
+    (repo / ".venv").symlink_to(REPO_ROOT / ".venv")
+
+    # Initial commit
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "init", "--no-verify"],
+        cwd=repo, check=True, capture_output=True,
+    )
+
+    # Install hooks
+    subprocess.run(
+        ["bash", "scripts/hooks/install.sh"], cwd=repo, check=True, capture_output=True
+    )
+
+    # Create and switch to integration
+    subprocess.run(
+        ["git", "checkout", "-b", "integration"],
+        cwd=repo, check=True, capture_output=True,
+    )
+    return repo
+
+
+class TestRealToolPreCommit:
+    """Pre-commit with real .venv tools exercising actual gate steps."""
+
+    def test_ruff_catches_unused_import(self, real_tree: Path) -> None:
+        """Staged file with unused import -> exit 1, ruff message, no mypy/pytest."""
+        bad = real_tree / "bad_import.py"
+        bad.write_text("import json\n")
+        subprocess.run(
+            ["git", "add", "bad_import.py"], cwd=real_tree, check=True, capture_output=True
+        )
+
+        result = subprocess.run(
+            ["sh", "scripts/hooks/pre-commit"],
+            cwd=real_tree, capture_output=True, text=True, timeout=60,
+        )
+        assert result.returncode == 1
+        assert "ruff found issues" in result.stdout
+        # mypy and pytest should not have run (ruff short-circuits)
+        assert "running mypy" not in result.stdout
+        assert "running pytest" not in result.stdout
+
+    def test_mypy_catches_type_error(self, real_tree: Path) -> None:
+        """Staged file clean for ruff but with type error -> exit 1, mypy message."""
+        bad = real_tree / "opsalert" / "_bad_types.py"
+        bad.write_text("x: int = 's'\n")
+        subprocess.run(
+            ["git", "add", "opsalert/_bad_types.py"],
+            cwd=real_tree, check=True, capture_output=True,
+        )
+
+        result = subprocess.run(
+            ["sh", "scripts/hooks/pre-commit"],
+            cwd=real_tree, capture_output=True, text=True, timeout=60,
+        )
+        assert result.returncode == 1
+        assert "mypy found type errors" in result.stdout
+        # pytest should not have run (mypy short-circuits)
+        assert "running pytest" not in result.stdout
+
+    def test_gitleaks_catches_fake_aws_key(self, real_tree: Path) -> None:
+        """Staged file with a runtime-constructed AWS key -> exit 1, gitleaks message."""
+        # Generate a fake AKIA key at runtime (never a literal in test source)
+        suffix = "".join(random.choices(string.ascii_uppercase + string.digits, k=16))
+        fake_key = "AKIA" + suffix
+        secret_file = real_tree / "leaked.py"
+        secret_file.write_text(f'AWS_KEY = "{fake_key}"\n')
+        subprocess.run(
+            ["git", "add", "leaked.py"], cwd=real_tree, check=True, capture_output=True
+        )
+
+        result = subprocess.run(
+            ["sh", "scripts/hooks/pre-commit"],
+            cwd=real_tree, capture_output=True, text=True, timeout=60,
+        )
+        assert result.returncode == 1
+        assert "gitleaks found a secret" in result.stdout
+
+
+class TestRealToolPrePush:
+    """Pre-push with real .venv tools exercising actual gate steps."""
+
+    def test_ruff_violation_blocks_push(self, real_tree: Path) -> None:
+        """A ruff violation in the tree blocks a push to integration."""
+        bad = real_tree / "opsalert" / "_bad.py"
+        bad.write_text("import json\n")
+        subprocess.run(
+            ["git", "add", str(bad)], cwd=real_tree, check=True, capture_output=True
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "bad", "--no-verify"],
+            cwd=real_tree, check=True, capture_output=True,
+        )
+
+        head_sha = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=real_tree, capture_output=True, text=True, check=True,
+        ).stdout.strip()
+
+        result = subprocess.run(
+            ["sh", "scripts/hooks/pre-push", "origin", "https://example.com"],
+            cwd=real_tree, capture_output=True, text=True, timeout=60,
+            input=f"refs/heads/integration {head_sha} refs/heads/integration 0000\n",
+        )
+        assert result.returncode == 1
+        assert "ruff found issues" in result.stdout

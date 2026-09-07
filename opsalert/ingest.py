@@ -751,6 +751,7 @@ def _build_event_json(event: Event) -> str | None:
 
 def _insert_alert(conn: Any, event: Event, condition_id: int | None) -> int | None:
     """Insert a single Alert row. Returns the row id or None."""
+    from sqlalchemy import insert
     from sqlalchemy.exc import IntegrityError
 
     from opsalert.model import Alert
@@ -758,7 +759,7 @@ def _insert_alert(conn: Any, event: Event, condition_id: int | None) -> int | No
 
     try:
         result = conn.execute(
-            Alert.__table__.insert().values(  # type: ignore[attr-defined]
+            insert(Alert).values(
                 event_id=event.event_id,
                 severity=event.severity,
                 category=event.category,

@@ -33,6 +33,11 @@ source = ["opsalert"]
 [tool.mypy]
 python_version = "3.11"
 warn_unused_configs = true
+
+# celery is an optional runtime dependency (Celery task context detection);
+# no py.typed marker or type stubs available.
+[[tool.mypy.overrides]]
+module = "celery.*"
 ignore_missing_imports = true
 
 [tool.ruff]

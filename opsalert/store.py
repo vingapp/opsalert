@@ -19,7 +19,8 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
 
-from sqlalchemy import select, text
+from sqlalchemy import insert, select, text
+from sqlalchemy.engine import CursorResult
 
 from opsalert.model import Alert, AlertCondition
 from opsalert.signature import condition_signature, normalize_message, render_template
@@ -200,7 +201,8 @@ async def _upsert_condition(session: "AsyncSession", values: dict[str, Any]) -> 
 
     if dialect == "mysql":
         result = await session.execute(upsert_statement("mysql", values))
-        return result.lastrowid  # type: ignore[attr-defined]
+        assert isinstance(result, CursorResult)
+        return result.lastrowid
 
     if dialect == "sqlite":
         result = await session.execute(upsert_statement("sqlite", values))
@@ -209,8 +211,11 @@ async def _upsert_condition(session: "AsyncSession", values: dict[str, Any]) -> 
     from sqlalchemy.exc import IntegrityError
 
     try:
-        result = await session.execute(AlertCondition.__table__.insert().values(**values))  # type: ignore[attr-defined]
-        return result.inserted_primary_key[0]  # type: ignore[attr-defined]
+        result = await session.execute(insert(AlertCondition).values(**values))
+        assert isinstance(result, CursorResult)
+        pk = result.inserted_primary_key
+        assert pk is not None
+        return pk[0]
     except IntegrityError:
         return await session.scalar(
             select(AlertCondition.id).where(
