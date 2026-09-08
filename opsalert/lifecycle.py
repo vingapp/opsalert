@@ -27,6 +27,7 @@ host app's alembic migrations, not by this package's ``ensure_tables``
 migration before running this version, since ``select(AlertCondition)``
 selects every mapped column and a missing column fails the query outright.
 """
+
 import json
 import logging
 from datetime import UTC, datetime, timedelta
@@ -272,13 +273,10 @@ async def _adopt_orphans(session, *, now: datetime, batch_size: int = 500) -> in
                         parts = []
 
                     # Reconstruct the signature from stored parts
-                    payload = "\x1f".join(
-                        str(p).replace("\x1f", " ") for p in parts
-                    )
+                    payload = "\x1f".join(str(p).replace("\x1f", " ") for p in parts)
                     import hashlib
-                    signature_key = hashlib.sha256(
-                        payload.encode("utf-8")
-                    ).hexdigest()
+
+                    signature_key = hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
                     kind = row.kind or (parts[1] if len(parts) > 1 else None)
                     msg_template = kind if kind else (row.message or "")[:500]
@@ -311,9 +309,9 @@ async def _adopt_orphans(session, *, now: datetime, batch_size: int = 500) -> in
                     # Normalizing the rendered message is only for old rows that
                     # never carried one — and for those, message == what the emit
                     # path normalized, so the identities still agree.
-                    template = _context_str(
-                        context, TEMPLATE_CONTEXT_KEY
-                    ) or normalize_message(row.message or "")
+                    template = _context_str(context, TEMPLATE_CONTEXT_KEY) or normalize_message(
+                        row.message or ""
+                    )
                     signature_key = condition_signature(
                         row.category, row.source, environment, template
                     )
@@ -479,7 +477,10 @@ async def _fold_new_occurrences(session, *, horizon: datetime) -> tuple[int, int
         )
         # Fold release strings from occurrence context — only new rows.
         await _fold_release(
-            session, condition, horizon=horizon, prev_watermark=prev_watermark,
+            session,
+            condition,
+            horizon=horizon,
+            prev_watermark=prev_watermark,
         )
         # Only rows we actually counted move the watermark, and every one of
         # them is older than the lag horizon — so no in-flight row can be
@@ -492,9 +493,7 @@ async def _fold_new_occurrences(session, *, horizon: datetime) -> tuple[int, int
     return updated, counted
 
 
-async def _peak_15m_count(
-    session, *, condition_id: int, before: datetime
-) -> int:
+async def _peak_15m_count(session, *, condition_id: int, before: datetime) -> int:
     """Max occurrence count in any 15-minute bucket in the 24 h before ``before``.
 
     Buckets occurrences by 15-minute intervals and returns the highest count.
@@ -502,14 +501,18 @@ async def _peak_15m_count(
     """
     window_start = before - timedelta(hours=24)
     stamps = (
-        await session.execute(
-            select(Alert.created).where(
-                Alert.condition_id == condition_id,
-                Alert.created >= window_start,
-                Alert.created <= before,
+        (
+            await session.execute(
+                select(Alert.created).where(
+                    Alert.condition_id == condition_id,
+                    Alert.created >= window_start,
+                    Alert.created <= before,
+                )
             )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
 
     if not stamps:
         return 0
@@ -542,20 +545,22 @@ async def _median_interval(session, *, condition_id: int, horizon: datetime) -> 
     caller falls back to the auto-close floor.
     """
     stamps = (
-        await session.execute(
-            select(Alert.created)
-            .where(Alert.condition_id == condition_id, Alert.created < horizon)
-            .order_by(Alert.id.desc())
-            .limit(MEDIAN_SAMPLE + 1)
+        (
+            await session.execute(
+                select(Alert.created)
+                .where(Alert.condition_id == condition_id, Alert.created < horizon)
+                .order_by(Alert.id.desc())
+                .limit(MEDIAN_SAMPLE + 1)
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     if len(stamps) < 2:
         return None
 
     ordered = sorted(_naive(s) for s in stamps if s is not None)
-    gaps = sorted(
-        (ordered[i + 1] - ordered[i]).total_seconds() for i in range(len(ordered) - 1)
-    )
+    gaps = sorted((ordered[i + 1] - ordered[i]).total_seconds() for i in range(len(ordered) - 1))
     middle = len(gaps) // 2
     median = gaps[middle] if len(gaps) % 2 else (gaps[middle - 1] + gaps[middle]) / 2
     return int(median)
@@ -731,7 +736,8 @@ async def _escalate_acknowledged(session, *, now: datetime) -> int:
             ack_subject_count = condition.acknowledged_subject_count
             if ack_subject_count is not None:
                 current_subject_count = await distinct_subjects(
-                    session, condition.id,
+                    session,
+                    condition.id,
                     since=(now - timedelta(days=365 * 10)).date(),
                 )
                 new_subjects = current_subject_count - ack_subject_count
@@ -755,16 +761,12 @@ async def _escalate_acknowledged(session, *, now: datetime) -> int:
                 )
         # Rule 5: lease expiry.
         if note is None and condition.acknowledged_until is not None:
-                until = _naive(condition.acknowledged_until)
-                naive_now = _naive(now)
-                last_seen = _naive(condition.last_seen)
-                naive_ack_at = _naive(ack_at)
-                if (
-                    naive_now > until
-                    and last_seen is not None
-                    and last_seen > naive_ack_at
-                ):
-                    note = "reopened: acknowledgement lease expired while still firing"
+            until = _naive(condition.acknowledged_until)
+            naive_now = _naive(now)
+            last_seen = _naive(condition.last_seen)
+            naive_ack_at = _naive(ack_at)
+            if naive_now > until and last_seen is not None and last_seen > naive_ack_at:
+                note = "reopened: acknowledgement lease expired while still firing"
 
         if note is None:
             continue
@@ -836,8 +838,10 @@ async def _auto_close_resolved(session, *, now: datetime) -> int:
     closed = 0
     reference_now = _naive(now)
     for condition in candidates:
-        last = _naive(condition.last_seen) or _naive(condition.resolved_at) or _naive(
-            condition.status_changed_at
+        last = (
+            _naive(condition.last_seen)
+            or _naive(condition.resolved_at)
+            or _naive(condition.status_changed_at)
         )
         if last is None:
             continue
@@ -857,11 +861,7 @@ async def _auto_stale_new(session, *, now: datetime) -> int:
     reopens it, so a mistimed close costs one sweep of silence, not an alert.
     """
     candidates = (
-        (
-            await session.execute(
-                select(AlertCondition).where(AlertCondition.status == STATUS_NEW)
-            )
-        )
+        (await session.execute(select(AlertCondition).where(AlertCondition.status == STATUS_NEW)))
         .scalars()
         .all()
     )
@@ -874,9 +874,7 @@ async def _auto_stale_new(session, *, now: datetime) -> int:
         condition.status = STATUS_CLOSED
         condition.closed_at = now
         condition.status_changed_at = now
-        condition.notes = _append_note(
-            condition.notes, "auto-closed: no occurrence in 30 days"
-        )
+        condition.notes = _append_note(condition.notes, "auto-closed: no occurrence in 30 days")
         staled += 1
     return staled
 
@@ -909,11 +907,7 @@ def subject_upsert_statement(dialect: str, values: dict[str, Any]):
 
     from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-    return (
-        sqlite_insert(AlertConditionSubject)
-        .values(**values)
-        .on_conflict_do_nothing()
-    )
+    return sqlite_insert(AlertConditionSubject).values(**values).on_conflict_do_nothing()
 
 
 async def record_subjects(
@@ -944,8 +938,7 @@ async def record_subjects(
 async def distinct_subjects(session, condition_id: int, *, since) -> int:
     """Count distinct (subject_kind, subject_key) pairs for a condition since ``since``."""
     result = await session.scalar(
-        select(func.count())
-        .select_from(
+        select(func.count()).select_from(
             select(AlertConditionSubject.subject_kind, AlertConditionSubject.subject_key)
             .where(
                 AlertConditionSubject.condition_id == condition_id,
@@ -1044,11 +1037,15 @@ async def set_status(
 
         # Stamp the peak 15-minute occurrence count in the 24 h before ack.
         condition.acknowledged_peak_15m = await _peak_15m_count(
-            session, condition_id=condition.id, before=now,
+            session,
+            condition_id=condition.id,
+            before=now,
         )
         # Stamp the distinct subject count at ack time.
         condition.acknowledged_subject_count = await distinct_subjects(
-            session, condition.id, since=(now - timedelta(days=365 * 10)).date(),
+            session,
+            condition.id,
+            since=(now - timedelta(days=365 * 10)).date(),
         )
         # Stamp the release at ack time.
         condition.acknowledged_release = condition.last_seen_release

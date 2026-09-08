@@ -1,4 +1,5 @@
 """Tests for TTL cleanup."""
+
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select
@@ -98,9 +99,7 @@ class TestCleanupPreservesConditionHistory:
         condition = (await session.execute(select(AlertCondition))).scalar_one()
         return condition, alert
 
-    async def test_counters_survive_the_occurrences_they_counted(
-        self, session, session_factory
-    ):
+    async def test_counters_survive_the_occurrences_they_counted(self, session, session_factory):
         opsalert.configure(session_factory=session_factory, retention_max_age_days=30)
         condition, _ = await self._counted_condition(session, age_days=45)
         first_seen, last_seen = condition.first_seen, condition.last_seen
@@ -127,9 +126,7 @@ class TestCleanupPreservesConditionHistory:
         opsalert.configure(session_factory=session_factory, retention_max_age_days=30)
         condition, old = await self._counted_condition(session, age_days=45)
 
-        stranded = await fire_alert(
-            session, severity="error", category="cat", message="boom"
-        )
+        stranded = await fire_alert(session, severity="error", category="cat", message="boom")
         stranded.created = datetime.now(UTC) - timedelta(days=44)
         await session.commit()
         assert stranded.id > condition.stats_synced_through
@@ -146,9 +143,7 @@ class TestCleanupPreservesConditionHistory:
     ):
         opsalert.configure(session_factory=session_factory, retention_max_age_days=30)
         condition, _ = await self._counted_condition(session, age_days=45)
-        stranded = await fire_alert(
-            session, severity="error", category="cat", message="boom"
-        )
+        stranded = await fire_alert(session, severity="error", category="cat", message="boom")
         stranded.created = datetime.now(UTC) - timedelta(days=44)
         await session.commit()
 
@@ -218,9 +213,7 @@ class TestReapEmptyConditions:
         """It may belong to a fire that is still in flight."""
         opsalert.configure(session_factory=session_factory)
         session.add(
-            _empty_condition(
-                signature_key="s1", created=datetime.now(UTC) - timedelta(minutes=5)
-            )
+            _empty_condition(signature_key="s1", created=datetime.now(UTC) - timedelta(minutes=5))
         )
         await session.commit()
 
@@ -285,13 +278,9 @@ class TestReapEmptyConditions:
         assert {c.signature_key for c in kept} == {"s1", "s2", "s3"}
 
     async def test_reap_age_is_configurable(self, session, session_factory):
-        opsalert.configure(
-            session_factory=session_factory, condition_empty_reap_minutes=10
-        )
+        opsalert.configure(session_factory=session_factory, condition_empty_reap_minutes=10)
         session.add(
-            _empty_condition(
-                signature_key="s1", created=datetime.now(UTC) - timedelta(minutes=30)
-            )
+            _empty_condition(signature_key="s1", created=datetime.now(UTC) - timedelta(minutes=30))
         )
         await session.commit()
 

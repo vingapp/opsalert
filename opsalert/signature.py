@@ -13,6 +13,7 @@ uuids, long hex ids, quoted literals — and leaves everything else alone.
 Emit sites that need more (an opaque url slug, say) migrate to ``params``,
 where identity is exact rather than guessed.
 """
+
 import hashlib
 import logging
 import re
@@ -161,9 +162,7 @@ def build_exception_chain(
             seen.add(id(current))
             name = _exc_label(current)
             chain.append(name)
-            current = getattr(current, "__cause__", None) or getattr(
-                current, "__context__", None
-            )
+            current = getattr(current, "__cause__", None) or getattr(current, "__context__", None)
         # Innermost first — the chain is built outer→inner, reverse it
         chain.reverse()
         return chain
@@ -233,9 +232,7 @@ def extract_origin_frame(
             if id(innermost) in seen:
                 break
             seen.add(id(innermost))
-            cause = getattr(innermost, "__cause__", None) or getattr(
-                innermost, "__context__", None
-            )
+            cause = getattr(innermost, "__cause__", None) or getattr(innermost, "__context__", None)
             if cause is None:
                 break
             innermost = cause
@@ -268,9 +265,7 @@ def extract_origin_frame(
         return ""
 
 
-def _is_in_app(
-    module: str, filename: str, in_app_prefixes: tuple[str, ...]
-) -> bool:
+def _is_in_app(module: str, filename: str, in_app_prefixes: tuple[str, ...]) -> bool:
     """Check if a frame is in-app."""
     if in_app_prefixes:
         return any(module.startswith(prefix) for prefix in in_app_prefixes)

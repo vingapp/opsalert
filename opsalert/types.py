@@ -1,4 +1,5 @@
 """Core types — severity levels and message dataclass."""
+
 from dataclasses import dataclass
 from enum import StrEnum
 

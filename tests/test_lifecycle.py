@@ -3,6 +3,7 @@
 Covers A4 (acknowledged), A5 (auto-close/auto-stale/reopen) and the stats
 half of A6 (the watermark must never run ahead of what was counted).
 """
+
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -25,8 +26,9 @@ from opsalert.store import fire_alert
 LONG_AGO = timedelta(minutes=10)
 
 
-async def _fire_backdated(session, *, age=LONG_AGO, severity="error", category="cat",
-                          message="boom", now=None):
+async def _fire_backdated(
+    session, *, age=LONG_AGO, severity="error", category="cat", message="boom", now=None
+):
     """Fire an occurrence and age it past the stats lag window."""
     alert = await fire_alert(session, severity=severity, category=category, message=message)
     alert.created = (now or datetime.now(UTC)) - age
@@ -95,9 +97,7 @@ class TestStatsWatermark:
         assert condition.stats_synced_through < fresh.id
         assert condition.occurrence_count == 1
 
-    async def test_worst_severity_is_kept_and_latest_severity_tracks_the_newest(
-        self, session
-    ):
+    async def test_worst_severity_is_kept_and_latest_severity_tracks_the_newest(self, session):
         now = datetime.now(UTC)
         await _fire_backdated(session, severity="critical", age=timedelta(minutes=30), now=now)
         await _fire_backdated(session, severity="warn", age=timedelta(minutes=10), now=now)
@@ -330,9 +330,7 @@ class TestAdoptionIdentity:
         orphan = (await session.execute(select(Alert))).scalar_one()
         assert orphan.condition_id == condition.id
 
-    async def test_old_style_orphan_falls_back_to_the_normalized_message(
-        self, session
-    ):
+    async def test_old_style_orphan_falls_back_to_the_normalized_message(self, session):
         """A row that predates the stored template still adopts, by normalizer."""
         from opsalert.signature import normalize_message
 
@@ -379,9 +377,7 @@ class TestAutomaticRules:
 
     async def test_the_six_hour_floor_holds_for_a_chatty_condition(self, session):
         """A condition that fires every second must not close over lunch."""
-        condition = await self._resolved_condition(
-            session, silent_for=timedelta(hours=3), median=1
-        )
+        condition = await self._resolved_condition(session, silent_for=timedelta(hours=3), median=1)
         assert AUTO_CLOSE_FLOOR == timedelta(hours=6)
         await apply_lifecycle_rules(session)
         await session.commit()
@@ -457,7 +453,9 @@ class TestHumanTransitions:
         """P8 — a state change nobody can attribute is not an audit trail."""
         condition = await self._condition(session)
         before = datetime.now(UTC)
-        await set_status(session, condition, "acknowledged", actor="chris", issue_url="https://github.com/test/1")
+        await set_status(
+            session, condition, "acknowledged", actor="chris", issue_url="https://github.com/test/1"
+        )
         await session.commit()
 
         assert condition.status == "acknowledged"
@@ -484,7 +482,9 @@ class TestHumanTransitions:
     async def test_reopening_clears_a_stale_acknowledgement(self, session):
         """The person who acknowledged the last episode has not seen this one."""
         condition = await self._condition(session)
-        await set_status(session, condition, "acknowledged", actor="chris", issue_url="https://github.com/test/1")
+        await set_status(
+            session, condition, "acknowledged", actor="chris", issue_url="https://github.com/test/1"
+        )
         await set_status(session, condition, "new", actor="chris")
         await session.commit()
 
@@ -504,7 +504,13 @@ class TestHumanTransitions:
 
     async def test_status_can_be_set_by_id(self, session):
         condition = await self._condition(session)
-        await set_status(session, condition.id, "acknowledged", actor="chris", issue_url="https://github.com/test/1")
+        await set_status(
+            session,
+            condition.id,
+            "acknowledged",
+            actor="chris",
+            issue_url="https://github.com/test/1",
+        )
         assert condition.status == "acknowledged"
 
     async def test_an_unknown_disposition_is_refused(self, session):
@@ -539,7 +545,14 @@ class TestAckEscalation:
         compare the current state against and can never fire."""
         now = datetime.now(UTC)
         condition = await self._synced_condition(session, occurrences=3, severity="warn", now=now)
-        await set_status(session, condition, "acknowledged", actor="chris", now=now, issue_url="https://github.com/test/1")
+        await set_status(
+            session,
+            condition,
+            "acknowledged",
+            actor="chris",
+            now=now,
+            issue_url="https://github.com/test/1",
+        )
         await session.commit()
 
         assert condition.acknowledged_severity == "warn"
@@ -566,7 +579,14 @@ class TestAckEscalation:
         comparing new occurrences against a stale count/severity forever."""
         now = datetime.now(UTC)
         condition = await self._synced_condition(session, occurrences=1, severity="warn", now=now)
-        await set_status(session, condition, "acknowledged", actor="chris", now=now, issue_url="https://github.com/test/1")
+        await set_status(
+            session,
+            condition,
+            "acknowledged",
+            actor="chris",
+            now=now,
+            issue_url="https://github.com/test/1",
+        )
         await session.commit()
         assert condition.acknowledged_occurrence_count == 1
         assert condition.acknowledged_severity == "warn"
@@ -574,7 +594,14 @@ class TestAckEscalation:
         later = now + timedelta(hours=1)
         await _fire_backdated(session, severity="error", age=timedelta(minutes=5), now=later)
         await session.commit()
-        await set_status(session, condition, "acknowledged", actor="chris", now=later, issue_url="https://github.com/test/1")
+        await set_status(
+            session,
+            condition,
+            "acknowledged",
+            actor="chris",
+            now=later,
+            issue_url="https://github.com/test/1",
+        )
         await session.commit()
 
         assert condition.acknowledged_occurrence_count == 2
@@ -585,7 +612,14 @@ class TestAckEscalation:
         after acknowledgement stays silently acknowledged."""
         now = datetime.now(UTC)
         condition = await self._synced_condition(session, occurrences=2, severity="warn", now=now)
-        await set_status(session, condition, "acknowledged", actor="chris", now=now, issue_url="https://github.com/test/1")
+        await set_status(
+            session,
+            condition,
+            "acknowledged",
+            actor="chris",
+            now=now,
+            issue_url="https://github.com/test/1",
+        )
         await session.commit()
 
         later = now + timedelta(minutes=10)
@@ -613,7 +647,14 @@ class TestAckEscalation:
         await sync_condition_stats(session, now=now)
         await session.commit()
         condition = await _the_condition(session)
-        await set_status(session, condition, "acknowledged", actor="chris", now=now, issue_url="https://github.com/test/1")
+        await set_status(
+            session,
+            condition,
+            "acknowledged",
+            actor="chris",
+            now=now,
+            issue_url="https://github.com/test/1",
+        )
         await session.commit()
         assert condition.acknowledged_severity == "error"
 
@@ -639,7 +680,14 @@ class TestAckEscalation:
         await session.commit()
         condition = await _the_condition(session)
         assert condition.occurrence_count == 24
-        await set_status(session, condition, "acknowledged", actor="chris", now=now, issue_url="https://github.com/test/1")
+        await set_status(
+            session,
+            condition,
+            "acknowledged",
+            actor="chris",
+            now=now,
+            issue_url="https://github.com/test/1",
+        )
         await session.commit()
 
         later = now + timedelta(hours=2)
@@ -664,7 +712,14 @@ class TestAckEscalation:
         await sync_condition_stats(session, now=now)
         await session.commit()
         condition = await _the_condition(session)
-        await set_status(session, condition, "acknowledged", actor="chris", now=now, issue_url="https://github.com/test/1")
+        await set_status(
+            session,
+            condition,
+            "acknowledged",
+            actor="chris",
+            now=now,
+            issue_url="https://github.com/test/1",
+        )
         await session.commit()
 
         later = now + timedelta(hours=2)
@@ -688,7 +743,14 @@ class TestAckEscalation:
         await sync_condition_stats(session, now=now)
         await session.commit()
         condition = await _the_condition(session)
-        await set_status(session, condition, "acknowledged", actor="chris", now=now, issue_url="https://github.com/test/1")
+        await set_status(
+            session,
+            condition,
+            "acknowledged",
+            actor="chris",
+            now=now,
+            issue_url="https://github.com/test/1",
+        )
         # Pre-ack peak of 20 → threshold = max(10, 30) = 30.
         condition.acknowledged_peak_15m = 20
         await session.commit()
@@ -705,9 +767,7 @@ class TestAckEscalation:
         assert result["escalated"] == 0
         assert condition.status == "acknowledged"
 
-    async def test_ack_mid_burst_baseline_uses_live_occurrences_not_stale_counter(
-        self, session
-    ):
+    async def test_ack_mid_burst_baseline_uses_live_occurrences_not_stale_counter(self, session):
         """Amendment: ``occurrence_count`` lags a sweep + STATS_LAG_SECONDS.
         Acking mid-burst while that column is still 0 must not baseline at
         0 (which would re-trip on the very next sweep) — the ack-time count
@@ -719,7 +779,14 @@ class TestAckEscalation:
         condition = await _the_condition(session)
         assert condition.occurrence_count == 0  # never synced — the stale value
 
-        await set_status(session, condition, "acknowledged", actor="chris", now=now, issue_url="https://github.com/test/1")
+        await set_status(
+            session,
+            condition,
+            "acknowledged",
+            actor="chris",
+            now=now,
+            issue_url="https://github.com/test/1",
+        )
         await session.commit()
         assert condition.acknowledged_occurrence_count == 12
 
@@ -759,7 +826,14 @@ class TestAckEscalation:
         nobody — collect never wakes anyone regardless of status."""
         now = datetime.now(UTC)
         condition = await self._synced_condition(session, occurrences=1, severity="warn", now=now)
-        await set_status(session, condition, "acknowledged", actor="chris", now=now, issue_url="https://github.com/test/1")
+        await set_status(
+            session,
+            condition,
+            "acknowledged",
+            actor="chris",
+            now=now,
+            issue_url="https://github.com/test/1",
+        )
         await set_disposition(session, condition, "collect", actor="chris")
         await session.commit()
 
@@ -868,7 +942,14 @@ class TestAckEscalation:
         await sync_condition_stats(session, now=now)
         await session.commit()
         condition = await _the_condition(session)
-        await set_status(session, condition, "acknowledged", actor="chris", now=now, issue_url="https://github.com/test/1")
+        await set_status(
+            session,
+            condition,
+            "acknowledged",
+            actor="chris",
+            now=now,
+            issue_url="https://github.com/test/1",
+        )
         # Simulate a pre-migration row: baseline unknowable.
         condition.acknowledged_severity = None
         condition.acknowledged_occurrence_count = None
@@ -938,7 +1019,10 @@ class TestAckRequiresIssue:
         """Providing an issue at ack time satisfies the requirement."""
         condition = await self._condition(session)
         await set_status(
-            session, condition, "acknowledged", actor="chris",
+            session,
+            condition,
+            "acknowledged",
+            actor="chris",
             issue_url="https://github.com/vingapp/opsalert/issues/7",
         )
         await session.commit()
@@ -959,7 +1043,10 @@ class TestAckRequiresIssue:
         now = datetime.now(UTC)
         condition = await self._condition(session)
         await set_status(
-            session, condition, "acknowledged", actor="chris",
+            session,
+            condition,
+            "acknowledged",
+            actor="chris",
             now=now,
             acknowledged_until=now + timedelta(hours=1),
         )
@@ -993,21 +1080,29 @@ class TestBurstPreAckPeak:
         # Background: 1 per hour for 24 hours.
         for h in range(24):
             await _fire_backdated(
-                session, severity="warn",
-                age=timedelta(hours=24 - h), now=now,
+                session,
+                severity="warn",
+                age=timedelta(hours=24 - h),
+                now=now,
             )
         # A burst of 20 in a 15-minute window 12 hours ago = the peak.
         for _ in range(20):
             await _fire_backdated(
-                session, severity="warn",
-                age=timedelta(hours=12, minutes=5), now=now,
+                session,
+                severity="warn",
+                age=timedelta(hours=12, minutes=5),
+                now=now,
             )
         await session.commit()
         await sync_condition_stats(session, now=now)
         await session.commit()
         condition = await _the_condition(session)
         await set_status(
-            session, condition, "acknowledged", actor="chris", now=now,
+            session,
+            condition,
+            "acknowledged",
+            actor="chris",
+            now=now,
             issue_url="https://github.com/test/1",
         )
         await session.commit()
@@ -1019,7 +1114,10 @@ class TestBurstPreAckPeak:
         later = now + timedelta(hours=2)
         for _ in range(28):
             await _fire_backdated(
-                session, severity="warn", age=timedelta(minutes=1), now=later,
+                session,
+                severity="warn",
+                age=timedelta(minutes=1),
+                now=later,
             )
         await session.commit()
         result = await apply_lifecycle_rules(session, now=later + timedelta(minutes=1))
@@ -1032,7 +1130,10 @@ class TestBurstPreAckPeak:
         # max(10, floor(1.5*21)) = 31. Add enough to reach 32 total = 4 more.
         for _ in range(4):
             await _fire_backdated(
-                session, severity="warn", age=timedelta(minutes=1), now=later,
+                session,
+                severity="warn",
+                age=timedelta(minutes=1),
+                now=later,
             )
         await session.commit()
         result2 = await apply_lifecycle_rules(session, now=later + timedelta(minutes=1))
@@ -1045,7 +1146,11 @@ class TestBurstPreAckPeak:
         now = datetime.now(UTC)
         condition = await self._synced_condition(session, occurrences=1, severity="warn", now=now)
         await set_status(
-            session, condition, "acknowledged", actor="chris", now=now,
+            session,
+            condition,
+            "acknowledged",
+            actor="chris",
+            now=now,
             issue_url="https://github.com/test/1",
         )
         await session.commit()
@@ -1053,7 +1158,10 @@ class TestBurstPreAckPeak:
         later = now + timedelta(hours=1)
         for _ in range(9):
             await _fire_backdated(
-                session, severity="warn", age=timedelta(minutes=1), now=later,
+                session,
+                severity="warn",
+                age=timedelta(minutes=1),
+                now=later,
             )
         await session.commit()
         result = await apply_lifecycle_rules(session, now=later + timedelta(minutes=1))
@@ -1075,13 +1183,18 @@ class TestSubjectReopen:
         # Seed some subjects before ack.
         today = now.date()
         await record_subjects(
-            session, condition.id,
+            session,
+            condition.id,
             [("user", f"u{i}") for i in range(n_subjects)],
             today,
         )
         await session.commit()
         await set_status(
-            session, condition, "acknowledged", actor="chris", now=now,
+            session,
+            condition,
+            "acknowledged",
+            actor="chris",
+            now=now,
             issue_url="https://github.com/test/1",
         )
         await session.commit()
@@ -1096,7 +1209,8 @@ class TestSubjectReopen:
         later = now + timedelta(hours=1)
         today = later.date()
         await record_subjects(
-            session, condition.id,
+            session,
+            condition.id,
             [("user", f"new{i}") for i in range(4)],
             today,
         )
@@ -1108,7 +1222,8 @@ class TestSubjectReopen:
 
         # Add 1 more (total 5 new) — SHOULD reopen.
         await record_subjects(
-            session, condition.id,
+            session,
+            condition.id,
             [("user", "new4")],
             today,
         )
@@ -1139,7 +1254,11 @@ class TestRegressionReopen:
         condition.last_seen_release = "v1.0"
         await session.flush()
         await set_status(
-            session, condition, "acknowledged", actor="chris", now=now,
+            session,
+            condition,
+            "acknowledged",
+            actor="chris",
+            now=now,
             issue_url="https://github.com/test/1",
         )
         await session.commit()
@@ -1161,7 +1280,11 @@ class TestRegressionReopen:
         now = datetime.now(UTC)
         condition = await self._synced_condition(session, now=now)
         await set_status(
-            session, condition, "acknowledged", actor="chris", now=now,
+            session,
+            condition,
+            "acknowledged",
+            actor="chris",
+            now=now,
             issue_url="https://github.com/test/1",
         )
         await session.commit()
@@ -1187,7 +1310,8 @@ class TestRecordAndDistinctSubjects:
 
         today = datetime.now(UTC).date()
         await record_subjects(
-            session, condition.id,
+            session,
+            condition.id,
             [("user", "u1"), ("user", "u2"), ("org", "o1")],
             today,
         )
@@ -1204,14 +1328,16 @@ class TestRecordAndDistinctSubjects:
 
         today = datetime.now(UTC).date()
         await record_subjects(
-            session, condition.id,
+            session,
+            condition.id,
             [("user", "u1"), ("user", "u1")],
             today,
         )
         await session.commit()
         # Again — no error.
         await record_subjects(
-            session, condition.id,
+            session,
+            condition.id,
             [("user", "u1")],
             today,
         )
@@ -1230,7 +1356,9 @@ class TestSyncRelease:
 
         now = datetime.now(UTC)
         a1 = Alert(
-            severity="error", category="cat", message="boom",
+            severity="error",
+            category="cat",
+            message="boom",
             context_json=json.dumps({"_release": "v1.0"}),
             created=now - timedelta(hours=2),
         )
@@ -1238,8 +1366,12 @@ class TestSyncRelease:
         await session.flush()
         # Create condition for it.
         from opsalert.store import fire_alert
+
         a2 = await fire_alert(
-            session, severity="error", category="cat", message="boom",
+            session,
+            severity="error",
+            category="cat",
+            message="boom",
             context={"_release": "v2.0"},
         )
         a2.created = now - timedelta(minutes=10)
@@ -1260,9 +1392,7 @@ class TestReopenedDeliveredImmediately:
     """#11: a reopened condition is delivered immediately, regardless of
     severity or disposition."""
 
-    async def test_reopened_warn_digest_delivered_immediately(
-        self, session, session_factory
-    ):
+    async def test_reopened_warn_digest_delivered_immediately(self, session, session_factory):
         """A WARN condition with digest disposition that reopens must still
         deliver immediately — a recurrence of something thought fixed is not
         a digest item."""
@@ -1294,10 +1424,14 @@ class TestReopenedDeliveredImmediately:
         condition = await _the_condition(session)
         await set_disposition(session, condition, "digest")
         await set_status(
-            session, condition, "resolved", actor="chris",
+            session,
+            condition,
+            "resolved",
+            actor="chris",
         )
         # Mark existing occurrences as notified.
         from sqlalchemy import update
+
         await session.execute(update(Alert).values(notified=True))
         await session.commit()
 
@@ -1319,26 +1453,34 @@ class TestSubjectUpsertDialects:
     def test_mysql_compiles_to_on_duplicate_key(self):
         from opsalert.lifecycle import subject_upsert_statement
 
-        stmt = subject_upsert_statement("mysql", {
-            "condition_id": 1,
-            "subject_kind": "user",
-            "subject_key": "u1",
-            "day": datetime.now(UTC).date(),
-        })
+        stmt = subject_upsert_statement(
+            "mysql",
+            {
+                "condition_id": 1,
+                "subject_kind": "user",
+                "subject_key": "u1",
+                "day": datetime.now(UTC).date(),
+            },
+        )
         from sqlalchemy.dialects import mysql
+
         compiled = str(stmt.compile(dialect=mysql.dialect()))
         assert "ON DUPLICATE KEY" in compiled
 
     def test_sqlite_compiles_to_on_conflict(self):
         from opsalert.lifecycle import subject_upsert_statement
 
-        stmt = subject_upsert_statement("sqlite", {
-            "condition_id": 1,
-            "subject_kind": "user",
-            "subject_key": "u1",
-            "day": datetime.now(UTC).date(),
-        })
+        stmt = subject_upsert_statement(
+            "sqlite",
+            {
+                "condition_id": 1,
+                "subject_kind": "user",
+                "subject_key": "u1",
+                "day": datetime.now(UTC).date(),
+            },
+        )
         from sqlalchemy.dialects import sqlite
+
         compiled = str(stmt.compile(dialect=sqlite.dialect()))
         assert "ON CONFLICT" in compiled
 
@@ -1351,6 +1493,7 @@ class TestDeliveryStateUpsertDialects:
 
         stmt = delivery_state_upsert_statement("mysql", datetime.now(UTC))
         from sqlalchemy.dialects import mysql
+
         compiled = str(stmt.compile(dialect=mysql.dialect()))
         assert "ON DUPLICATE KEY" in compiled
 
@@ -1359,6 +1502,7 @@ class TestDeliveryStateUpsertDialects:
 
         stmt = delivery_state_upsert_statement("sqlite", datetime.now(UTC))
         from sqlalchemy.dialects import sqlite
+
         compiled = str(stmt.compile(dialect=sqlite.dialect()))
         assert "ON CONFLICT" in compiled
 
@@ -1374,7 +1518,10 @@ class TestFoldReleaseNoRescan:
         """
         now = datetime.now(UTC)
         a = await fire_alert(
-            session, severity="error", category="cat", message="boom",
+            session,
+            severity="error",
+            category="cat",
+            message="boom",
             context={"_release": "v1.0"},
         )
         a.created = now - timedelta(minutes=10)
@@ -1405,7 +1552,10 @@ class TestFoldReleaseNoRescan:
         but not first_seen_release."""
         now = datetime.now(UTC)
         a = await fire_alert(
-            session, severity="error", category="cat", message="boom",
+            session,
+            severity="error",
+            category="cat",
+            message="boom",
             context={"_release": "v1.0"},
         )
         a.created = now - timedelta(minutes=20)
@@ -1421,7 +1571,10 @@ class TestFoldReleaseNoRescan:
 
         # New occurrence with different release.
         b = await fire_alert(
-            session, severity="error", category="cat", message="boom",
+            session,
+            severity="error",
+            category="cat",
+            message="boom",
             context={"_release": "v2.0"},
         )
         b.created = now - timedelta(minutes=5)
@@ -1451,7 +1604,10 @@ class TestRegressionFullFlow:
 
         # Fire and sync — condition gets last_seen_release = "v1.0".
         a = await fire_alert(
-            session, severity="error", category="cat", message="regressor",
+            session,
+            severity="error",
+            category="cat",
+            message="regressor",
             context={"_release": "v1.0"},
         )
         a.created = now - timedelta(minutes=20)
@@ -1462,16 +1618,18 @@ class TestRegressionFullFlow:
 
         condition = (
             await session.execute(
-                select(AlertCondition).where(
-                    AlertCondition.message_template == "regressor"
-                )
+                select(AlertCondition).where(AlertCondition.message_template == "regressor")
             )
         ).scalar_one()
         assert condition.last_seen_release == "v1.0"
 
         # Ack — stamps acknowledged_release = "v1.0".
         await set_status(
-            session, condition, "acknowledged", actor="chris", now=now,
+            session,
+            condition,
+            "acknowledged",
+            actor="chris",
+            now=now,
             issue_url="https://github.com/test/1",
         )
         await session.commit()
@@ -1480,7 +1638,10 @@ class TestRegressionFullFlow:
         # New occurrence at release B.
         later = now + timedelta(hours=1)
         b = await fire_alert(
-            session, severity="error", category="cat", message="regressor",
+            session,
+            severity="error",
+            category="cat",
+            message="regressor",
             context={"_release": "v2.0"},
         )
         b.created = later - timedelta(minutes=5)

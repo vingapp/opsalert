@@ -4,6 +4,7 @@ The contract under test is the uncomfortable one: conditionization is
 bookkeeping, and bookkeeping must never cost an alert. Every failure mode
 here ends with the occurrence stored and the caller unharmed.
 """
+
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -142,9 +143,7 @@ class TestUpsertStatements:
     def test_mysql_returns_the_existing_id_on_a_duplicate(self):
         from sqlalchemy.dialects import mysql
 
-        sql = str(
-            store.upsert_statement("mysql", self._values()).compile(dialect=mysql.dialect())
-        )
+        sql = str(store.upsert_statement("mysql", self._values()).compile(dialect=mysql.dialect()))
         assert "ON DUPLICATE KEY UPDATE" in sql
         assert "LAST_INSERT_ID(id)" in sql
 
@@ -199,9 +198,7 @@ class TestIsolatedResolution:
         # The occurrence rode the caller's transaction and went with it.
         assert (await session.execute(select(Alert))).scalars().all() == []
 
-    async def test_isolated_failure_degrades_to_a_null_condition(
-        self, session, monkeypatch
-    ):
+    async def test_isolated_failure_degrades_to_a_null_condition(self, session, monkeypatch):
         """A broken factory costs the grouping, not the alert (F1)."""
 
         def _broken_factory():
@@ -248,9 +245,7 @@ class TestStructuredParams:
         assert conditions[0].message_template == (
             "PUT /api/view/shares/{stub}/ exceeded its budget"
         )
-        messages = {
-            a.message for a in (await session.execute(select(Alert))).scalars().all()
-        }
+        messages = {a.message for a in (await session.execute(select(Alert))).scalars().all()}
         assert messages == {
             "PUT /api/view/shares/ChFICzP9VHlILNzd/ exceeded its budget",
             "PUT /api/view/shares/VHppTliH5Pr97ZJ9/ exceeded its budget",
@@ -347,9 +342,7 @@ class TestResolutionFailureIsSurvivable:
         await session.commit()
 
         assert alert.condition_id is None
-        messages = {
-            a.message for a in (await session.execute(select(Alert))).scalars().all()
-        }
+        messages = {a.message for a in (await session.execute(select(Alert))).scalars().all()}
         assert messages == {"work in progress", "still alive?"}
 
     async def test_resolution_failure_never_reaches_the_caller(self, session, monkeypatch):

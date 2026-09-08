@@ -1,4 +1,5 @@
 """Tests for alert delivery — immediate, throttled, and digest."""
+
 import json
 from datetime import UTC, datetime, timedelta
 
@@ -149,9 +150,7 @@ class TestDeliverImmediate:
         noisy.notified = True
         noisy.created = datetime.now(UTC) - timedelta(minutes=5)
         await fire_alert(session, severity="error", category="cat", message="known boom")
-        await fire_alert(
-            session, severity="error", category="cat", message="never seen before"
-        )
+        await fire_alert(session, severity="error", category="cat", message="never seen before")
         await session.commit()
 
         stats = await deliver_alerts(session)
@@ -336,9 +335,7 @@ class TestDeliverNoTransport:
         with pytest.raises(RuntimeError, match="delivery configured without a transport"):
             await _deliver_immediate(session, [], "to@x", "from@x", "Test", 60)
 
-    async def test_internal_deliver_digest_raises_without_transport(
-        self, session, session_factory
-    ):
+    async def test_internal_deliver_digest_raises_without_transport(self, session, session_factory):
         """_deliver_digest raises RuntimeError when transport is None."""
         from opsalert.delivery import _deliver_digest
 
@@ -346,9 +343,7 @@ class TestDeliverNoTransport:
         with pytest.raises(RuntimeError, match="delivery configured without a transport"):
             await _deliver_digest(session, [], "to@x", "from@x", "Test")
 
-    async def test_internal_deliver_legacy_raises_without_transport(
-        self, session, session_factory
-    ):
+    async def test_internal_deliver_legacy_raises_without_transport(self, session, session_factory):
         """_deliver_immediate_legacy raises RuntimeError when transport is None."""
         from opsalert.delivery import _deliver_immediate_legacy
 
@@ -381,9 +376,7 @@ class TestSentMarkDurability:
     the moment its send succeeds.
     """
 
-    async def test_mark_survives_failure_later_in_the_sweep(
-        self, session, session_factory
-    ):
+    async def test_mark_survives_failure_later_in_the_sweep(self, session, session_factory):
         transport = _ExplodeAfterFirstTransport()
         opsalert.configure(
             session_factory=session_factory,
@@ -409,9 +402,7 @@ class TestSentMarkDurability:
         # Read through a FRESH session: the delivered category's mark must
         # have been committed before the sweep blew up.
         async with session_factory() as fresh:
-            result = await fresh.execute(
-                select(Alert).where(Alert.category == delivered_category)
-            )
+            result = await fresh.execute(select(Alert).where(Alert.category == delivered_category))
             for alert in result.scalars():
                 assert alert.notified is True, (
                     f"notified mark for delivered category {delivered_category!r} "
@@ -422,9 +413,7 @@ class TestSentMarkDurability:
 class TestDigestInterval:
     """#10: _deliver_digest sends only when enough time has passed."""
 
-    async def test_digest_respects_interval_across_two_sweeps(
-        self, session, session_factory
-    ):
+    async def test_digest_respects_interval_across_two_sweeps(self, session, session_factory):
         """Two consecutive sweeps with a short interval: the second is suppressed
         because last_digest_sent_at is too recent."""
         transport = _TrackingTransport()
@@ -524,6 +513,7 @@ class TestPayloadShape:
             def __enter__(self):
                 class _Resp:
                     status = 200
+
                 return _Resp()
 
             def __exit__(self, *_a):
@@ -539,6 +529,7 @@ class TestPayloadShape:
         urllib.request.urlopen = fake_urlopen
         try:
             from opsalert.transport import WebhookTransport
+
             transport = WebhookTransport("http://localhost:9093/api/v2/alerts")
             payload = {
                 "version": "4",

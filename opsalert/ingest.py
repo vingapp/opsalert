@@ -8,6 +8,7 @@ counted sample, or a counted drop, and every event is a JSON log line.
 
 No event-loop imports in this module. The writer thread uses sync SQLAlchemy only.
 """
+
 from __future__ import annotations
 
 import atexit
@@ -422,9 +423,7 @@ def _writer_loop() -> None:
             while True:
                 try:
                     with engine.connect() as conn:
-                        result = write_batch(
-                            conn, batch, drops_snapshot, datetime.now(UTC)
-                        )
+                        result = write_batch(conn, batch, drops_snapshot, datetime.now(UTC))
                         conn.commit()
 
                     # Success — update totals
@@ -453,7 +452,7 @@ def _writer_loop() -> None:
                     # etc.) but not permanent ones (bad SQL, constraint
                     # violation, data type mismatch).
                     is_retryable = isinstance(exc, DBAPIError) and not isinstance(
-                        exc, (IntegrityError, ProgrammingError, DataError)
+                        exc, IntegrityError | ProgrammingError | DataError
                     )
 
                     if is_retryable and cumulative_retry < max_retry_s and _generation == my_gen:
@@ -464,8 +463,7 @@ def _writer_loop() -> None:
 
                     # Max retries exceeded or non-operational error — drop
                     logger.error(
-                        "opsalert.ingest: batch write failed after %.1fs; "
-                        "dropping %d events",
+                        "opsalert.ingest: batch write failed after %.1fs; " "dropping %d events",
                         cumulative_retry,
                         len(batch),
                         exc_info=True,
@@ -487,9 +485,7 @@ def _writer_loop() -> None:
                         if len(_queue) >= cfg.ingest_queue_max:
                             _evict_one()
                         _queue.appendleft(ev)
-                        _per_fp[ev.signature_key] = (
-                            _per_fp.get(ev.signature_key, 0) + 1
-                        )
+                        _per_fp[ev.signature_key] = _per_fp.get(ev.signature_key, 0) + 1
             # Thread exits; next enqueue starts a new one
             _check_flush_done()
             break
@@ -550,7 +546,7 @@ def write_batch(
         last_inserted_id = None
         group_sampled = 0
         group_attempted = 0  # inserts attempted (sampled_in events)
-        group_inserted = 0   # inserts that succeeded (not duplicate)
+        group_inserted = 0  # inserts that succeeded (not duplicate)
         max_ts = group[0].ts
 
         for ev in group:
@@ -624,6 +620,7 @@ def write_batch(
                     for subject_kind, subject_key in ev.subjects:
                         try:
                             from opsalert.lifecycle import subject_upsert_statement
+
                             stmt = subject_upsert_statement(
                                 conn.dialect.name,
                                 {
@@ -635,9 +632,7 @@ def write_batch(
                             )
                             conn.execute(stmt)
                         except Exception:
-                            logger.exception(
-                                "opsalert.ingest: subject recording failed"
-                            )
+                            logger.exception("opsalert.ingest: subject recording failed")
 
     # Handle drops
     for fp, dr in drops.items():
@@ -739,10 +734,24 @@ def _build_event_json(event: Event) -> str | None:
 
     # Extra — remaining context keys not already captured
     _reserved = {
-        "_caller", "_emit_site", "_exc_type", "_exc_message", "_traceback",
-        "_frames", "_exception_chain", "_trace_id", "_trace_origin",
-        "_user_id", "_org_id", "_task_name", "_task_id", "_release",
-        "_message_template", "_span_id", "_session_id", "_identifier_hash",
+        "_caller",
+        "_emit_site",
+        "_exc_type",
+        "_exc_message",
+        "_traceback",
+        "_frames",
+        "_exception_chain",
+        "_trace_id",
+        "_trace_origin",
+        "_user_id",
+        "_org_id",
+        "_task_name",
+        "_task_id",
+        "_release",
+        "_message_template",
+        "_span_id",
+        "_session_id",
+        "_identifier_hash",
         "environment",
     }
     extra = {k: v for k, v in ctx.items() if k not in _reserved}

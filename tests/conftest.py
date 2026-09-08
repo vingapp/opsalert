@@ -1,4 +1,5 @@
 """Test fixtures — in-memory SQLite async session."""
+
 from contextlib import asynccontextmanager
 
 import pytest

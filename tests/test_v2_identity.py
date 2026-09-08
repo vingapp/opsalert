@@ -6,6 +6,7 @@ subject-per-event recording, and the lint helper.
 
 Written BEFORE the implementation; they must fail on unmodified code.
 """
+
 import json
 import uuid
 from datetime import UTC, datetime
@@ -188,9 +189,9 @@ class TestSubjectPerEvent:
                 text("SELECT COUNT(*) FROM alert_condition_subject")
             ).scalar()
 
-        assert subject_count >= 2, (
-            f"expected subjects for BOTH events (including sampled-out), got {subject_count}"
-        )
+        assert (
+            subject_count >= 2
+        ), f"expected subjects for BOTH events (including sampled-out), got {subject_count}"
         engine.dispose()
 
 
@@ -217,9 +218,7 @@ class TestEventJsonShape:
         flush(timeout=5.0)
 
         with engine.connect() as conn:
-            row = conn.execute(
-                text("SELECT event_json FROM opsalert LIMIT 1")
-            ).fetchone()
+            row = conn.execute(text("SELECT event_json FROM opsalert LIMIT 1")).fetchone()
 
         assert row is not None, "expected an alert row"
         assert row[0] is not None, "event_json must not be NULL"
@@ -363,11 +362,14 @@ class TestConditionSearchMatchesKind:
         await session.commit()
 
         from opsalert.lifecycle import sync_condition_stats
+
         await sync_condition_stats(session)
         await session.commit()
 
         items, total, _ = await query_conditions(
-            session, search="db_timeout", environment=None,
+            session,
+            search="db_timeout",
+            environment=None,
         )
         assert total >= 1
         match = [c for c in items if c.get("kind") == "searchable.db_timeout"]
@@ -545,10 +547,7 @@ class TestFingerprintV2:
         src_dir = tmp_path / "src"
         src_dir.mkdir()
         mod_file = src_dir / "thing.py"
-        mod_file.write_text(
-            "def do_raise():\n"
-            "    raise ValueError('boom from tmpmod.thing')\n"
-        )
+        mod_file.write_text("def do_raise():\n" "    raise ValueError('boom from tmpmod.thing')\n")
 
         spec = importlib.util.spec_from_file_location("tmpmod.thing", str(mod_file))
         mod = importlib.util.module_from_spec(spec)
@@ -559,9 +558,9 @@ class TestFingerprintV2:
                 mod.do_raise()
             except ValueError as e:
                 origin = extract_origin_frame(e, in_app_prefixes=("tmpmod.",))
-                assert origin == "tmpmod.thing:do_raise", (
-                    f"expected 'tmpmod.thing:do_raise', got {origin!r}"
-                )
+                assert (
+                    origin == "tmpmod.thing:do_raise"
+                ), f"expected 'tmpmod.thing:do_raise', got {origin!r}"
         finally:
             sys.modules.pop("tmpmod.thing", None)
 
@@ -608,10 +607,7 @@ class TestLintHelper:
         from opsalert.lint import scan_fire_sites
 
         bad_file = tmp_path / "bad.py"
-        bad_file.write_text(
-            "import opsalert\n"
-            "opsalert.warn('cat', message='msg')\n"
-        )
+        bad_file.write_text("import opsalert\n" "opsalert.warn('cat', message='msg')\n")
 
         findings = scan_fire_sites([str(bad_file)], in_app_prefix="src.")
         assert len(findings) >= 1
@@ -623,8 +619,7 @@ class TestLintHelper:
 
         good_file = tmp_path / "good.py"
         good_file.write_text(
-            "import opsalert\n"
-            "opsalert.warn('cat', message='msg', kind='cat.thing')\n"
+            "import opsalert\n" "opsalert.warn('cat', message='msg', kind='cat.thing')\n"
         )
 
         findings = scan_fire_sites([str(good_file)], in_app_prefix="src.")
@@ -636,8 +631,7 @@ class TestLintHelper:
 
         bad_file = tmp_path / "invalid_kind.py"
         bad_file.write_text(
-            "import opsalert\n"
-            "opsalert.error('cat', message='msg', kind='INVALID')\n"
+            "import opsalert\n" "opsalert.error('cat', message='msg', kind='INVALID')\n"
         )
 
         findings = scan_fire_sites([str(bad_file)], in_app_prefix="src.")
@@ -659,6 +653,7 @@ class TestTraceProvider3Tuple:
         )
 
         from opsalert._enrichment import enrich_context
+
         ctx = enrich_context({"user_key": "val"})
 
         assert ctx["_trace_id"] == "req-abc-123"
@@ -672,6 +667,7 @@ class TestTraceProvider3Tuple:
         )
 
         from opsalert._enrichment import enrich_context
+
         ctx = enrich_context(None)
 
         assert ctx["_trace_id"] == "req-abc-123"

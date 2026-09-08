@@ -4,6 +4,7 @@ The hard case these tests exist for: delivery must decide correctly using
 only what it can see at the moment it runs. It cannot assume the maintenance
 sweep ran first, in the right order, or at all.
 """
+
 from datetime import UTC, datetime, timedelta
 
 from sqlalchemy import select
@@ -77,9 +78,7 @@ class TestReopenOnTheDeliveryPath:
         await session.commit()
 
         # It comes back — the same problem, so the same condition.
-        recurrence = await fire_alert(
-            session, severity="error", category="cat", message="boom"
-        )
+        recurrence = await fire_alert(session, severity="error", category="cat", message="boom")
         await session.commit()
 
         stats = await deliver_alerts(session)  # NO lifecycle sweep first
@@ -94,9 +93,7 @@ class TestReopenOnTheDeliveryPath:
         await session.refresh(recurrence)
         assert recurrence.notified is True
 
-    async def test_reopen_survives_a_later_failure_in_the_sweep(
-        self, session, session_factory
-    ):
+    async def test_reopen_survives_a_later_failure_in_the_sweep(self, session, session_factory):
         """The reopen is committed where it happens, not at the end."""
 
         class _Exploding(opsalert.Transport):
@@ -125,9 +122,7 @@ class TestReopenOnTheDeliveryPath:
 
         async with session_factory() as fresh:
             reloaded = (
-                await fresh.execute(
-                    select(AlertCondition).where(AlertCondition.id == condition_id)
-                )
+                await fresh.execute(select(AlertCondition).where(AlertCondition.id == condition_id))
             ).scalar_one()
             assert reloaded.status == "new"
             assert reloaded.reopened_count == 1
@@ -144,7 +139,9 @@ class TestAcknowledged:
         await session.commit()
         await sync_condition_stats(session)
         condition = await _condition(session)
-        await set_status(session, condition, "acknowledged", actor="chris", issue_url="https://github.com/test/1")
+        await set_status(
+            session, condition, "acknowledged", actor="chris", issue_url="https://github.com/test/1"
+        )
         await session.commit()
 
         stats = await deliver_alerts(session)
@@ -154,9 +151,7 @@ class TestAcknowledged:
         assert stats["digest_sent"] == 1
         assert transport.sent[0].category == "digest"
 
-    async def test_occurrences_keep_accruing_while_acknowledged(
-        self, session, session_factory
-    ):
+    async def test_occurrences_keep_accruing_while_acknowledged(self, session, session_factory):
         transport = _TrackingTransport()
         _configure(session_factory, transport)
 
@@ -164,7 +159,9 @@ class TestAcknowledged:
         await session.commit()
         await sync_condition_stats(session)
         condition = await _condition(session)
-        await set_status(session, condition, "acknowledged", actor="chris", issue_url="https://github.com/test/1")
+        await set_status(
+            session, condition, "acknowledged", actor="chris", issue_url="https://github.com/test/1"
+        )
         await session.commit()
 
         await _fire_old(session, severity="error", category="cat", message="boom")
@@ -217,9 +214,7 @@ class TestCollect:
 class TestOneEmailPerCategory:
     """P7 — cadence unchanged, inclusion per condition."""
 
-    async def test_many_conditions_in_one_category_send_one_email(
-        self, session, session_factory
-    ):
+    async def test_many_conditions_in_one_category_send_one_email(self, session, session_factory):
         transport = _TrackingTransport()
         _configure(session_factory, transport)
 
@@ -260,9 +255,7 @@ class TestOneEmailPerCategory:
         assert f"and {total - _CONDITION_LIST_CAP} more" in body
         assert body.count("- #") == _CONDITION_LIST_CAP
 
-    async def test_separate_categories_still_get_separate_emails(
-        self, session, session_factory
-    ):
+    async def test_separate_categories_still_get_separate_emails(self, session, session_factory):
         transport = _TrackingTransport()
         _configure(session_factory, transport)
 
@@ -360,8 +353,8 @@ class TestCorruptConditionIsolation:
         # The skipped condition's occurrence is left unnotified — it was not
         # delivered, so it must not be marked as if it had been.
         still_waiting = (
-            await session.execute(select(Alert).where(Alert.notified.is_(False)))
-        ).scalars().all()
+            (await session.execute(select(Alert).where(Alert.notified.is_(False)))).scalars().all()
+        )
         assert "unreadable" in [a.message for a in still_waiting]
         # ...and the skip itself became an alert of its own, written by the
         # ingest thread to its own DB (not the async session).
@@ -370,9 +363,7 @@ class TestCorruptConditionIsolation:
             self_report = conn.execute(
                 sa_text("SELECT message FROM opsalert WHERE category='alert_delivery'")
             ).fetchone()
-        assert self_report is not None, (
-            "the self-reporting alert was not written to the ingest DB"
-        )
+        assert self_report is not None, "the self-reporting alert was not written to the ingest DB"
         assert "Unusable alert condition row skipped during delivery" in self_report[0]
         ingest_engine.dispose()
 
@@ -402,15 +393,11 @@ class TestResolveWithUndeliveredBacklog:
         await session.commit()
 
         unnotified = (
-            await session.execute(
-                select(Alert).where(Alert.notified.is_(False))
-            )
-        ).scalars().all()
+            (await session.execute(select(Alert).where(Alert.notified.is_(False)))).scalars().all()
+        )
         assert unnotified == []
 
-    async def test_backlog_does_not_reopen_but_recurrence_does(
-        self, session, session_factory
-    ):
+    async def test_backlog_does_not_reopen_but_recurrence_does(self, session, session_factory):
         """The two halves of opsalert#1's prescribed test, in order.
 
         First: a resolved condition whose unnotified occurrences all PREDATE
@@ -464,13 +451,15 @@ class TestResolveWithUndeliveredBacklog:
         await sync_condition_stats(session)
         condition = await _condition(session)
 
-        await set_status(session, condition, "acknowledged", actor="chris", issue_url="https://github.com/test/1")
+        await set_status(
+            session, condition, "acknowledged", actor="chris", issue_url="https://github.com/test/1"
+        )
         await set_status(session, condition, "closed", actor="chris")
         await session.commit()
 
         unnotified = (
-            await session.execute(select(Alert).where(Alert.notified.is_(False)))
-        ).scalars().all()
+            (await session.execute(select(Alert).where(Alert.notified.is_(False)))).scalars().all()
+        )
         assert unnotified == []
 
         stats = await deliver_alerts(session)
@@ -498,9 +487,7 @@ class TestCategoryThrottle:
         )
         await session.commit()
 
-    async def test_a_fully_throttled_category_sends_nothing(
-        self, session, session_factory
-    ):
+    async def test_a_fully_throttled_category_sends_nothing(self, session, session_factory):
         """Two conditions in one category, both emailed, both firing again.
 
         Under the pre-fix rule each fresh occurrence re-qualified the category
@@ -532,9 +519,7 @@ class TestCategoryThrottle:
 
         # Nothing was marked: the occurrences wait for the next sweep.
         unnotified = (
-            (await session.execute(select(Alert).where(Alert.notified.is_(False))))
-            .scalars()
-            .all()
+            (await session.execute(select(Alert).where(Alert.notified.is_(False)))).scalars().all()
         )
         assert len(unnotified) == 2
 
@@ -556,15 +541,11 @@ class TestCategoryThrottle:
         transport = _TrackingTransport()
         _configure(session_factory, transport, throttle=60)
 
-        noisy = await fire_alert(
-            session, severity="error", category="cat", message="known boom"
-        )
+        noisy = await fire_alert(session, severity="error", category="cat", message="known boom")
         noisy.notified = True
         noisy.created = datetime.now(UTC) - timedelta(minutes=5)
         await fire_alert(session, severity="error", category="cat", message="known boom")
-        await fire_alert(
-            session, severity="error", category="cat", message="never seen before"
-        )
+        await fire_alert(session, severity="error", category="cat", message="never seen before")
         await session.commit()
 
         stats = await deliver_alerts(session)
@@ -579,9 +560,7 @@ class TestCategoryThrottle:
         assert "known boom" in body, "a throttled member must ride along"
 
         unnotified = (
-            (await session.execute(select(Alert).where(Alert.notified.is_(False))))
-            .scalars()
-            .all()
+            (await session.execute(select(Alert).where(Alert.notified.is_(False)))).scalars().all()
         )
         assert unnotified == [], "everyone on a sent email is marked notified"
 
@@ -599,9 +578,7 @@ class TestCategoryThrottle:
         await set_status(session, condition, "resolved", actor="chris")
 
         # Everything so far has been emailed, five minutes ago.
-        noisy = await fire_alert(
-            session, severity="error", category="cat", message="known boom"
-        )
+        noisy = await fire_alert(session, severity="error", category="cat", message="known boom")
         noisy.notified = True
         await session.execute(
             Alert.__table__.update().values(
@@ -632,9 +609,7 @@ class TestCategoryThrottle:
         transport = _TrackingTransport()
         _configure(session_factory, transport, throttle=60)
 
-        seen = await fire_alert(
-            session, severity="error", category="cat", message="loud boom"
-        )
+        seen = await fire_alert(session, severity="error", category="cat", message="loud boom")
         seen.notified = True
         seen.created = datetime.now(UTC) - timedelta(minutes=5)
         for _ in range(4):
@@ -664,7 +639,13 @@ class TestDigestSeverity:
         await _fire_old(session, severity="critical", category="cat", message="db down")
         await session.commit()
         await sync_condition_stats(session)
-        await set_status(session, await _condition(session), "acknowledged", actor="chris", issue_url="https://github.com/test/1")
+        await set_status(
+            session,
+            await _condition(session),
+            "acknowledged",
+            actor="chris",
+            issue_url="https://github.com/test/1",
+        )
         await session.commit()
 
         stats = await deliver_alerts(session)
@@ -678,9 +659,7 @@ class TestDigestSeverity:
         assert "warning" not in message.text_body
         assert message.severity == "critical"
 
-    async def test_an_all_warn_digest_says_nothing_about_severity(
-        self, session, session_factory
-    ):
+    async def test_an_all_warn_digest_says_nothing_about_severity(self, session, session_factory):
         transport = _TrackingTransport()
         _configure(session_factory, transport)
 

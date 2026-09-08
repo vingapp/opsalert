@@ -5,6 +5,7 @@ Adds underscore-prefixed keys (won't collide with caller-provided data):
 - _exc_type, _exc_message, _traceback: active exception info (if any)
 - _task_name, _task_id: Celery task info (if running inside a task)
 """
+
 import logging
 import sys
 import traceback as tb_module
@@ -123,12 +124,14 @@ def _build_structured_frames(
         filename = frame_obj.f_code.co_filename
         lineno = current_tb.tb_lineno
         in_app = _is_in_app(module, filename, in_app_prefixes)
-        result.append({
-            "module": module,
-            "function": function,
-            "lineno": lineno,
-            "in_app": in_app,
-        })
+        result.append(
+            {
+                "module": module,
+                "function": function,
+                "lineno": lineno,
+                "in_app": in_app,
+            }
+        )
         current_tb = current_tb.tb_next
 
     if len(result) <= budget:
@@ -145,7 +148,7 @@ def _build_structured_frames(
 
     # Keep head and tail of other frames
     half = remaining // 2
-    kept_other = other_frames[:half] + other_frames[-(remaining - half):]
+    kept_other = other_frames[:half] + other_frames[-(remaining - half) :]
     all_kept = sorted(in_app_frames + kept_other, key=lambda x: x[0])
     return [f for _, f in all_kept]
 
@@ -181,9 +184,7 @@ def enrich_context(
         while f is not None:
             module_name = f.f_globals.get("__name__", "")
             if module_name not in _SKIP_MODULES:
-                enriched["_caller"] = (
-                    f"{module_name}:{f.f_code.co_name}:{f.f_lineno}"
-                )
+                enriched["_caller"] = f"{module_name}:{f.f_code.co_name}:{f.f_lineno}"
                 break
             f = f.f_back
     finally:
@@ -211,27 +212,25 @@ def enrich_context(
         except Exception:
             logger.warning("enrichment: exc_message rendering failed", exc_info=True)
             enriched["_exc_message"] = "<unrenderable>"
-        tb = getattr(resolved_exc, "__traceback__", None) or (
-            exc_info[2] if exc_info else None
-        )
+        tb = getattr(resolved_exc, "__traceback__", None) or (exc_info[2] if exc_info else None)
         if tb:
             enriched["_traceback"] = _bounded_traceback(tb)
             # Structured frames for event_json
             try:
                 from opsalert._config import get_config as _gc
+
                 _in_app = _gc().in_app_prefixes
             except (RuntimeError, ImportError):
                 _in_app = ()
             enriched["_frames"] = _build_structured_frames(tb, _in_app)
 
         # Exception chain
-        enriched["_exception_chain"] = _build_exception_chain_for_enrichment(
-            resolved_exc
-        )
+        enriched["_exception_chain"] = _build_exception_chain_for_enrichment(resolved_exc)
 
     # --- Release from config ---
     try:
         from opsalert._config import get_config as _gc2
+
         _release = _gc2().release
         if _release is not None:
             enriched["_release"] = _release
@@ -255,6 +254,7 @@ def enrich_context(
     # trace ids.
     try:
         from opsalert._config import get_config
+
         cfg = get_config()
         if cfg.trace_provider is not None:
             result = cfg.trace_provider()
@@ -278,6 +278,7 @@ def enrich_context(
     # hits the DB) costs the alert nothing.
     try:
         from opsalert._config import get_config
+
         cfg = get_config()
         if cfg.identity_provider is not None:
             user_id, org_id = cfg.identity_provider()

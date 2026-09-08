@@ -1,4 +1,5 @@
 """Configuration — single configure() call wires everything at startup."""
+
 from __future__ import annotations
 
 from collections.abc import Callable
@@ -154,5 +155,5 @@ def _swap_driver(url: str) -> str:
     ]
     for async_drv, sync_drv in swaps:
         if url.startswith(async_drv):
-            return sync_drv + url[len(async_drv):]
+            return sync_drv + url[len(async_drv) :]
     return url

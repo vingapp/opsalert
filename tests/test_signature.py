@@ -10,6 +10,7 @@ error — two different failures in one condition means acknowledging one hides
 the other forever — so the normalizer only collapses what is unambiguously
 per-occurrence noise, and emit sites that need exact identity pass ``params``.
 """
+
 # The fixtures below are verbatim production messages; wrapping them would
 # stop them being verbatim, which is the only thing that makes them evidence.
 # ruff: noqa: E501
@@ -74,9 +75,7 @@ SINGLETONS = [
 
 def _signatures(messages, *, category, source=None, environment="production", params=None):
     return {
-        condition_signature(
-            category, source, environment, m if params else normalize_message(m)
-        )
+        condition_signature(category, source, environment, m if params else normalize_message(m))
         for m in messages
     }
 
@@ -103,7 +102,7 @@ class TestProductionFixtures:
         assert "UPDATE trace_step" not in template
 
     def test_work_queue_backlog_count_variants_merge(self):
-        """"3 pending item(s)" and "1 pending item(s)" are one backlog."""
+        """ "3 pending item(s)" and "1 pending item(s)" are one backlog."""
         backlog = [m for m in TASK_FAILURE if m.startswith("Work queue backlog")]
         assert len(backlog) == 2
         assert len(_signatures(backlog, category="task_failure")) == 1
@@ -121,7 +120,7 @@ class TestProductionFixtures:
         assert len(_signatures([network, conflict], category="client_crash")) == 2
 
     def test_timeout_variants_merge_on_the_duration(self):
-        """"timeout of 12000ms" and "timeout of 30000ms" are one condition."""
+        """ "timeout of 12000ms" and "timeout of 30000ms" are one condition."""
         real = next(m for m in CLIENT_CRASH if "timeout of" in m)
         variant = real.replace("12000ms", "30000ms")
         assert len(_signatures([real, variant], category="client_crash")) == 1
@@ -223,15 +222,11 @@ class TestNormalizerUnits:
     def test_numbers_uuids_hex_quoted_and_timestamps_become_placeholders(self):
         assert normalize_message("failed 42 times") == "failed <n> times"
         assert (
-            normalize_message("job 550e8400-e29b-41d4-a716-446655440000 died")
-            == "job <uuid> died"
+            normalize_message("job 550e8400-e29b-41d4-a716-446655440000 died") == "job <uuid> died"
         )
         assert normalize_message("step 08f16cbfcbbb456a stuck") == "step <hex> stuck"
         assert normalize_message("could not find 'widget-7'") == "could not find <str>"
-        assert (
-            normalize_message("expired at 2026-08-30T20:49:56.843067+00:00")
-            == "expired at <ts>"
-        )
+        assert normalize_message("expired at 2026-08-30T20:49:56.843067+00:00") == "expired at <ts>"
 
     def test_ordinary_words_are_left_alone(self):
         """Hex-looking English must not be mistaken for an id.

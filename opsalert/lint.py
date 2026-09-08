@@ -5,6 +5,7 @@ For V4/D1 to call from their suites::
     from opsalert.lint import scan_fire_sites
     assert scan_fire_sites(["src/"], in_app_prefix="src.") == []
 """
+
 import ast
 import re
 from dataclasses import dataclass
@@ -76,34 +77,38 @@ def _scan_file(path: str) -> list[Finding]:
                 break
 
         if kind_arg is None:
-            findings.append(Finding(
-                path=path,
-                line=node.lineno,
-                message="Missing kind= argument on opsalert fire call",
-            ))
+            findings.append(
+                Finding(
+                    path=path,
+                    line=node.lineno,
+                    message="Missing kind= argument on opsalert fire call",
+                )
+            )
             continue
 
         # Check that kind= is a static string constant
-        if isinstance(kind_arg.value, ast.Constant) and isinstance(
-            kind_arg.value.value, str
-        ):
+        if isinstance(kind_arg.value, ast.Constant) and isinstance(kind_arg.value.value, str):
             kind_value = kind_arg.value.value
             if not _KIND_RE.match(kind_value):
-                findings.append(Finding(
-                    path=path,
-                    line=node.lineno,
-                    message=(
-                        f"Invalid kind={kind_value!r}: "
-                        "must match ^[a-z0-9_]+(\\.[a-z0-9_]+)+$"
-                    ),
-                ))
+                findings.append(
+                    Finding(
+                        path=path,
+                        line=node.lineno,
+                        message=(
+                            f"Invalid kind={kind_value!r}: "
+                            "must match ^[a-z0-9_]+(\\.[a-z0-9_]+)+$"
+                        ),
+                    )
+                )
         elif not isinstance(kind_arg.value, ast.Constant):
             # Non-constant kind= — could be a variable, which we flag
-            findings.append(Finding(
-                path=path,
-                line=node.lineno,
-                message="kind= must be a static string literal, not a variable",
-            ))
+            findings.append(
+                Finding(
+                    path=path,
+                    line=node.lineno,
+                    message="kind= must be a static string literal, not a variable",
+                )
+            )
 
     return findings
 

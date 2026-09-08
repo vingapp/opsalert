@@ -1,4 +1,5 @@
 """Tests for fire_alert store operation."""
+
 import json
 
 from sqlalchemy import select
