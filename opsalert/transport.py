@@ -3,7 +3,6 @@
 The host application injects a transport via configure(). The package
 never depends on any specific email library.
 """
-
 import json
 import logging
 import urllib.error

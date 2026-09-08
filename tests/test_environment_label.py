@@ -5,7 +5,6 @@ the machine name torn off. These tests pin the label onto every surface that
 reaches a human, and pin the unconfigured case to byte-identical old output so
 consumers that never set `environment` are unaffected.
 """
-
 import json
 
 import pytest
@@ -54,8 +53,12 @@ def test_subject_prefix_is_empty_without_an_environment():
 
 async def test_immediate_subject_carries_the_environment(session, session_factory):
     transport = _TrackingTransport()
-    opsalert.configure(session_factory=session_factory, transport=transport, environment="staging")
-    await fire_alert(session, severity="error", category="import_pipeline", message="Row 42 failed")
+    opsalert.configure(
+        session_factory=session_factory, transport=transport, environment="staging"
+    )
+    await fire_alert(
+        session, severity="error", category="import_pipeline", message="Row 42 failed"
+    )
     await session.commit()
 
     await deliver_alerts(session)
@@ -67,7 +70,9 @@ async def test_immediate_subject_carries_the_environment(session, session_factor
 async def test_immediate_subject_unchanged_without_an_environment(session, session_factory):
     transport = _TrackingTransport()
     opsalert.configure(session_factory=session_factory, transport=transport)
-    await fire_alert(session, severity="error", category="import_pipeline", message="Row 42 failed")
+    await fire_alert(
+        session, severity="error", category="import_pipeline", message="Row 42 failed"
+    )
     await session.commit()
 
     await deliver_alerts(session)
@@ -134,7 +139,9 @@ def test_digest_body_opens_with_the_environment(session):
 
 async def test_text_bodies_open_with_the_environment(session, session_factory):
     transport = _TrackingTransport()
-    opsalert.configure(session_factory=session_factory, transport=transport, environment="staging")
+    opsalert.configure(
+        session_factory=session_factory, transport=transport, environment="staging"
+    )
     await fire_alert(session, severity="error", category="cat_a", message="boom")
     await fire_alert(session, severity="warn", category="cat_b", message="meh")
     await session.commit()
@@ -155,13 +162,13 @@ def test_unconfigured_environment_renders_byte_identical_bodies():
     kwargs = dict(
         category="import_pipeline", severity="error", count=3, latest_message="Row 42 failed"
     )
-    assert _render_legacy_email(**kwargs) == _render_legacy_email(**kwargs, environment=None)
+    assert _render_legacy_email(**kwargs) == _render_legacy_email(
+        **kwargs, environment=None
+    )
     # Golden: the exact pre-change body, character for character. A substring
     # check would pass on a body that merely gained a blank line where the
     # environment paragraph goes; this fails on it.
-    assert (
-        _render_legacy_email(**kwargs)
-        == """
+    assert _render_legacy_email(**kwargs) == """
     <div style="font-family: sans-serif; max-width: 600px;">
         <h2 style="color: #fd7e14;">
             ERROR Alert \u2014 import_pipeline
@@ -175,7 +182,6 @@ def test_unconfigured_environment_renders_byte_identical_bodies():
         </table>
     </div>
     """
-    )
 
     class _Row:
         category = "unknown_param"
@@ -189,7 +195,9 @@ def test_unconfigured_environment_renders_byte_identical_bodies():
 
 async def test_unconfigured_environment_stores_context_unchanged(session, session_factory):
     opsalert.configure(session_factory=session_factory)
-    await fire_alert(session, severity="error", category="cat", message="m", context={"row": 42})
+    await fire_alert(
+        session, severity="error", category="cat", message="m", context={"row": 42}
+    )
     await session.commit()
 
     alert = (await session.execute(select(Alert))).scalar_one()
@@ -203,7 +211,9 @@ async def test_unconfigured_environment_stores_context_unchanged(session, sessio
 
 async def test_stored_occurrence_context_is_stamped(session, session_factory):
     opsalert.configure(session_factory=session_factory, environment="staging")
-    await fire_alert(session, severity="error", category="cat", message="m", context={"row": 42})
+    await fire_alert(
+        session, severity="error", category="cat", message="m", context={"row": 42}
+    )
     await session.commit()
 
     alert = (await session.execute(select(Alert))).scalar_one()
@@ -237,7 +247,9 @@ async def test_stamp_never_clobbers_a_caller_provided_key(session, session_facto
 async def test_stamp_does_not_mutate_the_callers_dict(session, session_factory):
     opsalert.configure(session_factory=session_factory, environment="staging")
     caller_context = {"row": 42}
-    await fire_alert(session, severity="error", category="cat", message="m", context=caller_context)
+    await fire_alert(
+        session, severity="error", category="cat", message="m", context=caller_context
+    )
     await session.commit()
 
     assert caller_context == {"row": 42}
@@ -246,7 +258,9 @@ async def test_stamp_does_not_mutate_the_callers_dict(session, session_factory):
 async def test_stamp_survives_an_unconfigured_opsalert(session):
     """Storing must never depend on configure() having been called."""
     opsalert.reset_config()
-    await fire_alert(session, severity="error", category="cat", message="m", context={"row": 42})
+    await fire_alert(
+        session, severity="error", category="cat", message="m", context={"row": 42}
+    )
     await session.commit()
 
     alert = (await session.execute(select(Alert))).scalar_one()

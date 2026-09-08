@@ -3,7 +3,6 @@
 Red-first: tests (b) and (d) were written BEFORE implementation and failed
 on the unmodified code. All tests use file-backed sqlite as ingest_url.
 """
-
 import json
 import logging
 import os
@@ -162,7 +161,9 @@ class TestDBRefusing:
         result = flush(timeout=3.0)
         assert result.dropped >= 1, f"expected dropped >= 1, got {result}"
 
-        occ_records = [r for r in caplog.records if r.name == "opsalert.occurrence"]
+        occ_records = [
+            r for r in caplog.records if r.name == "opsalert.occurrence"
+        ]
         assert len(occ_records) >= 2, "expected at least two opsalert.occurrence log lines"
 
 
@@ -187,9 +188,9 @@ class TestHighVolumeSampling:
         from opsalert import ingest as _ingest
 
         # Double-check clean state
-        assert (
-            len(_ingest._sample_state) == 0
-        ), f"sample_state not clean: {dict(_ingest._sample_state)}"
+        assert len(_ingest._sample_state) == 0, (
+            f"sample_state not clean: {dict(_ingest._sample_state)}"
+        )
 
         url, engine = _make_db(tmp_path)
 
@@ -249,9 +250,9 @@ class TestHighVolumeSampling:
         assert median < 0.002, f"median per-call latency {median*1000:.2f}ms > 2ms"
 
         # Structural proof: the caller thread never touched the DB engine.
-        assert (
-            len(engine_thread_idents) > 0
-        ), "_get_engine was never called — the writer thread didn't run"
+        assert len(engine_thread_idents) > 0, (
+            "_get_engine was never called — the writer thread didn't run"
+        )
         assert caller_ident not in engine_thread_idents, (
             f"caller thread {caller_ident} touched the DB engine; "
             f"engine threads: {set(engine_thread_idents)}"
@@ -397,8 +398,7 @@ class TestThreadDeath:
             assert _count_alerts(engine) >= 1
 
             internal_errors = [
-                r
-                for r in caplog.records
+                r for r in caplog.records
                 if r.name == "opsalert.internal" and r.levelno >= logging.ERROR
             ]
             assert len(internal_errors) >= 1, "expected opsalert.internal error log"
@@ -556,13 +556,15 @@ class TestOverflowBatchUpdatesCondition:
 
         with engine.connect() as conn:
             row_count = conn.execute(text("SELECT COUNT(*) FROM opsalert")).scalar()
-            cond = conn.execute(text("SELECT sampled_out FROM alert_condition LIMIT 1")).fetchone()
+            cond = conn.execute(
+                text("SELECT sampled_out FROM alert_condition LIMIT 1")
+            ).fetchone()
 
         assert row_count == 20, f"expected 20 rows, got {row_count}"
         assert cond is not None
-        assert (
-            cond[0] == 5
-        ), f"condition sampled_out should be 5 (from overflow batch), got {cond[0]}"
+        assert cond[0] == 5, (
+            f"condition sampled_out should be 5 (from overflow batch), got {cond[0]}"
+        )
         engine.dispose()
 
 
@@ -630,7 +632,9 @@ class TestReplaySafety:
                 def exploding_commit():
                     orig_commit()  # data IS committed
                     commit_count_inner = 1  # noqa: F841
-                    raise OperationalError("lost connection after COMMIT", {}, Exception())
+                    raise OperationalError(
+                        "lost connection after COMMIT", {}, Exception()
+                    )
 
                 conn.commit = exploding_commit
             commit_count += 1
@@ -717,7 +721,9 @@ class TestForkChildFreshQueue:
                 data = os.read(r, 100)
                 os.close(r)
                 child_queue_len = int(data.decode())
-                assert child_queue_len == 0, f"child queue should be empty, got {child_queue_len}"
+                assert child_queue_len == 0, (
+                    f"child queue should be empty, got {child_queue_len}"
+                )
         finally:
             ingest._start_thread = orig_start
 
@@ -748,7 +754,9 @@ class TestNeverWritesOccurrenceCount:
             ).fetchone()
 
         assert row is not None
-        assert row[0] == 0, f"occurrence_count should be 0 (untouched by ingest), got {row[0]}"
+        assert row[0] == 0, (
+            f"occurrence_count should be 0 (untouched by ingest), got {row[0]}"
+        )
         engine.dispose()
 
 
@@ -772,10 +780,14 @@ class TestNoAsyncio:
             if isinstance(node, ast.Import):
                 for alias in node.names:
                     if "asyncio" in alias.name:
-                        pytest.fail(f"ingest.py line {node.lineno}: import {alias.name}")
+                        pytest.fail(
+                            f"ingest.py line {node.lineno}: import {alias.name}"
+                        )
             elif isinstance(node, ast.ImportFrom):
                 if node.module and "asyncio" in node.module:
-                    pytest.fail(f"ingest.py line {node.lineno}: from {node.module} import ...")
+                    pytest.fail(
+                        f"ingest.py line {node.lineno}: from {node.module} import ..."
+                    )
 
     def test_enqueue_works_without_running_loop(self, tmp_path):
         """(l) enqueue works with no running event loop."""
@@ -940,8 +952,12 @@ class TestJsonLogLine:
 
         flush(timeout=5.0)
 
-        occ_records = [r for r in caplog.records if r.name == "opsalert.occurrence"]
-        assert len(occ_records) == 5, f"expected 5 occurrence log lines, got {len(occ_records)}"
+        occ_records = [
+            r for r in caplog.records if r.name == "opsalert.occurrence"
+        ]
+        assert len(occ_records) == 5, (
+            f"expected 5 occurrence log lines, got {len(occ_records)}"
+        )
 
         # Each should be valid JSON
         for rec in occ_records:

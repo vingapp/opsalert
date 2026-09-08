@@ -14,7 +14,6 @@ still be about to reference them.
 Plain async functions — no scheduler dependency. The host app wraps
 this in whatever scheduler it uses.
 """
-
 import logging
 from datetime import UTC, datetime, timedelta
 
@@ -94,7 +93,9 @@ async def _reap_empty_conditions(session, *, now: datetime | None = None) -> int
     minutes = _resolve_setting("condition_empty_reap_minutes", 60)
     cutoff = (now or datetime.now(UTC)) - timedelta(minutes=minutes)
 
-    has_occurrence = select(Alert.id).where(Alert.condition_id == AlertCondition.id).exists()
+    has_occurrence = (
+        select(Alert.id).where(Alert.condition_id == AlertCondition.id).exists()
+    )
     result = await session.execute(
         delete(AlertCondition).where(
             AlertCondition.created < cutoff,
@@ -108,6 +109,8 @@ async def _reap_empty_conditions(session, *, now: datetime | None = None) -> int
     reaped = result.rowcount
 
     if reaped > 0:
-        logger.info("Reaped %d empty condition(s) older than %d minutes", reaped, minutes)
+        logger.info(
+            "Reaped %d empty condition(s) older than %d minutes", reaped, minutes
+        )
 
     return reaped

@@ -1,5 +1,4 @@
 """Tests for transport implementations."""
-
 import json
 from unittest.mock import patch
 
@@ -53,7 +52,6 @@ class TestCallableTransport:
 
     def test_catches_exceptions(self):
         """Never raises — returns False on exception."""
-
         def boom(*a, **kw):
             raise ConnectionError("network down")
 
@@ -74,7 +72,6 @@ class TestLogTransport:
     def test_logs_message(self, caplog):
         """Logs the alert at WARNING level."""
         import logging
-
         with caplog.at_level(logging.WARNING):
             transport = LogTransport()
             transport.send(
@@ -145,7 +142,6 @@ class TestWebhookTransport:
 
     def test_returns_false_on_error(self):
         """Returns False on network error."""
-
         def boom(req, timeout=None):
             raise ConnectionError("down")
 

@@ -25,7 +25,6 @@ Every transport-accepted send commits its notified-marks before the next send
 Plain async functions — no scheduler dependency. The host app wraps these in
 whatever scheduler it uses.
 """
-
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -180,8 +179,12 @@ def _alertmanager_payload(
         alert_item: dict = {
             "labels": labels,
             "annotations": annotations,
-            "startsAt": (batch.first_seen.isoformat() if batch.first_seen else ""),
-            "endsAt": (batch.resolved_at.isoformat() if batch.resolved_at else ""),
+            "startsAt": (
+                batch.first_seen.isoformat() if batch.first_seen else ""
+            ),
+            "endsAt": (
+                batch.resolved_at.isoformat() if batch.resolved_at else ""
+            ),
             "fingerprint": batch.signature_key,
         }
         alerts.append(alert_item)
@@ -511,7 +514,10 @@ async def _mark_notified(session, pairs: list[tuple[int, int]]) -> None:
             .where(
                 Alert.notified.is_(False),
                 or_(
-                    *[and_(Alert.condition_id == cid, Alert.id <= max_id) for cid, max_id in chunk]
+                    *[
+                        and_(Alert.condition_id == cid, Alert.id <= max_id)
+                        for cid, max_id in chunk
+                    ]
                 ),
             )
             .values(notified=True)
@@ -545,7 +551,8 @@ async def _throttled_condition_ids(
     return {
         row.condition_id
         for row in rows
-        if row.last_notified_at is not None and row.last_notified_at.replace(tzinfo=None) > cutoff
+        if row.last_notified_at is not None
+        and row.last_notified_at.replace(tzinfo=None) > cutoff
     }
 
 
@@ -583,9 +590,9 @@ async def _deliver_immediate(
 
     # A reopen is a state change, not a repeat: it is never throttled by the
     # emails sent about the episode that was closed out.
-    throttled = await _throttled_condition_ids(session, batches, throttle_minutes) - (
-        reopened_ids or set()
-    )
+    throttled = await _throttled_condition_ids(
+        session, batches, throttle_minutes
+    ) - (reopened_ids or set())
     by_category: dict[str, list[_ConditionBatch]] = {}
     for batch in batches:
         by_category.setdefault(batch.category, []).append(batch)
@@ -604,7 +611,10 @@ async def _deliver_immediate(
         total = sum(b.count for b in included)
         headline = included[0].latest_message
 
-        subject = f"{_subject_prefix(environment)}" f"[{worst.upper()}] {category}: {headline[:60]}"
+        subject = (
+            f"{_subject_prefix(environment)}"
+            f"[{worst.upper()}] {category}: {headline[:60]}"
+        )
         message = AlertMessage(
             subject=subject,
             html_body=_render_immediate_email(
@@ -866,7 +876,9 @@ async def _deliver_digest(
 
     rows: dict[str, _DigestRow] = {}
     for batch in batches:
-        row = rows.setdefault(batch.category, _DigestRow(batch.category, batch.latest_message, 0))
+        row = rows.setdefault(
+            batch.category, _DigestRow(batch.category, batch.latest_message, 0)
+        )
         row.count += batch.count
         row.latest_message = batch.latest_message
     for legacy in legacy_rows:

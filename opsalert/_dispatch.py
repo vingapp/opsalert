@@ -8,7 +8,6 @@ No event loop interaction. No session factory call. No DB access on the
 caller thread. The call shape is unchanged: ``warn/error/critical(category,
 message=, source=, context=)``.
 """
-
 import json
 import logging
 import uuid
@@ -81,12 +80,13 @@ def _fire_sync(
     # --- Kind validation ---
     if kind is not None and not validate_kind(kind):
         if cfg.testing:
-            raise ValueError(f"Invalid kind {kind!r}: must match ^[a-z0-9_]+(\\.[a-z0-9_]+)+$")
+            raise ValueError(
+                f"Invalid kind {kind!r}: must match ^[a-z0-9_]+(\\.[a-z0-9_]+)+$"
+            )
         # Production: replace with legacy fallback, warn once per (site, kind)
         emit_site_key = ""
         try:
             from opsalert._enrichment import compute_emit_site
-
             emit_site_key = compute_emit_site(stacklevel=stacklevel)
         except Exception:
             pass
@@ -123,7 +123,6 @@ def _fire_sync(
     resolved_exc = exc
     if resolved_exc is None:
         import sys
-
         exc_info = sys.exc_info()
         resolved_exc = exc_info[1] if exc_info else None
 
@@ -223,15 +222,8 @@ def warn(
     from opsalert.types import AlertSeverity
 
     _fire_sync(
-        AlertSeverity.WARN,
-        category,
-        message,
-        source,
-        context,
-        params,
-        kind=kind,
-        exc=exc,
-        stacklevel=stacklevel,
+        AlertSeverity.WARN, category, message, source, context, params,
+        kind=kind, exc=exc, stacklevel=stacklevel,
     )
 
 
@@ -250,15 +242,8 @@ def error(
     from opsalert.types import AlertSeverity
 
     _fire_sync(
-        AlertSeverity.ERROR,
-        category,
-        message,
-        source,
-        context,
-        params,
-        kind=kind,
-        exc=exc,
-        stacklevel=stacklevel,
+        AlertSeverity.ERROR, category, message, source, context, params,
+        kind=kind, exc=exc, stacklevel=stacklevel,
     )
 
 
@@ -277,13 +262,6 @@ def critical(
     from opsalert.types import AlertSeverity
 
     _fire_sync(
-        AlertSeverity.CRITICAL,
-        category,
-        message,
-        source,
-        context,
-        params,
-        kind=kind,
-        exc=exc,
-        stacklevel=stacklevel,
+        AlertSeverity.CRITICAL, category, message, source, context, params,
+        kind=kind, exc=exc, stacklevel=stacklevel,
     )

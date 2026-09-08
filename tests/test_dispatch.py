@@ -3,7 +3,6 @@
 Updated for the ingest path: fires go through the bounded queue + writer
 thread.  Tests that verify DB rows call ``opsalert.flush()`` before reading.
 """
-
 import pytest
 from sqlalchemy import create_engine, text
 
@@ -65,7 +64,9 @@ class TestFireAPI:
         flush(timeout=5.0)
 
         with engine.connect() as conn:
-            row = conn.execute(text("SELECT severity FROM opsalert")).fetchone()
+            row = conn.execute(
+                text("SELECT severity FROM opsalert")
+            ).fetchone()
 
         assert row is not None
         assert row[0] == "error"
@@ -83,7 +84,9 @@ class TestFireAPI:
         flush(timeout=5.0)
 
         with engine.connect() as conn:
-            row = conn.execute(text("SELECT severity, category FROM opsalert")).fetchone()
+            row = conn.execute(
+                text("SELECT severity, category FROM opsalert")
+            ).fetchone()
 
         assert row is not None
         assert row[0] == "critical"
@@ -189,7 +192,9 @@ class TestEnrichment:
         import json
 
         with engine.connect() as conn:
-            ctx_json = conn.execute(text("SELECT context_json FROM opsalert")).scalar()
+            ctx_json = conn.execute(
+                text("SELECT context_json FROM opsalert")
+            ).scalar()
 
         ctx = json.loads(ctx_json)
         assert "user_key" in ctx
@@ -215,7 +220,9 @@ class TestEnrichment:
         import json
 
         with engine.connect() as conn:
-            ctx_json = conn.execute(text("SELECT context_json FROM opsalert")).scalar()
+            ctx_json = conn.execute(
+                text("SELECT context_json FROM opsalert")
+            ).scalar()
 
         ctx = json.loads(ctx_json)
         assert ctx["_exc_type"] == "ValueError"
@@ -232,9 +239,9 @@ class TestEnrichment:
 
         tb = ctx["_traceback"]
         assert len(tb) > 2000 or "_frame_00" in tb, "fixture stack was too short to truncate"
-        assert (
-            "_application_frame_marker" in tb
-        ), "the outermost (application) frames were truncated away"
+        assert "_application_frame_marker" in tb, (
+            "the outermost (application) frames were truncated away"
+        )
         assert "_frame_59" in tb, "the innermost (raising) frames were truncated away"
 
     def test_traceback_stays_within_its_budget(self):
@@ -269,7 +276,9 @@ class TestEnrichment:
         import json
 
         with engine.connect() as conn:
-            ctx_json = conn.execute(text("SELECT context_json FROM opsalert")).scalar()
+            ctx_json = conn.execute(
+                text("SELECT context_json FROM opsalert")
+            ).scalar()
 
         stored = json.loads(ctx_json)
         assert stored["my_key"] == "my_val"
@@ -423,7 +432,9 @@ class TestIdentityProvider:
         flush(timeout=5.0)
 
         with engine.connect() as conn:
-            row = conn.execute(text("SELECT message FROM opsalert WHERE category='cat'")).fetchone()
+            row = conn.execute(
+                text("SELECT message FROM opsalert WHERE category='cat'")
+            ).fetchone()
         assert row is not None
         assert row[0] == "the alert that matters"
         engine.dispose()

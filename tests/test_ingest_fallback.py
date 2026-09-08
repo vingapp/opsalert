@@ -75,7 +75,9 @@ class TestResolveConditionSyncIntegrityFallback:
 
         # Verify it exists.
         row = sync_conn.execute(
-            select(AlertCondition.id).where(AlertCondition.signature_key == event.signature_key)
+            select(AlertCondition.id).where(
+                AlertCondition.signature_key == event.signature_key
+            )
         ).scalar_one()
         assert row == cid_1
 
@@ -89,7 +91,9 @@ class TestResolveConditionSyncIntegrityFallback:
             call_count += 1
             if call_count == 1:
                 # First call is the lookup SELECT — return empty to force upsert
-                return original_execute(select(AlertCondition.id).where(AlertCondition.id < 0))
+                return original_execute(
+                    select(AlertCondition.id).where(AlertCondition.id < 0)
+                )
             return original_execute(stmt, *args, **kwargs)
 
         def exploding_upsert(dialect, values):
@@ -115,7 +119,9 @@ class TestResolveConditionSyncIntegrityFallback:
             call_count += 1
             if call_count == 1:
                 # Force the lookup SELECT to miss
-                return original_execute(select(AlertCondition.id).where(AlertCondition.id < 0))
+                return original_execute(
+                    select(AlertCondition.id).where(AlertCondition.id < 0)
+                )
             return original_execute(stmt, *args, **kwargs)
 
         def exploding_upsert(dialect, values):

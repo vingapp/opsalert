@@ -22,7 +22,6 @@ Usage::
         params={"method": "PUT", "route": "/api/view/shares/{stub}/"},
     )
 """
-
 from opsalert._config import configure, get_config, reset_config
 from opsalert._dispatch import critical, error, warn
 from opsalert.cleanup import cleanup_alerts

@@ -5,7 +5,6 @@ Level 2 (?category=X): GROUP BY message within category → count, latest_create
 Level 3 (?category=X&message=Y): Individual occurrences with context
 Next-fix: Highest-priority group with aggregated debugging data
 """
-
 import base64
 import json
 from collections.abc import Mapping
@@ -82,23 +81,31 @@ async def query_categories(
 
     # Latest message per category — correlated scalar subquery. Filters
     # are mirrored so the message reflects what passed the filter set.
-    latest_msg_subq = select(Alert.message).where(Alert.category == agg_cte.c.category)
+    latest_msg_subq = (
+        select(Alert.message)
+        .where(Alert.category == agg_cte.c.category)
+    )
     if severity:
         latest_msg_subq = latest_msg_subq.where(Alert.severity == severity)
     if source:
         latest_msg_subq = latest_msg_subq.where(Alert.source == source)
     if search:
         latest_msg_subq = latest_msg_subq.where(Alert.message.ilike(f"%{search}%"))
-    latest_msg_scalar = latest_msg_subq.order_by(Alert.created.desc()).limit(1).scalar_subquery()
+    latest_msg_scalar = (
+        latest_msg_subq.order_by(Alert.created.desc()).limit(1).scalar_subquery()
+    )
 
-    final = select(
-        agg_cte.c.category,
-        agg_cte.c.severity_rank,
-        agg_cte.c.source,
-        agg_cte.c.count,
-        latest_msg_scalar.label("latest_message"),
-        agg_cte.c.latest_created,
-    ).order_by(desc(agg_cte.c.latest_created))
+    final = (
+        select(
+            agg_cte.c.category,
+            agg_cte.c.severity_rank,
+            agg_cte.c.source,
+            agg_cte.c.count,
+            latest_msg_scalar.label("latest_message"),
+            agg_cte.c.latest_created,
+        )
+        .order_by(desc(agg_cte.c.latest_created))
+    )
 
     result = await session.execute(final)
     return [
@@ -155,7 +162,10 @@ async def query_messages(
     for f in base_filters:
         query = query.where(f)
     query = (
-        query.group_by(Alert.message).order_by(desc("latest_created")).offset(offset).limit(limit)
+        query.group_by(Alert.message)
+        .order_by(desc("latest_created"))
+        .offset(offset)
+        .limit(limit)
     )
 
     result = await session.execute(query)
@@ -284,7 +294,9 @@ async def query_aggregates(session: "AsyncSession") -> dict:
 
     Returns dict with total count and by_severity breakdown.
     """
-    result = await session.execute(select(func.count(Alert.id).label("total")))
+    result = await session.execute(
+        select(func.count(Alert.id).label("total"))
+    )
     total = result.scalar() or 0
 
     severity_result = await session.execute(
@@ -389,7 +401,6 @@ async def query_next_fix(
     # Resolve fix hint from configured hints (defensive for unconfigured state)
     try:
         from opsalert._config import get_config
-
         cfg = get_config()
         fix_hint = cfg.fix_hints.get(row.category, cfg.default_fix_hint)
     except RuntimeError:
@@ -459,7 +470,9 @@ def _condition_dict(condition: AlertCondition) -> dict:
         "template": condition.message_template,
         "status": condition.status,
         "disposition": condition.disposition,
-        "effective_disposition": effective_disposition(condition.severity, condition.disposition),
+        "effective_disposition": effective_disposition(
+            condition.severity, condition.disposition
+        ),
         "severity": condition.severity,
         "latest_severity": condition.latest_severity,
         "issue_url": condition.issue_url,
@@ -540,7 +553,9 @@ async def query_conditions(
     if severity:
         filters.append(AlertCondition.severity == severity)
 
-    total = (await session.scalar(select(func.count(AlertCondition.id)).where(*filters))) or 0
+    total = (
+        await session.scalar(select(func.count(AlertCondition.id)).where(*filters))
+    ) or 0
 
     sort_map = {
         "last_seen": AlertCondition.last_seen,
@@ -654,7 +669,9 @@ def _decode_attention_cursor(
     return marks, None
 
 
-async def _count_users_24h(session: "AsyncSession", candidate_ids: list[int]) -> dict[int, int]:
+async def _count_users_24h(
+    session: "AsyncSession", candidate_ids: list[int]
+) -> dict[int, int]:
     """Count distinct subjects per condition from alert_condition_subject.
 
     Uses ``day >= today - 1`` (two calendar days) as the 24h proxy.
@@ -672,7 +689,9 @@ async def _count_users_24h(session: "AsyncSession", candidate_ids: list[int]) ->
                 AlertConditionSubject.condition_id,
                 func.count(
                     func.distinct(
-                        AlertConditionSubject.subject_kind + ":" + AlertConditionSubject.subject_key
+                        AlertConditionSubject.subject_kind
+                        + ":"
+                        + AlertConditionSubject.subject_key
                     )
                 ).label("cnt"),
             )
@@ -773,7 +792,11 @@ async def query_attention(
         filters.append(AlertCondition.environment == scope)
 
     rows = (
-        (await session.execute(select(AlertCondition).where(*filters).order_by(AlertCondition.id)))
+        (
+            await session.execute(
+                select(AlertCondition).where(*filters).order_by(AlertCondition.id)
+            )
+        )
         .scalars()
         .all()
     )
@@ -947,6 +970,8 @@ async def delete_batch(
 
 async def delete_by_id(session: "AsyncSession", *, alert_id: int) -> bool:
     """Delete a single alert by ID. Returns True if found and deleted."""
-    result = await session.execute(delete(Alert).where(Alert.id == alert_id))
+    result = await session.execute(
+        delete(Alert).where(Alert.id == alert_id)
+    )
     assert isinstance(result, CursorResult)
     return result.rowcount > 0

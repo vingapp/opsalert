@@ -6,7 +6,6 @@ occurrences are instances of. Occurrences are volatile (pruned on a retention
 clock); the condition carries the state a human cares about: acknowledged,
 resolved, the issue URL, how often it fires, whether it came back.
 """
-
 from datetime import UTC, datetime
 
 from sqlalchemy import (
@@ -90,7 +89,9 @@ class Alert(OpsAlertBase):
 
     # How many sibling events this row "stands for" beyond itself. Written
     # by the ingest sampling logic; aggregations in O2/O3 read it.
-    sampled_out: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    sampled_out: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
 
     # --- Identity v2 columns ---
     kind: Mapped[str | None] = mapped_column(String(120), nullable=True, index=True)
@@ -195,7 +196,9 @@ class AlertCondition(OpsAlertBase):
     notes: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # Audit stamps
-    acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    acknowledged_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     acknowledged_by: Mapped[str | None] = mapped_column(String(100), nullable=True)
     # Baseline captured AT ack time, so the escalation rule (opsalert#7) has
     # something to compare the condition's current state against. NULL on
@@ -235,7 +238,9 @@ class AlertCondition(OpsAlertBase):
     dropped_count: Mapped[int] = mapped_column(
         Integer, default=0, server_default="0", nullable=False
     )
-    sampled_out: Mapped[int] = mapped_column(Integer, default=0, server_default="0", nullable=False)
+    sampled_out: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
 
     # Derived statistics — outlive the occurrences they were computed from
     first_seen: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

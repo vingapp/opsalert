@@ -11,7 +11,6 @@ short-lived transaction where one is available, and degrades to a NULL
 never sees an exception, because the alert row is the record of a problem that
 already happened — losing it to bookkeeping would be the worst possible trade.
 """
-
 import json
 import logging
 from datetime import UTC, datetime
@@ -219,7 +218,9 @@ async def _upsert_condition(session: "AsyncSession", values: dict[str, Any]) -> 
         return pk[0]
     except IntegrityError:
         return await session.scalar(
-            select(AlertCondition.id).where(AlertCondition.signature_key == values["signature_key"])
+            select(AlertCondition.id).where(
+                AlertCondition.signature_key == values["signature_key"]
+            )
         )
 
 
@@ -402,7 +403,6 @@ async def fire_alert(
 
     try:
         from opsalert._config import get_config
-
         cfg = get_config()
         in_app_prefixes = cfg.in_app_prefixes
     except (RuntimeError, ImportError):
@@ -500,7 +500,6 @@ async def _resolve_v2_condition(
     factory = None
     try:
         from opsalert._config import get_config
-
         factory = get_config().session_factory
     except (RuntimeError, ImportError):
         factory = None
@@ -514,12 +513,18 @@ async def _resolve_v2_condition(
                 await isolated.commit()
                 return condition_id
         except Exception:
-            logger.exception("opsalert: isolated v2 condition resolution failed for kind=%s", kind)
+            logger.exception(
+                "opsalert: isolated v2 condition resolution failed for kind=%s", kind
+            )
             return None
 
     try:
         async with session.begin_nested():
-            return await _lookup_or_create(session, signature_key=signature_key, values=values)
+            return await _lookup_or_create(
+                session, signature_key=signature_key, values=values
+            )
     except Exception:
-        logger.exception("opsalert: v2 condition resolution failed for kind=%s", kind)
+        logger.exception(
+            "opsalert: v2 condition resolution failed for kind=%s", kind
+        )
         return None
