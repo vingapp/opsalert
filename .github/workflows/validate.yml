@@ -2,7 +2,10 @@ name: Validate
 
 on:
   pull_request:
-    branches: [staging, main]
+    branches: [integration, staging, main]
+  merge_group:
+    branches: [integration]
+  workflow_dispatch:
 
 concurrency:
   group: validate-${{ github.event.pull_request.number || github.ref }}
@@ -21,8 +24,8 @@ jobs:
       - name: Secrets (gitleaks)
         env:
           GITLEAKS_BIN_DIR: ${{ runner.temp }}/bin
-          GITLEAKS_BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          GITLEAKS_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GITLEAKS_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          GITLEAKS_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
         run: bash scripts/gates/gitleaks.sh ci
       - uses: actions/setup-python@v5
         with:
