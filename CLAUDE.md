@@ -78,3 +78,5 @@ current copy. A release of this library is a vingapi `requirements.lock` pin bum
 ## Conventions
 
 (Accreting.)
+
+Landing: PRs to `integration` go through the GitHub merge queue with `validate` as the required check (see `~/CLAUDE.md`).
