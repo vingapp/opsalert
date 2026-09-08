@@ -74,12 +74,12 @@ ci() {
     echo "gitleaks: scanning checked-out tree..."
     "$GITLEAKS" dir . --redact --config .gitleaks.toml --no-banner
 
-    if [ -n "${GITLEAKS_BASE_SHA:-}" ] && [ -n "${GITLEAKS_HEAD_SHA:-}" ]; then
-        echo "gitleaks: scanning PR commits (${GITLEAKS_BASE_SHA}..${GITLEAKS_HEAD_SHA})..."
-        "$GITLEAKS" git --log-opts="${GITLEAKS_BASE_SHA}..${GITLEAKS_HEAD_SHA}" --redact --config .gitleaks.toml --no-banner
-    else
-        echo "gitleaks: GITLEAKS_BASE_SHA / GITLEAKS_HEAD_SHA not set — skipping PR-range scan."
+    if [ -z "${GITLEAKS_BASE_SHA:-}" ] || [ -z "${GITLEAKS_HEAD_SHA:-}" ]; then
+        echo "gitleaks: ERROR — GITLEAKS_BASE_SHA and GITLEAKS_HEAD_SHA must both be set in ci mode."
+        exit 1
     fi
+    echo "gitleaks: scanning PR commits (${GITLEAKS_BASE_SHA}..${GITLEAKS_HEAD_SHA})..."
+    "$GITLEAKS" git --log-opts="${GITLEAKS_BASE_SHA}..${GITLEAKS_HEAD_SHA}" --redact --config .gitleaks.toml --no-banner
 }
 
 # ── dispatch ───────────────────────────────────────────────────────
