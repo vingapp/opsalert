@@ -453,7 +453,7 @@ def _writer_loop() -> None:
                     # etc.) but not permanent ones (bad SQL, constraint
                     # violation, data type mismatch).
                     is_retryable = isinstance(exc, DBAPIError) and not isinstance(
-                        exc, (IntegrityError, ProgrammingError, DataError)
+                        exc, IntegrityError | ProgrammingError | DataError
                     )
 
                     if is_retryable and cumulative_retry < max_retry_s and _generation == my_gen:

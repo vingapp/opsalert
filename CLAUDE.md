@@ -2,7 +2,7 @@
 
 Standalone operational alerting. `import opsalert; opsalert.error(...)` from anywhere (async or sync) — fire-and-forget, structured storage, pluggable delivery.
 
-For users-of-uptake guidance see `~/CLAUDE.md`. The repo README has the contract and quick-start — read it for the API surface.
+The repo README has the contract and quick-start — read it for the API surface.
 
 ## Stack
 
