@@ -27,7 +27,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install tools
-        run: pip install ruff mypy
+        run: pip install -e .[dev] ruff mypy
       - name: Lint (ruff)
         run: ruff check opsalert/ tests/
       - name: Type check (mypy)
