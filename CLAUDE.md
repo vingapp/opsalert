@@ -2,7 +2,7 @@
 
 Standalone operational alerting. `import opsalert; opsalert.error(...)` from anywhere (async or sync) — fire-and-forget, structured storage, pluggable delivery.
 
-For users-of-uptake guidance see `~/CLAUDE.md`. The repo README has the contract and quick-start — read it for the API surface.
+The repo README has the contract and quick-start — read it for the API surface.
 
 ## Stack
 
@@ -62,10 +62,21 @@ For users-of-uptake guidance see `~/CLAUDE.md`. The repo README has the contract
 ## Commands
 
 ```bash
-.venv/bin/pytest                 # uptake plugin auto-runs
-.venv/bin/uptake-lint
+.venv/bin/pytest
 ```
+
+## Gates
+
+CI (validate.yml) is the gate; run `ruff check` and `pytest` locally.
+
+**`~/ving-gates/work/opsalert`** is vingapi's pinned editable install of this
+library. It is never landed from — it exists only so vingapi's `.venv` has a
+current copy. A release of this library is a vingapi `requirements.lock` pin bump.
+
+**Linked worktrees** gate in their own tree and need their own `.venv`.
 
 ## Conventions
 
 (Accreting.)
+
+Landing: PRs to `integration` go through the GitHub merge queue with `validate` as the required check (see `~/CLAUDE.md`).

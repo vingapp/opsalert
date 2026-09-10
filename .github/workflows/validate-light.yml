@@ -1,0 +1,46 @@
+name: Validate (light)
+
+# Quick checks for worker PRs into lead branches.
+# Full validate is opt-in via: gh workflow run validate.yml --ref <branch>
+
+on:
+  pull_request:
+    branches: ['lead/**']
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Secrets (gitleaks)
+        env:
+          GITLEAKS_BIN_DIR: ${{ runner.temp }}/bin
+          GITLEAKS_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          GITLEAKS_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: bash scripts/gates/gitleaks.sh ci
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install tools
+        run: pip install -e .[dev] ruff mypy
+      - name: Lint (ruff)
+        run: ruff check opsalert/ tests/
+      - name: Type check (mypy)
+        run: mypy opsalert/
+
+  validate-light:
+    if: always()
+    needs: [checks]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Aggregate
+        run: |
+          if [ "${{ needs.checks.result }}" != "success" ]; then
+            echo "checks: ${{ needs.checks.result }}"
+            exit 1
+          fi

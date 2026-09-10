@@ -8,8 +8,8 @@ Three jobs live here:
    auto-close of a resolved condition that has gone quiet, auto-stale of a
    condition nobody ever triaged and that stopped happening, and escalation
    of an acknowledged condition that got worse (opsalert#7): a new all-time
-   severity, a burst far above its ack-time rate, or a lease that expired
-   while it kept firing.
+   severity, a burst far above its ack-time rate, subject spread, or a lease
+   that expired while it kept firing.
 3. :func:`set_status` / :func:`set_disposition` are the human edits, with
    transition validation and audit stamps.
 
@@ -26,14 +26,17 @@ host app's alembic migrations, not by this package's ``ensure_tables``
 (create_all only, never alters an existing table) — the host MUST apply that
 migration before running this version, since ``select(AlertCondition)``
 selects every mapped column and a missing column fails the query outright.
+``resolved_release`` (VARCHAR(40), nullable) is in the same family.
 """
 import json
 import logging
 from datetime import UTC, datetime, timedelta
+from typing import Any, overload
 
 from sqlalchemy import case, func, select, update
 
-from opsalert.model import Alert, AlertCondition
+from opsalert._config import get_config
+from opsalert.model import Alert, AlertCondition, AlertConditionSubject
 from opsalert.signature import condition_signature, normalize_message
 from opsalert.store import TEMPLATE_CONTEXT_KEY, _lookup_or_create
 from opsalert.types import AlertSeverity
@@ -94,10 +97,13 @@ MEDIAN_SAMPLE = 50
 ACK_BURST_WINDOW = timedelta(minutes=15)
 ACK_BURST_MIN = 10
 ACK_BURST_MULTIPLE = 5
+ACK_BURST_PEAK_MULTIPLE = 1.5
 # Floor under the baseline's age denominator: a condition acknowledged
 # minutes after it first appeared must not get a wildly inflated baseline
 # rate from a near-zero age.
 ACK_BASELINE_MIN_AGE = timedelta(hours=1)
+# A condition reopens if this many NEW distinct subjects appear since ack.
+ACK_SUBJECT_SPREAD = 5
 
 _SEVERITY_ORDER = {
     AlertSeverity.WARN.value: 1,
@@ -118,8 +124,12 @@ _IMMEDIATE_BY_DEFAULT = frozenset({AlertSeverity.ERROR.value, AlertSeverity.CRIT
 
 
 def worst_severity(a: str | None, b: str | None) -> str:
-    """The more severe of two severity strings (unknown values rank lowest)."""
-    return a if _SEVERITY_ORDER.get(a or "", 0) >= _SEVERITY_ORDER.get(b or "", 0) else b
+    """The more severe of two severity strings (unknown values rank lowest).
+
+    Returns the coerced winner; two None inputs yield "".
+    """
+    winner = a if _SEVERITY_ORDER.get(a or "", 0) >= _SEVERITY_ORDER.get(b or "", 0) else b
+    return winner or ""
 
 
 def effective_disposition(severity: str | None, disposition: str | None) -> str:
@@ -135,6 +145,12 @@ def effective_disposition(severity: str | None, disposition: str | None) -> str:
     return DISPOSITION_IMMEDIATE if severity in _IMMEDIATE_BY_DEFAULT else DISPOSITION_DIGEST
 
 
+@overload
+def _naive(value: datetime) -> datetime: ...
+@overload
+def _naive(value: None) -> None: ...
+@overload
+def _naive(value: datetime | None) -> datetime | None: ...
 def _naive(value: datetime | None) -> datetime | None:
     """Drop tzinfo for comparison — some drivers hand back naive UTC."""
     if value is None:
@@ -142,15 +158,24 @@ def _naive(value: datetime | None) -> datetime | None:
     return value.replace(tzinfo=None)
 
 
-def reopen_condition(condition: AlertCondition, *, now: datetime | None = None) -> None:
+def reopen_condition(
+    condition: AlertCondition,
+    *,
+    now: datetime | None = None,
+    fired_release: str | None = None,
+) -> None:
     """Bring a resolved/closed condition back to ``new``.
 
     Shared by the delivery path (which reopens INLINE, before it decides
     whether to email — see P4) and by the lifecycle sweep's belt-and-braces
     scan. Clearing the acknowledgement stamps matters: the person who
     acknowledged the old episode has not seen this one.
+
+    Appends a reopen note that distinguishes a regression (the condition had
+    a ``resolved_release``, meaning a fix shipped) from a plain recurrence.
     """
     now = now or datetime.now(UTC)
+    leaving_status = condition.status
     condition.status = STATUS_NEW
     condition.reopened_count = (condition.reopened_count or 0) + 1
     condition.status_changed_at = now
@@ -161,6 +186,26 @@ def reopen_condition(condition: AlertCondition, *, now: datetime | None = None) 
     condition.acknowledged_severity = None
     condition.acknowledged_occurrence_count = None
     condition.acknowledged_until = None
+    condition.acknowledged_peak_15m = None
+    condition.acknowledged_subject_count = None
+    # acknowledged_release is audit only — no rule reads it. Cleared on
+    # ack re-stamp, resolve, and close; kept through reopen.
+    # resolved_release is KEPT through reopen: a reopen after a fix shipped
+    # is a regression in the attention feed.
+
+    issue = condition.issue_url or condition.resolution_url or "no linked issue"
+    if condition.resolved_release:
+        note = (
+            f"reopened: regression — fired again under "
+            f"{fired_release or 'unknown release'} after fix shipped in "
+            f"{condition.resolved_release} ({issue})"
+        )
+    else:
+        note = (
+            f"reopened: fired again after being {leaving_status} ({issue})"
+        )
+    condition.notes = _append_note(condition.notes, note)
+
     logger.warning(
         "opsalert: condition %s (%s) reopened — it fired again after being closed out",
         condition.id,
@@ -226,6 +271,9 @@ async def _adopt_orphans(session, *, now: datetime, batch_size: int = 500) -> in
                     Alert.message,
                     Alert.severity,
                     Alert.context_json,
+                    Alert.fingerprint_version,
+                    Alert.fingerprint_json,
+                    Alert.kind,
                 )
                 .where(Alert.condition_id.is_(None), Alert.id > last_id)
                 .order_by(Alert.id)
@@ -241,35 +289,77 @@ async def _adopt_orphans(session, *, now: datetime, batch_size: int = 500) -> in
             try:
                 context = _context_dict(row.context_json)
                 environment = _context_str(context, "environment")
-                # A params emission stored its emit-time template on the row
-                # (opsalert#2): reuse it VERBATIM, so the orphan lands under
-                # the same identity the fire path would have produced.
-                # Normalizing the rendered message is only for old rows that
-                # never carried one — and for those, message == what the emit
-                # path normalized, so the identities still agree.
-                template = _context_str(context, TEMPLATE_CONTEXT_KEY) or normalize_message(
-                    row.message or ""
-                )
-                signature_key = condition_signature(
-                    row.category, row.source, environment, template
-                )
-                condition_id = await _lookup_or_create(
-                    session,
-                    signature_key=signature_key,
-                    values={
-                        "signature_key": signature_key,
-                        "category": row.category,
-                        "source": row.source,
-                        "environment": environment,
-                        "message_template": template[:500],
-                        "status": STATUS_NEW,
-                        "severity": row.severity,
-                        "latest_severity": row.severity,
-                        "status_changed_at": now,
-                        "created": now,
-                        "updated": now,
-                    },
-                )
+
+                # V2 rows adopt by their stored signature_key (no recompute)
+                if (row.fingerprint_version or 1) >= 2 and row.fingerprint_json:
+                    try:
+                        parts = json.loads(row.fingerprint_json)
+                    except (ValueError, TypeError):
+                        parts = []
+
+                    # Reconstruct the signature from stored parts
+                    payload = "\x1f".join(
+                        str(p).replace("\x1f", " ") for p in parts
+                    )
+                    import hashlib
+                    signature_key = hashlib.sha256(
+                        payload.encode("utf-8")
+                    ).hexdigest()
+
+                    kind = row.kind or (parts[1] if len(parts) > 1 else None)
+                    msg_template = kind if kind else (row.message or "")[:500]
+
+                    condition_id = await _lookup_or_create(
+                        session,
+                        signature_key=signature_key,
+                        values={
+                            "signature_key": signature_key,
+                            "category": row.category,
+                            "source": row.source,
+                            "environment": environment,
+                            "message_template": msg_template[:500],
+                            "status": STATUS_NEW,
+                            "severity": row.severity,
+                            "latest_severity": row.severity,
+                            "status_changed_at": now,
+                            "created": now,
+                            "updated": now,
+                            "kind": kind,
+                            "fingerprint_version": 2,
+                            "fingerprint_json": row.fingerprint_json,
+                        },
+                    )
+                else:
+                    # V1 rows: recompute identity as before
+                    # A params emission stored its emit-time template on the row
+                    # (opsalert#2): reuse it VERBATIM, so the orphan lands under
+                    # the same identity the fire path would have produced.
+                    # Normalizing the rendered message is only for old rows that
+                    # never carried one — and for those, message == what the emit
+                    # path normalized, so the identities still agree.
+                    template = _context_str(
+                        context, TEMPLATE_CONTEXT_KEY
+                    ) or normalize_message(row.message or "")
+                    signature_key = condition_signature(
+                        row.category, row.source, environment, template
+                    )
+                    condition_id = await _lookup_or_create(
+                        session,
+                        signature_key=signature_key,
+                        values={
+                            "signature_key": signature_key,
+                            "category": row.category,
+                            "source": row.source,
+                            "environment": environment,
+                            "message_template": template[:500],
+                            "status": STATUS_NEW,
+                            "severity": row.severity,
+                            "latest_severity": row.severity,
+                            "status_changed_at": now,
+                            "created": now,
+                            "updated": now,
+                        },
+                    )
             except Exception:
                 logger.exception("opsalert: could not adopt orphan occurrence %s", row.id)
                 continue
@@ -399,6 +489,7 @@ async def _fold_new_occurrences(session, *, horizon: datetime) -> tuple[int, int
         condition = await session.get(AlertCondition, row.cid)
         if condition is None:
             continue
+        prev_watermark = condition.stats_synced_through or 0
         _apply_counts(
             condition,
             count=row.n,
@@ -412,15 +503,53 @@ async def _fold_new_occurrences(session, *, horizon: datetime) -> tuple[int, int
         condition.median_interval_seconds = await _median_interval(
             session, condition_id=row.cid, horizon=horizon
         )
+        # Fold release strings from occurrence context — only new rows.
+        await _fold_release(
+            session, condition, horizon=horizon, prev_watermark=prev_watermark,
+        )
         # Only rows we actually counted move the watermark, and every one of
         # them is older than the lag horizon — so no in-flight row can be
         # stranded below it.
-        condition.stats_synced_through = max(condition.stats_synced_through or 0, row.max_id)
+        condition.stats_synced_through = max(prev_watermark, row.max_id)
         updated += 1
         counted += row.n
 
     await session.flush()
     return updated, counted
+
+
+async def _peak_15m_count(
+    session, *, condition_id: int, before: datetime
+) -> int:
+    """Max occurrence count in any 15-minute bucket in the 24 h before ``before``.
+
+    Buckets occurrences by 15-minute intervals and returns the highest count.
+    Used to baseline the burst detection rule at ack time.
+    """
+    window_start = before - timedelta(hours=24)
+    stamps = (
+        await session.execute(
+            select(Alert.created).where(
+                Alert.condition_id == condition_id,
+                Alert.created >= window_start,
+                Alert.created <= before,
+            )
+        )
+    ).scalars().all()
+
+    if not stamps:
+        return 0
+
+    # Bucket by 15-minute intervals (epoch seconds // 900).
+    buckets: dict[int, int] = {}
+    for stamp in stamps:
+        naive = _naive(stamp)
+        if naive is None:
+            continue
+        bucket = int(naive.timestamp()) // 900
+        buckets[bucket] = buckets.get(bucket, 0) + 1
+
+    return max(buckets.values()) if buckets else 0
 
 
 async def _latest_severity(session, *, condition_id: int, horizon: datetime) -> str | None:
@@ -449,13 +578,56 @@ async def _median_interval(session, *, condition_id: int, horizon: datetime) -> 
     if len(stamps) < 2:
         return None
 
-    ordered = sorted(_naive(s) for s in stamps)
+    ordered = sorted(_naive(s) for s in stamps if s is not None)
     gaps = sorted(
         (ordered[i + 1] - ordered[i]).total_seconds() for i in range(len(ordered) - 1)
     )
     middle = len(gaps) // 2
     median = gaps[middle] if len(gaps) % 2 else (gaps[middle - 1] + gaps[middle]) / 2
     return int(median)
+
+
+async def _fold_release(
+    session, condition: AlertCondition, *, horizon: datetime, prev_watermark: int
+) -> None:
+    """Fold ``_release`` from occurrence context into the condition.
+
+    Scans ONLY rows above ``prev_watermark`` (the stats_synced_through
+    value before this sweep's fold) and before ``horizon``, so repeated
+    sweeps never rescan the same rows. ``first_seen_release`` is set only
+    when NULL; ``last_seen_release`` = the last non-null in the window.
+    """
+    rows = (
+        await session.execute(
+            select(Alert.context_json)
+            .where(
+                Alert.condition_id == condition.id,
+                Alert.id > prev_watermark,
+                Alert.created < horizon,
+                Alert.context_json.is_not(None),
+            )
+            .order_by(Alert.id.asc())
+        )
+    ).all()
+
+    if not rows:
+        return
+
+    first_release: str | None = None
+    last_release: str | None = None
+    for row in rows:
+        ctx = _context_dict(row.context_json)
+        release = _context_str(ctx, "_release")
+        if release is None:
+            continue
+        if first_release is None:
+            first_release = release
+        last_release = release
+
+    if first_release is not None and condition.first_seen_release is None:
+        condition.first_seen_release = first_release
+    if last_release is not None:
+        condition.last_seen_release = last_release
 
 
 # =============================================================================
@@ -483,7 +655,7 @@ async def _escalate_acknowledged(session, *, now: datetime) -> int:
     """Bring an acknowledged condition back to ``new`` when it got worse.
 
     "Acknowledged" means a human has seen THIS episode and owns it — not
-    "silent forever". Three independent triggers, checked in this order
+    "silent forever". Four independent triggers, checked in this order
     (first match wins) for every acknowledged condition:
 
     1. Severity escalation — an occurrence since the ack outranks the worst
@@ -493,10 +665,15 @@ async def _escalate_acknowledged(session, *, now: datetime) -> int:
        :data:`ACK_BURST_MULTIPLE` times the condition's baseline rate at ack
        time (occurrence_count / age, floored at :data:`ACK_BASELINE_MIN_AGE`
        — see the module-level comment for why this is NOT the median).
-    3. Lease expiry — ``acknowledged_until`` has passed AND the condition has
+    3. Subject spread — >= 5 new distinct subjects beyond the ack baseline.
+    4. Lease expiry — ``acknowledged_until`` has passed AND the condition has
        fired since the ack (``last_seen > acknowledged_at``). A lease expiring
        on a condition that went quiet does nothing; the auto-close/auto-stale
        rules own a quiet condition.
+
+    A deploy (release change) is NOT a trigger (#23): an ack with no lease
+    and no issue is "owned until something changes", not "owned until the
+    next release". Regression detection lives on the resolved→reopened path.
 
     One aggregate query per acknowledged condition covers both occurrence
     rules — acknowledged conditions are few (dozens), so per-condition is
@@ -569,26 +746,33 @@ async def _escalate_acknowledged(session, *, now: datetime) -> int:
                 )
         if note is None:
             burst_count = row.burst_count or 0
-            if burst_count >= ACK_BURST_MIN:
-                ack_count = condition.acknowledged_occurrence_count or 0
-                # baseline_rate = acknowledged_occurrence_count / age at ack,
-                # age floored so a condition acked minutes after it first
-                # appeared doesn't get a wildly inflated baseline rate.
-                first_seen = _naive(condition.first_seen)
-                naive_ack_at = _naive(ack_at)
-                baseline_span = (
-                    max(naive_ack_at - first_seen, ACK_BASELINE_MIN_AGE)
-                    if first_seen is not None
-                    else ACK_BASELINE_MIN_AGE
+            # Burst threshold: max(10, 1.5 * acknowledged_peak_15m).
+            # NULL peak → treat as 0, so threshold = 10.
+            peak = condition.acknowledged_peak_15m or 0
+            burst_threshold = max(ACK_BURST_MIN, int(ACK_BURST_PEAK_MULTIPLE * peak))
+            if burst_count > burst_threshold:
+                window_minutes = int(ACK_BURST_WINDOW.total_seconds() // 60)
+                note = (
+                    f"reopened: burst {burst_count} in {window_minutes}m vs "
+                    f"threshold {burst_threshold} (peak {peak}/15m) "
+                    "after acknowledgement"
                 )
-                baseline_rate_per_15m = ack_count / (baseline_span.total_seconds() / 60 / 15)
-                if burst_count > ACK_BURST_MULTIPLE * baseline_rate_per_15m:
-                    window_minutes = int(ACK_BURST_WINDOW.total_seconds() // 60)
+        # Rule 3: subject spread — >= 5 new distinct subjects beyond ack baseline.
+        if note is None:
+            ack_subject_count = condition.acknowledged_subject_count
+            if ack_subject_count is not None:
+                current_subject_count = await distinct_subjects(
+                    session, condition.id,
+                    since=(now - timedelta(days=365 * 10)).date(),
+                )
+                new_subjects = current_subject_count - ack_subject_count
+                if new_subjects >= ACK_SUBJECT_SPREAD:
                     note = (
-                        f"reopened: burst {burst_count} in {window_minutes}m vs baseline "
-                        f"{baseline_rate_per_15m:.1f}/15m after acknowledgement"
+                        f"reopened: {new_subjects} new subjects since acknowledgement "
+                        f"(was {ack_subject_count}, now {current_subject_count})"
                     )
-            if note is None and condition.acknowledged_until is not None:
+        # Rule 4: lease expiry.
+        if note is None and condition.acknowledged_until is not None:
                 until = _naive(condition.acknowledged_until)
                 naive_now = _naive(now)
                 last_seen = _naive(condition.last_seen)
@@ -637,7 +821,9 @@ async def _reopen_recurrences(session, *, now: datetime) -> int:
         .all()
     )
     for condition in conditions:
-        reopen_condition(condition, now=now)
+        reopen_condition(
+            condition, now=now, fired_release=condition.last_seen_release,
+        )
     return len(conditions)
 
 
@@ -720,6 +906,79 @@ def _append_note(existing: str | None, line: str) -> str:
 
 
 # =============================================================================
+# Subject tracking
+# =============================================================================
+
+
+def subject_upsert_statement(dialect: str, values: dict[str, Any]):
+    """Build a dialect-appropriate INSERT IGNORE for alert_condition_subject.
+
+    MySQL uses ``INSERT IGNORE`` (``on_duplicate_key_update`` with a no-op
+    set so the row is silently skipped on conflict). SQLite uses
+    ``ON CONFLICT DO NOTHING``. Exposed as a builder so O2/ingest can use
+    it from a sync connection.
+    """
+    if dialect == "mysql":
+        from sqlalchemy.dialects.mysql import insert as mysql_insert
+
+        return (
+            mysql_insert(AlertConditionSubject)
+            .values(**values)
+            .on_duplicate_key_update(condition_id=values["condition_id"])
+        )
+
+    from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+
+    return (
+        sqlite_insert(AlertConditionSubject)
+        .values(**values)
+        .on_conflict_do_nothing()
+    )
+
+
+async def record_subjects(
+    session,
+    condition_id: int,
+    subjects: list[tuple[str, str]],
+    day,
+) -> None:
+    """INSERT IGNORE / upsert-do-nothing rows into alert_condition_subject.
+
+    ``subjects`` is a list of ``(kind, key)`` tuples.  ``day`` is the
+    calendar date the subjects were observed on.
+    """
+    from opsalert.store import _dialect_name
+
+    dialect = _dialect_name(session)
+    for kind, key in subjects:
+        values = {
+            "condition_id": condition_id,
+            "subject_kind": kind,
+            "subject_key": key,
+            "day": day,
+        }
+        stmt = subject_upsert_statement(dialect, values)
+        await session.execute(stmt)
+
+
+async def distinct_subjects(session, condition_id: int, *, since) -> int:
+    """Count distinct (subject_kind, subject_key) pairs for a condition since ``since``."""
+    result = await session.scalar(
+        select(func.count())
+        .select_from(
+            select(AlertConditionSubject.subject_kind, AlertConditionSubject.subject_key)
+            .where(
+                AlertConditionSubject.condition_id == condition_id,
+                AlertConditionSubject.day >= since,
+            )
+            .group_by(AlertConditionSubject.subject_kind, AlertConditionSubject.subject_key)
+            .subquery()
+        )
+    )
+    return result or 0
+
+
+# =============================================================================
 # Human transitions
 # =============================================================================
 
@@ -744,6 +1003,7 @@ async def set_status(
     notes: str | None = None,
     now: datetime | None = None,
     acknowledged_until: datetime | None = None,
+    release: str | None = None,
 ) -> AlertCondition:
     """Move a condition to ``status``, validating the transition and stamping it.
 
@@ -771,6 +1031,14 @@ async def set_status(
     if status != current and status not in ALLOWED_TRANSITIONS.get(current, frozenset()):
         raise ValueError(f"Cannot move an alert condition from {current!r} to {status!r}")
 
+    # Acknowledged = owned: require an issue URL unless this is a snooze
+    # (acknowledged_until with no issue). The message string is the contract.
+    if status == STATUS_ACKNOWLEDGED:
+        has_issue = issue_url or condition.issue_url
+        is_snooze = acknowledged_until is not None and not has_issue
+        if not has_issue and not is_snooze:
+            raise ValueError("ack_requires_issue")
+
     condition.status = status
     condition.status_changed_at = now
 
@@ -794,13 +1062,39 @@ async def set_status(
         occurrence_severity = _RANK_TO_SEVERITY.get(ack_max_rank or 0)
         condition.acknowledged_severity = worst_severity(condition.severity, occurrence_severity)
         condition.acknowledged_until = acknowledged_until
+
+        # Stamp the peak 15-minute occurrence count in the 24 h before ack.
+        condition.acknowledged_peak_15m = await _peak_15m_count(
+            session, condition_id=condition.id, before=now,
+        )
+        # Stamp the distinct subject count at ack time.
+        condition.acknowledged_subject_count = await distinct_subjects(
+            session, condition.id, since=(now - timedelta(days=365 * 10)).date(),
+        )
+        # Stamp the release at ack time.
+        condition.acknowledged_release = condition.last_seen_release
+        # A new episode is owned; the old fix is history.
+        condition.resolved_release = None
     elif status == STATUS_RESOLVED:
         condition.resolved_at = now
         condition.resolved_by = resolved_by or actor
+        # Stamp the release the fix shipped in — the regression signal.
+        if release is not None:
+            _release: str | None = release
+        else:
+            try:
+                _release = get_config().release
+            except RuntimeError:
+                _release = None
+        condition.resolved_release = str(_release)[:40] if _release else None
     elif status == STATUS_CLOSED:
         condition.closed_at = now
+        # closed follows resolved; the fix release is still the fix release.
 
     if status in (STATUS_RESOLVED, STATUS_CLOSED):
+        # Clear the ack-time release baseline: the episode is over, and
+        # a future ack will re-stamp from the new state.
+        condition.acknowledged_release = None
         # Retire the undelivered backlog (opsalert#1). Resolving is a human
         # saying "I have seen this and dealt with it" — emailing the history
         # afterwards has no audience, and leaving it unnotified either
@@ -824,6 +1118,11 @@ async def set_status(
         condition.acknowledged_severity = None
         condition.acknowledged_occurrence_count = None
         condition.acknowledged_until = None
+        condition.acknowledged_peak_15m = None
+        condition.acknowledged_subject_count = None
+        condition.acknowledged_release = None
+        # A manual new clears the fix release — the old fix is history.
+        condition.resolved_release = None
         condition.resolved_at = None
         condition.closed_at = None
 

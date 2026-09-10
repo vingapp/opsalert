@@ -6,7 +6,7 @@ sweep ran first, in the right order, or at all.
 """
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 import opsalert
 from opsalert.delivery import _CONDITION_LIST_CAP, deliver_alerts
@@ -72,7 +72,7 @@ class TestReopenOnTheDeliveryPath:
         await set_status(session, condition, "resolved", actor="chris")
         await set_disposition(session, condition, "collect")
         await session.execute(  # the first episode was already delivered
-            Alert.__table__.update().values(notified=True)
+            update(Alert).values(notified=True)
         )
         await session.commit()
 
@@ -110,7 +110,7 @@ class TestReopenOnTheDeliveryPath:
         await sync_condition_stats(session)
         condition = await _condition(session)
         await set_status(session, condition, "resolved", actor="chris")
-        await session.execute(Alert.__table__.update().values(notified=True))
+        await session.execute(update(Alert).values(notified=True))
         await session.commit()
         condition_id = condition.id
 
@@ -144,7 +144,7 @@ class TestAcknowledged:
         await session.commit()
         await sync_condition_stats(session)
         condition = await _condition(session)
-        await set_status(session, condition, "acknowledged", actor="chris")
+        await set_status(session, condition, "acknowledged", actor="chris", issue_url="https://github.com/test/1")
         await session.commit()
 
         stats = await deliver_alerts(session)
@@ -164,7 +164,7 @@ class TestAcknowledged:
         await session.commit()
         await sync_condition_stats(session)
         condition = await _condition(session)
-        await set_status(session, condition, "acknowledged", actor="chris")
+        await set_status(session, condition, "acknowledged", actor="chris", issue_url="https://github.com/test/1")
         await session.commit()
 
         await _fire_old(session, severity="error", category="cat", message="boom")
@@ -323,10 +323,23 @@ class TestCorruptConditionIsolation:
     """F3 — one unusable row must not take the sweep down with it."""
 
     async def test_a_broken_condition_is_skipped_and_the_rest_deliver(
-        self, session, session_factory
+        self, session, session_factory, tmp_path
     ):
+        from sqlalchemy import create_engine
+        from sqlalchemy import text as sa_text
+
+        from opsalert.ingest import flush
+        from opsalert.model import OpsAlertBase as _Base
+
+        # Set up a file-backed ingest DB so the self-reporting alert from
+        # delivery.py (which goes through the ingest queue) can be verified.
+        ingest_path = tmp_path / "delivery_self_report.db"
+        ingest_url = f"sqlite:///{ingest_path}"
+        ingest_engine = create_engine(ingest_url)
+        _Base.metadata.create_all(ingest_engine)
+
         transport = _TrackingTransport()
-        _configure(session_factory, transport)
+        _configure(session_factory, transport, ingest_url=ingest_url)
 
         await fire_alert(session, severity="error", category="good", message="deliver me")
         broken_alert = await fire_alert(
@@ -350,11 +363,18 @@ class TestCorruptConditionIsolation:
             await session.execute(select(Alert).where(Alert.notified.is_(False)))
         ).scalars().all()
         assert "unreadable" in [a.message for a in still_waiting]
-        # ...and the skip itself became an alert of its own, rather than a log
-        # line nobody reads (F3).
-        assert "Unusable alert condition row skipped during delivery" in [
-            a.message for a in still_waiting
-        ]
+        # ...and the skip itself became an alert of its own, written by the
+        # ingest thread to its own DB (not the async session).
+        flush(timeout=5.0)
+        with ingest_engine.connect() as conn:
+            self_report = conn.execute(
+                sa_text("SELECT message FROM opsalert WHERE category='alert_delivery'")
+            ).fetchone()
+        assert self_report is not None, (
+            "the self-reporting alert was not written to the ingest DB"
+        )
+        assert "Unusable alert condition row skipped during delivery" in self_report[0]
+        ingest_engine.dispose()
 
 
 class TestResolveWithUndeliveredBacklog:
@@ -408,7 +428,7 @@ class TestResolveWithUndeliveredBacklog:
         condition = await _condition(session)
         await set_status(session, condition, "resolved", actor="chris")
         # Recreate the pre-fix state: a backlog resolve did not retire.
-        await session.execute(Alert.__table__.update().values(notified=False))
+        await session.execute(update(Alert).values(notified=False))
         await session.commit()
 
         stats = await deliver_alerts(session)
@@ -444,7 +464,7 @@ class TestResolveWithUndeliveredBacklog:
         await sync_condition_stats(session)
         condition = await _condition(session)
 
-        await set_status(session, condition, "acknowledged", actor="chris")
+        await set_status(session, condition, "acknowledged", actor="chris", issue_url="https://github.com/test/1")
         await set_status(session, condition, "closed", actor="chris")
         await session.commit()
 
@@ -472,7 +492,7 @@ class TestCategoryThrottle:
     async def _emailed_ago(self, session, minutes: int) -> None:
         """Backdate every notified row so the throttle reads it as `minutes` old."""
         await session.execute(
-            Alert.__table__.update()
+            update(Alert)
             .where(Alert.notified.is_(True))
             .values(created=datetime.now(UTC) - timedelta(minutes=minutes))
         )
@@ -584,7 +604,7 @@ class TestCategoryThrottle:
         )
         noisy.notified = True
         await session.execute(
-            Alert.__table__.update().values(
+            update(Alert).values(
                 notified=True, created=datetime.now(UTC) - timedelta(minutes=5)
             )
         )
@@ -644,7 +664,7 @@ class TestDigestSeverity:
         await _fire_old(session, severity="critical", category="cat", message="db down")
         await session.commit()
         await sync_condition_stats(session)
-        await set_status(session, await _condition(session), "acknowledged", actor="chris")
+        await set_status(session, await _condition(session), "acknowledged", actor="chris", issue_url="https://github.com/test/1")
         await session.commit()
 
         stats = await deliver_alerts(session)
@@ -675,3 +695,51 @@ class TestDigestSeverity:
         assert message.severity == "warn"
         assert "worst" not in message.subject
         assert "alert(s)" in message.subject
+
+
+class TestReopenNoteReliesOnDispatchStampingAlertRelease:
+    """Defensive test: delivery._reopen_recurring reads Alert.release to build
+    the reopen note. In production _dispatch.py stamps Alert.release from
+    context._release (line ~203). If Alert.release is missing, the note says
+    'unknown release'. This test exercises the delivery path with Alert.release
+    populated (as _dispatch does) and asserts the note names the right release.
+    The consumer is delivery._reopen_recurring; the fix is there, not here."""
+
+    async def test_reopen_note_relies_on_dispatch_stamping_alert_release(
+        self, session, session_factory,
+    ):
+        transport = _TrackingTransport()
+        _configure(session_factory, transport)
+
+        # Fire and resolve.
+        await _fire_old(session, severity="error", category="cat", message="boom")
+        await session.commit()
+        await sync_condition_stats(session)
+        condition = await _condition(session)
+        await set_status(
+            session, condition, "resolved", actor="chris", release="v1",
+            issue_url="https://github.com/test/1",
+        )
+        await session.execute(
+            update(Alert).values(notified=True)
+        )
+        await session.commit()
+
+        # Recurrence: simulate _dispatch stamping Alert.release = "v2".
+        recurrence = Alert(
+            severity="error", category="cat", message="boom",
+            condition_id=condition.id,
+            release="v2",
+            created=datetime.now(UTC),
+        )
+        session.add(recurrence)
+        await session.commit()
+
+        await deliver_alerts(session)
+        await session.commit()
+
+        await session.refresh(condition)
+        assert condition.status == "new"
+        assert "fired again under v2 after fix shipped in v1" in (condition.notes or ""), (
+            "delivery._reopen_recurring must read Alert.release for the reopen note"
+        )
