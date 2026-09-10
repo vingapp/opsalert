@@ -8,8 +8,8 @@ Three jobs live here:
    auto-close of a resolved condition that has gone quiet, auto-stale of a
    condition nobody ever triaged and that stopped happening, and escalation
    of an acknowledged condition that got worse (opsalert#7): a new all-time
-   severity, a burst far above its ack-time rate, or a lease that expired
-   while it kept firing.
+   severity, a burst far above its ack-time rate, subject spread, or a lease
+   that expired while it kept firing.
 3. :func:`set_status` / :func:`set_disposition` are the human edits, with
    transition validation and audit stamps.
 
@@ -26,6 +26,7 @@ host app's alembic migrations, not by this package's ``ensure_tables``
 (create_all only, never alters an existing table) — the host MUST apply that
 migration before running this version, since ``select(AlertCondition)``
 selects every mapped column and a missing column fails the query outright.
+``resolved_release`` (VARCHAR(40), nullable) is in the same family.
 """
 import json
 import logging
@@ -34,6 +35,7 @@ from typing import Any, overload
 
 from sqlalchemy import case, func, select, update
 
+from opsalert._config import get_config
 from opsalert.model import Alert, AlertCondition, AlertConditionSubject
 from opsalert.signature import condition_signature, normalize_message
 from opsalert.store import TEMPLATE_CONTEXT_KEY, _lookup_or_create
@@ -156,15 +158,24 @@ def _naive(value: datetime | None) -> datetime | None:
     return value.replace(tzinfo=None)
 
 
-def reopen_condition(condition: AlertCondition, *, now: datetime | None = None) -> None:
+def reopen_condition(
+    condition: AlertCondition,
+    *,
+    now: datetime | None = None,
+    fired_release: str | None = None,
+) -> None:
     """Bring a resolved/closed condition back to ``new``.
 
     Shared by the delivery path (which reopens INLINE, before it decides
     whether to email — see P4) and by the lifecycle sweep's belt-and-braces
     scan. Clearing the acknowledgement stamps matters: the person who
     acknowledged the old episode has not seen this one.
+
+    Appends a reopen note that distinguishes a regression (the condition had
+    a ``resolved_release``, meaning a fix shipped) from a plain recurrence.
     """
     now = now or datetime.now(UTC)
+    leaving_status = condition.status
     condition.status = STATUS_NEW
     condition.reopened_count = (condition.reopened_count or 0) + 1
     condition.status_changed_at = now
@@ -177,9 +188,24 @@ def reopen_condition(condition: AlertCondition, *, now: datetime | None = None) 
     condition.acknowledged_until = None
     condition.acknowledged_peak_15m = None
     condition.acknowledged_subject_count = None
-    # acknowledged_release is KEPT through reopen: it is "release at last ack"
-    # and remains a valid baseline for is_regression in the attention feed.
-    # Cleared only on new→ack re-stamp, resolve, and close.
+    # acknowledged_release is audit only — no rule reads it. Cleared on
+    # ack re-stamp, resolve, and close; kept through reopen.
+    # resolved_release is KEPT through reopen: a reopen after a fix shipped
+    # is a regression in the attention feed.
+
+    issue = condition.issue_url or condition.resolution_url or "no linked issue"
+    if condition.resolved_release:
+        note = (
+            f"reopened: regression — fired again under "
+            f"{fired_release or 'unknown release'} after fix shipped in "
+            f"{condition.resolved_release} ({issue})"
+        )
+    else:
+        note = (
+            f"reopened: fired again after being {leaving_status} ({issue})"
+        )
+    condition.notes = _append_note(condition.notes, note)
+
     logger.warning(
         "opsalert: condition %s (%s) reopened — it fired again after being closed out",
         condition.id,
@@ -629,7 +655,7 @@ async def _escalate_acknowledged(session, *, now: datetime) -> int:
     """Bring an acknowledged condition back to ``new`` when it got worse.
 
     "Acknowledged" means a human has seen THIS episode and owns it — not
-    "silent forever". Three independent triggers, checked in this order
+    "silent forever". Four independent triggers, checked in this order
     (first match wins) for every acknowledged condition:
 
     1. Severity escalation — an occurrence since the ack outranks the worst
@@ -639,10 +665,15 @@ async def _escalate_acknowledged(session, *, now: datetime) -> int:
        :data:`ACK_BURST_MULTIPLE` times the condition's baseline rate at ack
        time (occurrence_count / age, floored at :data:`ACK_BASELINE_MIN_AGE`
        — see the module-level comment for why this is NOT the median).
-    3. Lease expiry — ``acknowledged_until`` has passed AND the condition has
+    3. Subject spread — >= 5 new distinct subjects beyond the ack baseline.
+    4. Lease expiry — ``acknowledged_until`` has passed AND the condition has
        fired since the ack (``last_seen > acknowledged_at``). A lease expiring
        on a condition that went quiet does nothing; the auto-close/auto-stale
        rules own a quiet condition.
+
+    A deploy (release change) is NOT a trigger (#23): an ack with no lease
+    and no issue is "owned until something changes", not "owned until the
+    next release". Regression detection lives on the resolved→reopened path.
 
     One aggregate query per acknowledged condition covers both occurrence
     rules — acknowledged conditions are few (dozens), so per-condition is
@@ -740,20 +771,7 @@ async def _escalate_acknowledged(session, *, now: datetime) -> int:
                         f"reopened: {new_subjects} new subjects since acknowledgement "
                         f"(was {ack_subject_count}, now {current_subject_count})"
                     )
-        # Rule 4: regression — last_seen_release != acknowledged_release.
-        if note is None:
-            ack_release = condition.acknowledged_release
-            current_release = condition.last_seen_release
-            if (
-                ack_release is not None
-                and current_release is not None
-                and current_release != ack_release
-            ):
-                note = (
-                    f"reopened: regression — release changed "
-                    f"{ack_release} → {current_release} after acknowledgement"
-                )
-        # Rule 5: lease expiry.
+        # Rule 4: lease expiry.
         if note is None and condition.acknowledged_until is not None:
                 until = _naive(condition.acknowledged_until)
                 naive_now = _naive(now)
@@ -803,7 +821,9 @@ async def _reopen_recurrences(session, *, now: datetime) -> int:
         .all()
     )
     for condition in conditions:
-        reopen_condition(condition, now=now)
+        reopen_condition(
+            condition, now=now, fired_release=condition.last_seen_release,
+        )
     return len(conditions)
 
 
@@ -983,6 +1003,7 @@ async def set_status(
     notes: str | None = None,
     now: datetime | None = None,
     acknowledged_until: datetime | None = None,
+    release: str | None = None,
 ) -> AlertCondition:
     """Move a condition to ``status``, validating the transition and stamping it.
 
@@ -1052,11 +1073,23 @@ async def set_status(
         )
         # Stamp the release at ack time.
         condition.acknowledged_release = condition.last_seen_release
+        # A new episode is owned; the old fix is history.
+        condition.resolved_release = None
     elif status == STATUS_RESOLVED:
         condition.resolved_at = now
         condition.resolved_by = resolved_by or actor
+        # Stamp the release the fix shipped in — the regression signal.
+        if release is not None:
+            _release: str | None = release
+        else:
+            try:
+                _release = get_config().release
+            except RuntimeError:
+                _release = None
+        condition.resolved_release = str(_release)[:40] if _release else None
     elif status == STATUS_CLOSED:
         condition.closed_at = now
+        # closed follows resolved; the fix release is still the fix release.
 
     if status in (STATUS_RESOLVED, STATUS_CLOSED):
         # Clear the ack-time release baseline: the episode is over, and
@@ -1088,6 +1121,8 @@ async def set_status(
         condition.acknowledged_peak_15m = None
         condition.acknowledged_subject_count = None
         condition.acknowledged_release = None
+        # A manual new clears the fix release — the old fix is history.
+        condition.resolved_release = None
         condition.resolved_at = None
         condition.closed_at = None
 

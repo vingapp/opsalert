@@ -907,21 +907,64 @@ class TestAttentionDisposition:
         assert len(third["conditions"]) == 1
         assert third["conditions"][0]["template"] == "loud"
 
-    async def test_attention_is_regression_computed(self, session, session_factory):
-        """is_regression = last_seen_release != acknowledged_release, both non-null."""
+    async def test_attention_is_regression_means_reopened_after_fix(
+        self, session, session_factory,
+    ):
+        """is_regression = resolved_release is not None and status == new.
+
+        A new condition with resolved_release set (reopened after a fix shipped)
+        is a regression. A new condition with acknowledged_release but no
+        resolved_release is NOT a regression (the old definition; must be False).
+        """
         opsalert.configure(session_factory=session_factory)
+
+        # Condition 1: resolved_release set → is_regression True.
         await _fire_old(session, message="regressed")
         await session.commit()
         await sync_condition_stats(session)
-        condition = await _condition_for(session, "regressed")
-        condition.last_seen_release = "v2.0"
-        condition.acknowledged_release = "v1.0"
+        c1 = await _condition_for(session, "regressed")
+        c1.resolved_release = "v2"
+        await session.flush()
         await session.commit()
 
         result = await query_attention(session)
         match = [c for c in result["conditions"] if c["template"] == "regressed"]
         assert len(match) == 1
         assert match[0]["is_regression"] is True
+
+        # Condition 2: acknowledged_release set, resolved_release NULL → NOT regression.
+        await _fire_old(session, message="not-regressed")
+        await session.commit()
+        await sync_condition_stats(session)
+        c2 = await _condition_for(session, "not-regressed")
+        c2.acknowledged_release = "v1"
+        c2.last_seen_release = "v2"
+        c2.resolved_release = None
+        await session.flush()
+        await session.commit()
+
+        result2 = await query_attention(session)
+        m2 = [c for c in result2["conditions"] if c["template"] == "not-regressed"]
+        assert len(m2) == 1
+        assert m2[0]["is_regression"] is False
+
+    async def test_condition_dict_carries_release_stamps(self, session, session_factory):
+        """query_conditions items carry acknowledged_release and resolved_release."""
+        opsalert.configure(session_factory=session_factory)
+        await _fire_old(session, message="stamped")
+        await session.commit()
+        await sync_condition_stats(session)
+        condition = await _condition_for(session, "stamped")
+        condition.acknowledged_release = "v1"
+        condition.resolved_release = "v2"
+        await session.flush()
+        await session.commit()
+
+        items, _, _ = await query_conditions(session)
+        match = [i for i in items if i["template"] == "stamped"]
+        assert len(match) == 1
+        assert match[0]["acknowledged_release"] == "v1"
+        assert match[0]["resolved_release"] == "v2"
 
     async def test_attention_has_release_and_users_fields(self, session, session_factory):
         """Attention conditions include users_24h, first_seen_release,
