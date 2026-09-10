@@ -220,8 +220,12 @@ class AlertCondition(OpsAlertBase):
     # Number of distinct subjects at ack time — the baseline for the subject
     # reopen rule: >= 5 new subjects beyond this count reopens the condition.
     acknowledged_subject_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    # Release string at ack time — the baseline for the regression reopen rule.
+    # Release string at ack time — audit only (no rule reads it since #23).
     acknowledged_release: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    # Release current when the condition was resolved — the release the fix
+    # shipped in. Kept through reopen (a reopen after this is a regression),
+    # cleared on ack / manual new.
+    resolved_release: Mapped[str | None] = mapped_column(String(40), nullable=True)
     status_changed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
@@ -230,7 +234,7 @@ class AlertCondition(OpsAlertBase):
 
     # Release strings — earliest and latest ``_release`` context key seen on
     # occurrences. Folded by ``sync_condition_stats`` the same way first/last
-    # seen timestamps are. Used by the regression reopen rule (O3).
+    # seen timestamps are. Informational; no lifecycle rule reads them directly.
     first_seen_release: Mapped[str | None] = mapped_column(String(40), nullable=True)
     last_seen_release: Mapped[str | None] = mapped_column(String(40), nullable=True)
 

@@ -59,6 +59,7 @@ CREATE TABLE alert_condition (
     notes TEXT,
     acknowledged_at DATETIME, acknowledged_by VARCHAR(100), status_changed_at DATETIME,
     resolved_at DATETIME, closed_at DATETIME,
+    resolved_release VARCHAR(40),
     first_seen DATETIME, last_seen DATETIME,
     occurrence_count INTEGER NOT NULL DEFAULT 0,
     reopened_count INTEGER NOT NULL DEFAULT 0,
@@ -432,6 +433,13 @@ production.
 | `acknowledged` | Somebody has it. Leaves the attention line and immediate email; digest at most. Occurrences keep accruing. |
 | `resolved` | Believed fixed. Auto-closes after `max(6h, 10 × median interval)` of silence. |
 | `closed` | Done. A recurrence reopens it. |
+
+An acknowledged condition re-surfaces only on severity escalation, burst, subject
+spread, or lease expiry — a deploy is not a reason; an ack with no lease and no
+issue is "owned until something changes". A resolved or closed condition that fires
+again is the regression signal: the reopen note names the linked issue and the
+release the fix shipped in (``set_status(resolved)`` stamps ``resolved_release``
+from the ``release`` kwarg or the configured release).
 
 | `disposition` | Meaning |
 |---------------|---------|

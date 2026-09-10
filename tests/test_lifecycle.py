@@ -1120,59 +1120,314 @@ class TestSubjectReopen:
         assert "subjects" in (condition.notes or "")
 
 
-class TestRegressionReopen:
-    """Reopens when last_seen_release differs from acknowledged_release."""
+class TestRule4Deleted:
+    """#23 — an acknowledged condition does NOT reopen on a deploy."""
 
-    async def _synced_condition(self, session, *, severity="warn", now=None):
-        now = now or datetime.now(UTC)
-        await _fire_backdated(session, severity=severity, now=now)
+    async def test_reported_23_acked_across_deploy_stays_acked(self, session):
+        """The reported case: a warn, immediate condition fires under release A,
+        gets acked with an issue and no lease, fires under release B an hour later
+        at the same severity; stats sync; apply_lifecycle_rules.
+        Must stay acknowledged — a deploy is not an escalation trigger."""
+        now = datetime.now(UTC)
+        await _fire_backdated(
+            session, severity="warn", now=now,
+        )
         await session.commit()
         await sync_condition_stats(session, now=now)
         await session.commit()
-        return await _the_condition(session)
-
-    async def test_regression_reopens(self, session):
-        """A condition whose last_seen_release is newer than
-        acknowledged_release is a regression and must reopen."""
-        now = datetime.now(UTC)
-        condition = await self._synced_condition(session, now=now)
-        condition.last_seen_release = "v1.0"
+        condition = await _the_condition(session)
+        condition.last_seen_release = "803942d"
         await session.flush()
+
+        await set_disposition(session, condition, "immediate")
         await set_status(
-            session, condition, "acknowledged", actor="chris", now=now,
-            issue_url="https://github.com/test/1",
+            session, condition, "acknowledged", actor="ops", now=now,
+            issue_url="https://github.com/vingapp/vingapi/issues/603",
+            notes="telemetry, not a fault",
         )
         await session.commit()
-        assert condition.acknowledged_release == "v1.0"
+        assert condition.acknowledged_release == "803942d"
 
-        # A newer release appears.
-        condition.last_seen_release = "v2.0"
+        # One occurrence fires under a new release an hour later.
+        later = now + timedelta(hours=1)
+        await _fire_backdated(session, severity="warn", now=later, age=timedelta(minutes=10))
+        await session.commit()
+        await sync_condition_stats(session, now=later)
+        await session.commit()
+
+        await session.refresh(condition)
+        condition.last_seen_release = "9a1b2c3"
         await session.flush()
         await session.commit()
 
-        result = await apply_lifecycle_rules(session, now=now + timedelta(hours=1))
+        result = await apply_lifecycle_rules(session, now=later + timedelta(minutes=1))
         await session.commit()
-        assert result["escalated"] == 1
-        assert condition.status == "new"
-        assert "regression" in (condition.notes or "").lower()
 
-    async def test_null_release_skipped(self, session):
-        """NULL on either side skips the regression rule."""
-        now = datetime.now(UTC)
-        condition = await self._synced_condition(session, now=now)
-        await set_status(
-            session, condition, "acknowledged", actor="chris", now=now,
-            issue_url="https://github.com/test/1",
-        )
-        await session.commit()
-        # Both NULL — should not reopen.
-        assert condition.acknowledged_release is None
-        assert condition.last_seen_release is None
-
-        result = await apply_lifecycle_rules(session, now=now + timedelta(hours=1))
-        await session.commit()
+        await session.refresh(condition)
         assert result["escalated"] == 0
         assert condition.status == "acknowledged"
+        assert condition.reopened_count == 0
+        assert "regression" not in (condition.notes or "").lower()
+        assert condition.last_seen_release == "9a1b2c3"
+        assert condition.acknowledged_release == "803942d"
+
+    async def test_acked_no_issue_snooze_survives_deploy(self, session):
+        """Same shape but acked as a snooze (acknowledged_until a day out, no
+        issue). Stays acknowledged after one occurrence under a new release."""
+        now = datetime.now(UTC)
+        await _fire_backdated(session, severity="warn", now=now)
+        await session.commit()
+        await sync_condition_stats(session, now=now)
+        await session.commit()
+        condition = await _the_condition(session)
+        condition.last_seen_release = "803942d"
+        await session.flush()
+
+        await set_status(
+            session, condition, "acknowledged", actor="ops", now=now,
+            acknowledged_until=now + timedelta(days=1),
+        )
+        await session.commit()
+        assert condition.acknowledged_release == "803942d"
+
+        later = now + timedelta(hours=1)
+        await _fire_backdated(session, severity="warn", now=later, age=timedelta(minutes=10))
+        await session.commit()
+        await sync_condition_stats(session, now=later)
+        await session.commit()
+
+        await session.refresh(condition)
+        condition.last_seen_release = "9a1b2c3"
+        await session.flush()
+        await session.commit()
+
+        result = await apply_lifecycle_rules(session, now=later + timedelta(minutes=1))
+        await session.commit()
+        await session.refresh(condition)
+        assert result["escalated"] == 0
+        assert condition.status == "acknowledged"
+
+
+class TestResolvedReleaseStamp:
+    """#23 — resolved_release stamps and lifecycle."""
+
+    async def test_resolved_fires_under_fix_release_reopens_with_regression_note(
+        self, session, session_factory,
+    ):
+        """Fire under v1, sync, resolve with release=v2, fire under v2 again,
+        deliver_alerts. Assert the regression note names the issue and releases."""
+        import opsalert
+        from opsalert.delivery import deliver_alerts
+
+        transport_sent: list = []
+
+        class _T(opsalert.Transport):
+            def send(self, message, *, to, from_addr, from_name):
+                transport_sent.append(message)
+                return True
+
+        opsalert.configure(
+            session_factory=session_factory,
+            transport=_T(),
+            delivery_to_email="ops@test.com",
+            delivery_from_email="alert@test.com",
+            delivery_throttle_minutes=0,
+        )
+
+        now = datetime.now(UTC)
+        await _fire_backdated(session, severity="error", now=now)
+        await session.commit()
+        await sync_condition_stats(session, now=now)
+        await session.commit()
+        condition = await _the_condition(session)
+
+        issue = "https://github.com/vingapp/vingapi/issues/603"
+        await set_status(
+            session, condition, "resolved", actor="chris", now=now,
+            issue_url=issue, release="v2",
+        )
+        await session.commit()
+        assert condition.resolved_release == "v2"
+
+        # It fires again under v2.
+        a2 = Alert(
+            severity="error", category="cat", message="boom",
+            release="v2",
+            created=now + timedelta(minutes=5),
+        )
+        session.add(a2)
+        await session.flush()
+        # Attach to the same condition.
+        a2.condition_id = condition.id
+        await session.commit()
+
+        await deliver_alerts(session)
+        await session.commit()
+
+        await session.refresh(condition)
+        assert condition.status == "new"
+        assert condition.reopened_count == 1
+        assert condition.resolved_release == "v2"
+        expected_note = (
+            f"reopened: regression — fired again under v2 after fix shipped in v2 ({issue})"
+        )
+        assert expected_note in (condition.notes or "")
+
+    async def test_resolved_release_defaults_to_configured_release(self, session):
+        """set_status(resolved) with no release kwarg uses get_config().release."""
+        import opsalert
+
+        now = datetime.now(UTC)
+        await _fire_backdated(session, severity="error", now=now)
+        await session.commit()
+        await sync_condition_stats(session, now=now)
+        await session.commit()
+        condition = await _the_condition(session)
+
+        try:
+            opsalert.configure(release="cfg-sha")
+            await set_status(session, condition, "resolved", actor="chris", now=now)
+            await session.commit()
+            assert condition.resolved_release == "cfg-sha"
+        finally:
+            opsalert.reset_config()
+
+    async def test_reopen_belt_note_uses_last_seen_release(self, session):
+        """The lifecycle belt path passes last_seen_release as fired_release."""
+        from opsalert.lifecycle import apply_lifecycle_rules
+
+        now = datetime.now(UTC)
+        await _fire_backdated(session, severity="error", now=now)
+        await session.commit()
+        await sync_condition_stats(session, now=now)
+        await session.commit()
+        condition = await _the_condition(session)
+        await set_status(
+            session, condition, "resolved", actor="chris", now=now, release="v1",
+            issue_url="https://github.com/test/1",
+        )
+        await session.commit()
+
+        # Fire again — but mark it notified=True so delivery skips it.
+        import json
+        later = now + timedelta(hours=1)
+        a2 = Alert(
+            severity="error", category="cat", message="boom",
+            release="v2",
+            context_json=json.dumps({"_release": "v2"}),
+            created=later,
+            notified=True,
+        )
+        session.add(a2)
+        await session.flush()
+        a2.condition_id = condition.id
+        await session.commit()
+
+        await sync_condition_stats(session, now=later + timedelta(minutes=2))
+        await session.commit()
+
+        await session.refresh(condition)
+        assert condition.last_seen_release == "v2"
+
+        await apply_lifecycle_rules(session, now=later + timedelta(minutes=3))
+        await session.commit()
+        await session.refresh(condition)
+        assert condition.status == "new"
+        assert condition.reopened_count == 1
+        assert "fired again under v2 after fix shipped in v1" in (condition.notes or "")
+
+    async def test_reopen_without_resolved_release_note_has_no_regression_word(self, session):
+        """A pre-v2 row (resolved_release NULL) that fires again gets a note
+        without the word 'regression'."""
+        now = datetime.now(UTC)
+        await _fire_backdated(session, severity="error", now=now)
+        await session.commit()
+        await sync_condition_stats(session, now=now)
+        await session.commit()
+        condition = await _the_condition(session)
+        condition.issue_url = "https://github.com/test/1"
+        await set_status(session, condition, "resolved", actor="chris", now=now)
+        await session.commit()
+        # Simulate pre-v2: clear resolved_release.
+        condition.resolved_release = None
+        await session.flush()
+        await session.commit()
+
+        # Fire again via lifecycle belt.
+        import json
+        later = now + timedelta(hours=1)
+        a2 = Alert(
+            severity="error", category="cat", message="boom",
+            context_json=json.dumps({"_release": "v3"}),
+            created=later, notified=True,
+        )
+        session.add(a2)
+        await session.flush()
+        a2.condition_id = condition.id
+        await session.commit()
+        await sync_condition_stats(session, now=later + timedelta(minutes=2))
+        await session.commit()
+
+        from opsalert.lifecycle import apply_lifecycle_rules
+        await apply_lifecycle_rules(session, now=later + timedelta(minutes=3))
+        await session.commit()
+        await session.refresh(condition)
+        assert condition.status == "new"
+        notes = condition.notes or ""
+        assert "regression" not in notes
+        assert "reopened: fired again after being resolved (https://github.com/test/1)" in notes
+
+    async def test_ack_clears_resolved_release(self, session):
+        """resolved (release=v2) → reopen → ack: resolved_release is None."""
+        from opsalert.lifecycle import apply_lifecycle_rules
+        from opsalert.query import query_conditions
+
+        now = datetime.now(UTC)
+        await _fire_backdated(session, severity="error", now=now)
+        await session.commit()
+        await sync_condition_stats(session, now=now)
+        await session.commit()
+        condition = await _the_condition(session)
+        await set_status(
+            session, condition, "resolved", actor="chris", now=now, release="v2",
+        )
+        await session.commit()
+        assert condition.resolved_release == "v2"
+
+        # Reopen via belt.
+        import json
+        later = now + timedelta(hours=1)
+        a2 = Alert(
+            severity="error", category="cat", message="boom",
+            context_json=json.dumps({"_release": "v3"}),
+            created=later, notified=True,
+        )
+        session.add(a2)
+        await session.flush()
+        a2.condition_id = condition.id
+        await session.commit()
+        await sync_condition_stats(session, now=later + timedelta(minutes=2))
+        await session.commit()
+        await apply_lifecycle_rules(session, now=later + timedelta(minutes=3))
+        await session.commit()
+        await session.refresh(condition)
+        assert condition.status == "new"
+        assert condition.resolved_release == "v2"
+
+        # Ack clears it.
+        await set_status(
+            session, condition, "acknowledged", actor="chris",
+            now=later + timedelta(minutes=5),
+            issue_url="https://github.com/test/1",
+        )
+        await session.commit()
+        assert condition.resolved_release is None
+
+        # query_conditions dict also shows it cleared.
+        items, _, _ = await query_conditions(session)
+        match = [i for i in items if i["id"] == condition.id]
+        assert len(match) == 1
+        assert match[0]["resolved_release"] is None
 
 
 class TestRecordAndDistinctSubjects:
@@ -1436,74 +1691,3 @@ class TestFoldReleaseNoRescan:
         assert condition.last_seen_release == "v2.0"
 
 
-class TestRegressionFullFlow:
-    """Full-flow test: ack at release A, occurrences at release B,
-    lifecycle reopens, attention shows is_regression=True."""
-
-    async def test_ack_at_a_occurrences_at_b_attention_is_regression(
-        self, session, session_factory
-    ):
-        import opsalert
-        from opsalert.query import query_attention
-
-        opsalert.configure(session_factory=session_factory)
-        now = datetime.now(UTC)
-
-        # Fire and sync — condition gets last_seen_release = "v1.0".
-        a = await fire_alert(
-            session, severity="error", category="cat", message="regressor",
-            context={"_release": "v1.0"},
-        )
-        a.created = now - timedelta(minutes=20)
-        await session.flush()
-        await session.commit()
-        await sync_condition_stats(session, now=now)
-        await session.commit()
-
-        condition = (
-            await session.execute(
-                select(AlertCondition).where(
-                    AlertCondition.message_template == "regressor"
-                )
-            )
-        ).scalar_one()
-        assert condition.last_seen_release == "v1.0"
-
-        # Ack — stamps acknowledged_release = "v1.0".
-        await set_status(
-            session, condition, "acknowledged", actor="chris", now=now,
-            issue_url="https://github.com/test/1",
-        )
-        await session.commit()
-        assert condition.acknowledged_release == "v1.0"
-
-        # New occurrence at release B.
-        later = now + timedelta(hours=1)
-        b = await fire_alert(
-            session, severity="error", category="cat", message="regressor",
-            context={"_release": "v2.0"},
-        )
-        b.created = later - timedelta(minutes=5)
-        await session.flush()
-        await session.commit()
-        await sync_condition_stats(session, now=later)
-        await session.commit()
-
-        await session.refresh(condition)
-        assert condition.last_seen_release == "v2.0"
-
-        # Lifecycle detects the regression and reopens.
-        result = await apply_lifecycle_rules(session, now=later + timedelta(minutes=1))
-        await session.commit()
-        assert result["escalated"] == 1
-        await session.refresh(condition)
-        assert condition.status == "new"
-        assert "regression" in (condition.notes or "").lower()
-        # acknowledged_release is KEPT through reopen.
-        assert condition.acknowledged_release == "v1.0"
-
-        # Attention shows is_regression=True.
-        attention = await query_attention(session)
-        match = [c for c in attention["conditions"] if c["template"] == "regressor"]
-        assert len(match) == 1
-        assert match[0]["is_regression"] is True
