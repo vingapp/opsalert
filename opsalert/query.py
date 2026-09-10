@@ -497,6 +497,9 @@ def _condition_dict(condition: AlertCondition) -> dict:
         "fingerprint_version": condition.fingerprint_version,
         "message_example": condition.message_example,
         "resolution_url": condition.resolution_url,
+        # Release stamps
+        "acknowledged_release": condition.acknowledged_release,
+        "resolved_release": condition.resolved_release,
     }
 
 
@@ -904,9 +907,8 @@ async def query_attention(
             "first_seen_release": condition.first_seen_release,
             "last_seen_release": condition.last_seen_release,
             "is_regression": (
-                condition.last_seen_release is not None
-                and condition.acknowledged_release is not None
-                and condition.last_seen_release != condition.acknowledged_release
+                condition.resolved_release is not None
+                and condition.status == "new"
             ),
         }
         for condition, count_since in included

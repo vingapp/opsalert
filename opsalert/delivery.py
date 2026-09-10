@@ -348,7 +348,26 @@ async def _reopen_recurring(session) -> set[int]:
         condition = await session.get(AlertCondition, condition_id)
         if condition is None:
             continue
-        reopen_condition(condition, now=now)
+        # The fired_release is from the newest unnotified occurrence created
+        # after the resolve/close stamp — the same predicate as the id query
+        # above. Delivery runs BEFORE the stats fold, so last_seen_release
+        # is stale; query directly.
+        fired_release = await session.scalar(
+            select(Alert.release)
+            .where(
+                Alert.condition_id == condition_id,
+                Alert.notified.is_(False),
+                Alert.created
+                > func.coalesce(
+                    condition.resolved_at,
+                    condition.closed_at,
+                    condition.status_changed_at,
+                ),
+            )
+            .order_by(Alert.id.desc())
+            .limit(1)
+        )
+        reopen_condition(condition, now=now, fired_release=fired_release)
         reopened.add(condition_id)
 
     # The reopen is a state change that must outlive whatever happens to the
