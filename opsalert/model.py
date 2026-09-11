@@ -8,7 +8,17 @@ resolved, the issue URL, how often it fires, whether it came back.
 """
 from datetime import UTC, datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text
+from sqlalchemy import (
+    Boolean,
+    Date,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    SmallInteger,
+    String,
+    Text,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -73,6 +83,31 @@ class Alert(OpsAlertBase):
         ForeignKey("alert_condition.id", ondelete="SET NULL"), nullable=True
     )
 
+    # Ingest event id — a 32-char hex UUID. UNIQUE so replay safety can
+    # detect duplicates after an ambiguous commit.
+    event_id: Mapped[str | None] = mapped_column(String(32), unique=True, nullable=True)
+
+    # How many sibling events this row "stands for" beyond itself. Written
+    # by the ingest sampling logic; aggregations in O2/O3 read it.
+    sampled_out: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
+
+    # --- Identity v2 columns ---
+    kind: Mapped[str | None] = mapped_column(String(120), nullable=True, index=True)
+    emit_site: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    exception_class: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    trace_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    span_id: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
+    user_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    org_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    release: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    fingerprint_version: Mapped[int] = mapped_column(
+        SmallInteger, default=1, server_default="1", nullable=False
+    )
+    fingerprint_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    event_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     # Email delivery tracking
     notified: Mapped[bool] = mapped_column(
         Boolean, default=False, server_default="0", nullable=False
@@ -106,6 +141,12 @@ class AlertCondition(OpsAlertBase):
     occurrence pruning: they are maintained by the stats sweeper up to the
     ``stats_synced_through`` watermark, and cleanup may only delete
     occurrences at or below that watermark (P3).
+
+    ``acknowledged`` does not mean silenced forever: ``acknowledged_severity``,
+    ``acknowledged_occurrence_count`` and ``acknowledged_until`` let the
+    lifecycle sweep notice the episode got worse (severity escalation, a
+    burst far above the ack-time rate) or that a time-boxed lease expired
+    while the condition kept firing, and reopen it (opsalert#7).
     """
 
     __tablename__ = "alert_condition"
@@ -126,6 +167,16 @@ class AlertCondition(OpsAlertBase):
     source: Mapped[str | None] = mapped_column(String(100), nullable=True)
     environment: Mapped[str | None] = mapped_column(String(50), nullable=True)
     message_template: Mapped[str] = mapped_column(String(500), nullable=False)
+
+    # Identity v2
+    kind: Mapped[str | None] = mapped_column(String(120), nullable=True, index=True)
+    fingerprint_version: Mapped[int] = mapped_column(
+        SmallInteger, default=1, server_default="1", nullable=False
+    )
+    fingerprint_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    emit_site: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    message_example: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    resolution_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
 
     # Lifecycle
     status: Mapped[str] = mapped_column(
@@ -149,11 +200,51 @@ class AlertCondition(OpsAlertBase):
         DateTime(timezone=True), nullable=True
     )
     acknowledged_by: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    # Baseline captured AT ack time, so the escalation rule (opsalert#7) has
+    # something to compare the condition's current state against. NULL on
+    # rows acknowledged before this column existed, and on any row where the
+    # ack predates the baseline being known — lifecycle.py treats NULL as
+    # "unknowable", not "zero", except where documented at the call site.
+    acknowledged_severity: Mapped[str | None] = mapped_column(String(10), nullable=True)
+    acknowledged_occurrence_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Optional lease: past this time, a still-firing acknowledged condition
+    # reopens even without escalation or burst — the operator said "I've got
+    # this for a while", not "forever".
+    acknowledged_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # Peak 15-min window occurrence count in the 24 h before the ack — the
+    # baseline for burst detection (opsalert#7 O3). NULL on rows acked before
+    # this column existed; lifecycle treats NULL as 0 so any burst >= 10 trips.
+    acknowledged_peak_15m: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Number of distinct subjects at ack time — the baseline for the subject
+    # reopen rule: >= 5 new subjects beyond this count reopens the condition.
+    acknowledged_subject_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Release string at ack time — audit only (no rule reads it since #23).
+    acknowledged_release: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    # Release current when the condition was resolved — the release the fix
+    # shipped in. Kept through reopen (a reopen after this is a regression),
+    # cleared on ack / manual new.
+    resolved_release: Mapped[str | None] = mapped_column(String(40), nullable=True)
     status_changed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Release strings — earliest and latest ``_release`` context key seen on
+    # occurrences. Folded by ``sync_condition_stats`` the same way first/last
+    # seen timestamps are. Informational; no lifecycle rule reads them directly.
+    first_seen_release: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    last_seen_release: Mapped[str | None] = mapped_column(String(40), nullable=True)
+
+    # Ingest drop and sampling accounting on the condition
+    dropped_count: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
+    sampled_out: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
 
     # Derived statistics — outlive the occurrences they were computed from
     first_seen: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -186,3 +277,37 @@ class AlertCondition(OpsAlertBase):
             f"<AlertCondition(id={self.id}, category={self.category!r}, "
             f"status={self.status!r}, count={self.occurrence_count})>"
         )
+
+
+class AlertConditionSubject(OpsAlertBase):
+    """Distinct subjects observed for a condition on a given day.
+
+    Populated by ingest (O2); lifecycle reads ``distinct_subjects()`` to
+    decide whether enough new subjects have appeared since the ack to
+    justify reopening the condition.
+    """
+
+    __tablename__ = "alert_condition_subject"
+
+    condition_id: Mapped[int] = mapped_column(
+        ForeignKey("alert_condition.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    subject_kind: Mapped[str] = mapped_column(String(10), primary_key=True)
+    subject_key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    day: Mapped[datetime] = mapped_column(Date, primary_key=True)
+
+
+class AlertDeliveryState(OpsAlertBase):
+    """Singleton row holding cross-sweep delivery state.
+
+    ``id`` is always 1 — there is exactly one delivery loop per deployment,
+    and a table beats module-level state because it survives process restarts.
+    """
+
+    __tablename__ = "alert_delivery_state"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    last_digest_sent_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )

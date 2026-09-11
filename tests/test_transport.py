@@ -19,7 +19,7 @@ def _make_message(**overrides) -> AlertMessage:
         "alert_count": 1,
     }
     defaults.update(overrides)
-    return AlertMessage(**defaults)
+    return AlertMessage(**defaults)  # type: ignore[arg-type]
 
 
 class TestCallableTransport:
@@ -94,8 +94,8 @@ class _FakeResponse:
     def __enter__(self) -> "_FakeResponse":
         return self
 
-    def __exit__(self, exc_type, exc, tb) -> bool:
-        return False
+    def __exit__(self, exc_type, exc, tb) -> None:
+        pass
 
 
 class _FakeUrlopen:

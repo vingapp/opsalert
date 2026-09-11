@@ -1,0 +1,6 @@
+[extend]
+useDefault = true
+
+[allowlist]
+  description = "Compiled bytecode (never committed, absent in CI)"
+  paths = ['''__pycache__/''']

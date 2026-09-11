@@ -37,3 +37,7 @@ class AlertMessage:
     # None when the host app did not configure one -- subjects and bodies then
     # render exactly as they did before environment labelling existed.
     environment: str | None = None
+    # Alertmanager-compatible webhook payload. When present,
+    # ``WebhookTransport.send`` POSTs this dict as-is instead of the
+    # legacy ad-hoc shape. Email renderers may also read from it.
+    payload: dict | None = None

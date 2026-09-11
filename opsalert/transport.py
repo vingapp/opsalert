@@ -72,13 +72,16 @@ class WebhookTransport(Transport):
         self._headers = headers or {}
 
     def send(self, message: AlertMessage, *, to: str, from_addr: str, from_name: str) -> bool:
-        payload = {
-            "severity": message.severity,
-            "category": message.category,
-            "subject": message.subject,
-            "text": message.text_body,
-            "alert_count": message.alert_count,
-        }
+        if message.payload is not None:
+            payload = message.payload
+        else:
+            payload = {
+                "severity": message.severity,
+                "category": message.category,
+                "subject": message.subject,
+                "text": message.text_body,
+                "alert_count": message.alert_count,
+            }
         data = json.dumps(payload).encode("utf-8")
         req = urllib.request.Request(
             self._url,
