@@ -330,6 +330,52 @@ class TestAdoptionIdentity:
         orphan = (await session.execute(select(Alert))).scalar_one()
         assert orphan.condition_id == condition.id
 
+    async def test_lifecycle_adoption_relies_on_signature_from_parts(self, session):
+        """Adoption hashes a v2 orphan's stored parts with ``signature_from_parts``.
+
+        A v2 occurrence whose ``fingerprint_json`` carries identity parts and
+        whose ``condition_id`` is NULL must be adopted onto the condition the
+        fire path created for the same parts. Lifecycle adoption breaks if the
+        helper's hashing changes; fix the consumer, never the helper.
+        """
+        import json
+
+        from opsalert.signature import event_fingerprint_parts, signature_from_parts
+
+        identity = {"route": "/x", "scope": "org", "entity": "42"}
+        fired = await fire_alert(
+            session, severity="error", category="cat", message="boom",
+            kind="x.y", identity=identity,
+        )
+        parts = event_fingerprint_parts(
+            kind="x.y", environment=None, exception_chain=[], origin_frame="",
+            identity=identity,
+        )
+        assert parts[-2:] == ["identity", json.dumps(identity, sort_keys=True,
+                                                    separators=(",", ":"))]
+        orphan = Alert(
+            severity="error",
+            category="cat",
+            message="boom",
+            kind="x.y",
+            fingerprint_version=2,
+            fingerprint_json=json.dumps(parts),
+            created=datetime.now(UTC) - LONG_AGO,
+        )
+        session.add(orphan)
+        await session.commit()
+        assert orphan.condition_id is None
+
+        stats = await sync_condition_stats(session)
+        await session.commit()
+
+        assert stats["adopted"] == 1
+        condition = (await session.execute(select(AlertCondition))).scalar_one()
+        assert condition.signature_key == signature_from_parts(parts)
+        assert condition.id == fired.condition_id
+        await session.refresh(orphan)
+        assert orphan.condition_id == condition.id
+
     async def test_old_style_orphan_falls_back_to_the_normalized_message(
         self, session
     ):

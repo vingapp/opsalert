@@ -14,8 +14,10 @@ Emit sites that need more (an opaque url slug, say) migrate to ``params``,
 where identity is exact rather than guessed.
 """
 import hashlib
+import json
 import logging
 import re
+from collections.abc import Mapping, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +101,46 @@ def validate_kind(kind: str) -> bool:
     return bool(_KIND_RE.match(kind))
 
 
+IDENTITY_SENTINEL = "identity"
+
+
+def identity_parts(identity: Mapping[str, str] | None) -> list[str]:
+    """Return the fingerprint parts for a caller's exact ``identity``.
+
+    ``None`` and an empty mapping return ``[]``, so a caller that passes no
+    identity keeps a parts list (and therefore a signature) byte-identical to
+    one that never knew the kwarg existed.
+
+    Otherwise the result is ``[IDENTITY_SENTINEL, <canonical JSON>]``. The JSON
+    is ``sort_keys=True`` with no whitespace, so key order is irrelevant and
+    two mappings produce the same text exactly when they are equal. Collision
+    argument: the JSON text of a non-empty dict always starts with ``{``, so
+    it can never equal the sentinel, an exception-class label, a ``kind``, or
+    a ``module:function`` origin frame; and JSON string escaping means no key
+    or value can shift the boundary between entries (``{"a":"b=c"}`` and
+    ``{"a=b":"c"}`` stay distinct).
+    """
+    if not identity:
+        return []
+    return [
+        IDENTITY_SENTINEL,
+        json.dumps(dict(identity), sort_keys=True, separators=(",", ":")),
+    ]
+
+
+def signature_from_parts(parts: Sequence[object]) -> str:
+    """Hash an already-built fingerprint parts list into a 64-char hex key.
+
+    This is the ONE place a v2 signature is hashed. ``event_signature`` calls
+    it on freshly built parts; every path that only has a stored
+    ``fingerprint_json`` (the drop record, lifecycle adoption) calls it on the
+    stored parts, so a stored occurrence can never land on a different
+    condition than the one it was fired into.
+    """
+    payload = "\x1f".join(str(part).replace("\x1f", " ") for part in parts)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def event_signature(
     *,
     kind: str,
@@ -106,19 +148,27 @@ def event_signature(
     exception_chain: list[str],
     origin_frame: str,
     template: str | None = None,
+    identity: Mapping[str, str] | None = None,
 ) -> str:
     """V2 identity key.
 
     ``template`` is included ONLY for legacy fallback (``kind`` ending in
     ``.legacy``) so that two messages that v1 kept separate remain separate.
+    ``identity`` is the caller's exact extra identity (see
+    :func:`identity_parts`); ``None`` and ``{}`` change nothing.
 
     Returns the same 64-char hex key format as ``condition_signature``.
     """
-    parts = ["2", kind, environment or "", *exception_chain, origin_frame]
-    if template is not None:
-        parts.append((template or "")[:TEMPLATE_MAX_CHARS])
-    payload = "\x1f".join(part.replace("\x1f", " ") for part in parts)
-    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return signature_from_parts(
+        event_fingerprint_parts(
+            kind=kind,
+            environment=environment,
+            exception_chain=exception_chain,
+            origin_frame=origin_frame,
+            template=template,
+            identity=identity,
+        )
+    )
 
 
 def event_fingerprint_parts(
@@ -128,11 +178,13 @@ def event_fingerprint_parts(
     exception_chain: list[str],
     origin_frame: str,
     template: str | None = None,
+    identity: Mapping[str, str] | None = None,
 ) -> list[str]:
     """Return the parts list for ``fingerprint_json``."""
     parts = ["2", kind, environment or "", *exception_chain, origin_frame]
     if template is not None:
         parts.append((template or "")[:TEMPLATE_MAX_CHARS])
+    parts.extend(identity_parts(identity))
     return parts
 
 

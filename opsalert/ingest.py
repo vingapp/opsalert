@@ -872,8 +872,30 @@ def _resolve_condition_sync_from_drop(conn: Any, dr: DropRecord) -> int | None:
     from opsalert.signature import condition_signature
     from opsalert.store import upsert_statement
 
-    # Use the v2 signature from the event that was dropped, if available
-    if dr.kind:
+    # The dropped event's stored fingerprint parts ARE its identity (chain,
+    # origin frame, identity kwarg): hash them, never recompute. Recomputing
+    # from the header lost the chain and frame and forked a second condition.
+    fp: str | None = None
+    if dr.fingerprint_json:
+        from opsalert.signature import signature_from_parts
+
+        try:
+            parts = json.loads(dr.fingerprint_json)
+            if not isinstance(parts, list):
+                raise TypeError(f"expected a list, got {type(parts).__name__}")
+            fp = signature_from_parts(parts)
+        except (ValueError, TypeError):
+            logger.warning(
+                "opsalert.ingest: unreadable fingerprint_json on drop record "
+                "for category=%s; recomputing the signature",
+                dr.category,
+                exc_info=True,
+            )
+
+    if fp is None and dr.kind:
+        # Fallback only (no usable stored parts): the header lacks the chain
+        # and origin frame, so this can fork a condition; it is still better
+        # than losing the drop count.
         from opsalert.signature import event_signature
 
         template_for_fp = dr.template if dr.kind.endswith(".legacy") else None
@@ -884,7 +906,7 @@ def _resolve_condition_sync_from_drop(conn: Any, dr: DropRecord) -> int | None:
             origin_frame="",
             template=template_for_fp,
         )
-    else:
+    elif fp is None:
         fp = condition_signature(dr.category, dr.source, dr.environment, dr.template)
 
     # SELECT first

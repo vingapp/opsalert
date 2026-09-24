@@ -204,9 +204,9 @@ opsalert.configure(get_setting=resolve_setting, ...)
 Three severity levels, identical signatures:
 
 ```python
-opsalert.warn(category, *, message, source=None, context=None, params=None)
-opsalert.error(category, *, message, source=None, context=None, params=None)
-opsalert.critical(category, *, message, source=None, context=None, params=None)
+opsalert.warn(category, *, message, source=None, context=None, params=None, identity=None)
+opsalert.error(category, *, message, source=None, context=None, params=None, identity=None)
+opsalert.critical(category, *, message, source=None, context=None, params=None, identity=None)
 ```
 
 | Parameter | Type | Description |
@@ -216,6 +216,7 @@ opsalert.critical(category, *, message, source=None, context=None, params=None)
 | `source` | `str \| None` | Where the alert originated (e.g., `"email"`, `"api"`, `"celery"`). |
 | `context` | `dict \| None` | Arbitrary structured data. Serialized as JSON. |
 | `params` | `dict \| None` | Values for a `str.format`-style `message` template. With `params`, the raw template is the condition's identity and the stored message is the rendered text. A missing key renders as its own placeholder — it never raises. |
+| `identity` | `Mapping[str, str] \| None` | Extra exact identity for the condition: same `kind`, different `identity` → different condition. Key order is irrelevant. `None` and `{}` are the same as omitting it. Use it for per-route / per-entity conditions instead of putting the value in the message template. |
 
 ### Severity Levels
 
