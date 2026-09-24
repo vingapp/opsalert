@@ -11,6 +11,7 @@ message=, source=, context=)``.
 import json
 import logging
 import uuid
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any
 
@@ -29,6 +30,8 @@ logger = logging.getLogger(__name__)
 
 # Track invalid kinds that have been warned about: (emit_site, kind) -> True
 _invalid_kind_warned: set[tuple[str, str]] = set()
+# Track non-str identities that have been warned about: (emit_site, keys) -> True
+_invalid_identity_warned: set[tuple[str, str]] = set()
 
 
 def _extract_subjects(context: dict[str, Any] | None) -> list[tuple[str, str]]:
@@ -51,6 +54,58 @@ def _extract_subjects(context: dict[str, Any] | None) -> list[tuple[str, str]]:
     return []
 
 
+def _validated_identity(
+    identity: Any, *, testing: bool, stacklevel: int
+) -> Mapping[str, str] | None:
+    """Return ``identity`` with only ``str`` keys and values.
+
+    Mirrors ``kind`` validation. In testing mode a non-str key or value (or
+    a non-mapping) raises ``TypeError`` — the test-suite signal. In
+    production nothing raises: non-str keys/values are coerced with ``str()``
+    (an unusable non-mapping is dropped) and a warning is logged once per
+    ``(emit_site, keys)``.
+    """
+    try:
+        if identity is None or (isinstance(identity, Mapping) and not identity):
+            return None
+        valid = isinstance(identity, Mapping) and all(
+            isinstance(k, str) and isinstance(v, str) for k, v in identity.items()
+        )
+    except Exception:
+        valid = False
+    if valid:
+        return identity
+    if testing:
+        raise TypeError(
+            f"identity must be a Mapping[str, str]; got {identity!r}"
+        )
+    coerced: dict[str, str] | None
+    try:
+        if not isinstance(identity, Mapping):
+            raise TypeError("not a mapping")
+        coerced = {str(k): str(v) for k, v in identity.items()}
+        keys = repr(sorted(coerced))
+    except Exception:
+        coerced = None
+        keys = type(identity).__name__
+    emit_site_key = ""
+    try:
+        from opsalert._enrichment import compute_emit_site
+        emit_site_key = compute_emit_site(stacklevel=stacklevel)
+    except Exception:
+        pass
+    warn_key = (emit_site_key, keys)
+    if warn_key not in _invalid_identity_warned:
+        _invalid_identity_warned.add(warn_key)
+        logger.warning(
+            "opsalert: non-str identity %s from %s; %s",
+            keys,
+            emit_site_key,
+            "coerced with str()" if coerced is not None else "dropped",
+        )
+    return coerced
+
+
 def _fire_sync(
     severity: str,
     category: str,
@@ -61,6 +116,7 @@ def _fire_sync(
     kind: str | None = None,
     exc: BaseException | None = None,
     stacklevel: int = 1,
+    identity: Mapping[str, str] | None = None,
 ) -> None:
     """Fire an alert from any context (sync or async).
 
@@ -99,6 +155,11 @@ def _fire_sync(
                 emit_site_key,
             )
         kind = None  # Fall through to legacy
+
+    # --- Identity validation (raises only in testing mode) ---
+    identity = _validated_identity(
+        identity, testing=cfg.testing, stacklevel=stacklevel
+    )
 
     if cfg.testing:
         return
@@ -139,6 +200,7 @@ def _fire_sync(
         exception_chain=exception_chain,
         origin_frame=origin_frame,
         template=template_for_fp,
+        identity=identity,
     )
     fp_parts = event_fingerprint_parts(
         kind=actual_kind,
@@ -146,6 +208,7 @@ def _fire_sync(
         exception_chain=exception_chain,
         origin_frame=origin_frame,
         template=template_for_fp,
+        identity=identity,
     )
     fingerprint_json = json.dumps(fp_parts)
 
@@ -217,13 +280,14 @@ def warn(
     source: str | None = None,
     context: dict[str, Any] | None = None,
     params: dict[str, Any] | None = None,
+    identity: Mapping[str, str] | None = None,
 ) -> None:
     """Fire a WARN alert. For unexpected but non-breaking issues."""
     from opsalert.types import AlertSeverity
 
     _fire_sync(
         AlertSeverity.WARN, category, message, source, context, params,
-        kind=kind, exc=exc, stacklevel=stacklevel,
+        kind=kind, exc=exc, stacklevel=stacklevel, identity=identity,
     )
 
 
@@ -237,13 +301,14 @@ def error(
     source: str | None = None,
     context: dict[str, Any] | None = None,
     params: dict[str, Any] | None = None,
+    identity: Mapping[str, str] | None = None,
 ) -> None:
     """Fire an ERROR alert. For something that failed that shouldn't have."""
     from opsalert.types import AlertSeverity
 
     _fire_sync(
         AlertSeverity.ERROR, category, message, source, context, params,
-        kind=kind, exc=exc, stacklevel=stacklevel,
+        kind=kind, exc=exc, stacklevel=stacklevel, identity=identity,
     )
 
 
@@ -257,11 +322,12 @@ def critical(
     source: str | None = None,
     context: dict[str, Any] | None = None,
     params: dict[str, Any] | None = None,
+    identity: Mapping[str, str] | None = None,
 ) -> None:
     """Fire a CRITICAL alert. For infrastructure-level problems."""
     from opsalert.types import AlertSeverity
 
     _fire_sync(
         AlertSeverity.CRITICAL, category, message, source, context, params,
-        kind=kind, exc=exc, stacklevel=stacklevel,
+        kind=kind, exc=exc, stacklevel=stacklevel, identity=identity,
     )

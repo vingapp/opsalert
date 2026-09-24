@@ -37,7 +37,11 @@ from sqlalchemy import case, func, select, update
 
 from opsalert._config import get_config
 from opsalert.model import Alert, AlertCondition, AlertConditionSubject
-from opsalert.signature import condition_signature, normalize_message
+from opsalert.signature import (
+    condition_signature,
+    normalize_message,
+    signature_from_parts,
+)
 from opsalert.store import TEMPLATE_CONTEXT_KEY, _lookup_or_create
 from opsalert.types import AlertSeverity
 
@@ -298,13 +302,7 @@ async def _adopt_orphans(session, *, now: datetime, batch_size: int = 500) -> in
                         parts = []
 
                     # Reconstruct the signature from stored parts
-                    payload = "\x1f".join(
-                        str(p).replace("\x1f", " ") for p in parts
-                    )
-                    import hashlib
-                    signature_key = hashlib.sha256(
-                        payload.encode("utf-8")
-                    ).hexdigest()
+                    signature_key = signature_from_parts(parts)
 
                     kind = row.kind or (parts[1] if len(parts) > 1 else None)
                     msg_template = kind if kind else (row.message or "")[:500]
