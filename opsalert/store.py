@@ -13,6 +13,7 @@ already happened — losing it to bookkeeping would be the worst possible trade.
 """
 import json
 import logging
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -370,6 +371,7 @@ async def fire_alert(
     params: dict[str, Any] | None = None,
     kind: str | None = None,
     exc: BaseException | None = None,
+    identity: Mapping[str, str] | None = None,
 ) -> Alert:
     """Create an alert record. Every call creates one row.
 
@@ -380,7 +382,9 @@ async def fire_alert(
     as given and identity falls back to :func:`normalize_message`.
 
     ``kind`` and ``exc`` enable v2 identity through the same functions as
-    the dispatch path.
+    the dispatch path. ``identity`` is the caller's extra exact identity
+    (same ``kind``, different ``identity`` -> different condition); ``None``
+    and ``{}`` are the same as omitting it.
     """
     stamped = stamp_environment(context)
     rendered = render_template(message, params)
@@ -418,6 +422,7 @@ async def fire_alert(
         exception_chain=exception_chain,
         origin_frame=origin_frame,
         template=template_for_fp,
+        identity=identity,
     )
     sig_key = event_signature(
         kind=actual_kind,
@@ -425,6 +430,7 @@ async def fire_alert(
         exception_chain=exception_chain,
         origin_frame=origin_frame,
         template=template_for_fp,
+        identity=identity,
     )
 
     condition_id = await _resolve_v2_condition(
