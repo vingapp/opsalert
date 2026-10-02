@@ -18,6 +18,7 @@ dev = [
     "pytest-asyncio>=0.24",
     "pytest-cov>=6.0.0",
     "aiosqlite>=0.20",
+    "greenlet>=3.0",
     "ruff>=0.6",
     "mypy>=1.10",
     "pre-commit>=3.8",
