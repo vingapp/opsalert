@@ -69,6 +69,15 @@ The repo README has the contract and quick-start — read it for the API surface
 
 CI (validate.yml) is the gate; run `ruff check` and `pytest` locally.
 
+- CI installs under `ci-constraints.txt` (the third-party pins of vingapi's `requirements.lock`),
+  so the gate tests the versions prod runs. Local runs that should match the gate use
+  `pip install -c ci-constraints.txt -e .[dev]`.
+- After a vingapi `requirements.lock` change, regenerate it with
+  `python scripts/sync_ci_constraints.py <vingapi requirements.lock> --sha <vingapi sha>`
+  (`--check` reports drift without writing).
+- `validate-latest` (`.github/workflows/validate-latest.yml`) runs unconstrained every Monday
+  06:00Z and reports a failure by issue; it never gates a merge.
+
 **`~/ving-gates/work/opsalert`** is vingapi's pinned editable install of this
 library. It is never landed from — it exists only so vingapi's `.venv` has a
 current copy. A release of this library is a vingapi `requirements.lock` pin bump.

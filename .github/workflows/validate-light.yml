@@ -27,7 +27,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install tools
-        run: pip install -e .[dev] ruff mypy
+        run: pip install -c ci-constraints.txt -e .[dev] ruff mypy
       - name: Lint (ruff)
         run: ruff check opsalert/ tests/
       - name: Type check (mypy)
