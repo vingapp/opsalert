@@ -26,9 +26,9 @@ DEFAULT_OUT = REPO_ROOT / "ci-constraints.txt"
 
 _PIN = re.compile(r"^[A-Za-z0-9_.\-]+==\S+$")
 
-REGENERATE = (
-    "python scripts/sync_ci_constraints.py <vingapi requirements.lock> --sha <vingapi commit sha>"
-)
+# Kept free of gitleaks generic-api-key keywords: this line sits directly above
+# the first pin, and "<vingapi ... sha>" followed by a pin reads as a key.
+REGENERATE = "python scripts/sync_ci_constraints.py <lock path> --sha <commit>"
 
 
 def third_party_pins(lock_text: str) -> list[str]:
