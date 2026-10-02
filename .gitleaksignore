@@ -1,5 +1,0 @@
-# False positive in a superseded commit on worker/34-ci-constraints (opsalert#34): the
-# generated header line "--sha <vingapi commit sha>" plus the first pin read as
-# generic-api-key. The header was reworded in the next commit; this pins only that
-# commit, file, rule and line, so it suppresses nothing else.
-1e8f17592617caf1e788242571d839a21eec8387:ci-constraints.txt:generic-api-key:3
