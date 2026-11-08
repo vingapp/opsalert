@@ -36,7 +36,7 @@ ensure() {
     tmpdir=$(mktemp -d)
     trap 'rm -rf "$tmpdir"' EXIT
 
-    curl -fsSL -o "${tmpdir}/gitleaks.tar.gz" "$GITLEAKS_URL"
+    curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 -o "${tmpdir}/gitleaks.tar.gz" "$GITLEAKS_URL"
 
     # Verify sha256 checksum against the release's checksums.txt value.
     if ! echo "${GITLEAKS_SHA256}  ${tmpdir}/gitleaks.tar.gz" | sha256sum -c --strict - >/dev/null 2>&1; then
