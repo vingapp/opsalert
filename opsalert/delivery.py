@@ -378,25 +378,12 @@ async def _reopen_recurring(session) -> set[int]:
 
 async def _load_condition_batches(session) -> tuple[list[_ConditionBatch], int]:
     """Group unnotified occurrences by condition. Returns (batches, skipped)."""
-    # The newest unnotified occurrence's text, per condition. The template is
-    # the identity, but a subject line reading "Row <n> failed" is worse than
-    # one reading "Row 42 failed" — the reader wants the instance.
-    latest_message = (
-        select(Alert.message)
-        .where(Alert.condition_id == AlertCondition.id, Alert.notified.is_(False))
-        .order_by(Alert.created.desc(), Alert.id.desc())
-        .limit(1)
-        .correlate(AlertCondition)
-        .scalar_subquery()
-    )
-
     rows = (
         await session.execute(
             select(
                 AlertCondition.id.label("condition_id"),
                 AlertCondition.category,
                 AlertCondition.message_template,
-                latest_message.label("latest_message"),
                 AlertCondition.severity,
                 AlertCondition.status,
                 AlertCondition.disposition,
@@ -427,6 +414,23 @@ async def _load_condition_batches(session) -> tuple[list[_ConditionBatch], int]:
         )
     ).all()
 
+    # The newest unnotified occurrence's text, per condition. The template is
+    # the identity, but a subject line reading "Row <n> failed" is worse than
+    # one reading "Row 42 failed" — the reader wants the instance.
+    #
+    # Fetched by primary key from each group's max_id, ONE query for all
+    # conditions. Never a correlated subquery in the aggregate above: MySQL
+    # runs that per joined row, not per condition, so a condition with N
+    # unsent of M total rows cost N*M reads and stopped prod delivery
+    # (opsalert#47: 2,155 x 43,370 rows, every run past the 300 s limit).
+    max_ids = [row.max_id for row in rows if row.max_id is not None]
+    latest_by_id: dict[int, str] = {}
+    if max_ids:
+        latest_rows = await session.execute(
+            select(Alert.id, Alert.message).where(Alert.id.in_(max_ids))
+        )
+        latest_by_id = {int(alert_id): message for alert_id, message in latest_rows.all()}
+
     batches: list[_ConditionBatch] = []
     skipped = 0
     for row in rows:
@@ -442,7 +446,9 @@ async def _load_condition_batches(session) -> tuple[list[_ConditionBatch], int]:
                     condition_id=row.condition_id,
                     category=str(row.category),
                     template=str(row.message_template or ""),
-                    latest_message=str(row.latest_message or row.message_template or ""),
+                    latest_message=str(
+                        latest_by_id.get(int(row.max_id)) or row.message_template or ""
+                    ),
                     severity=str(row.severity or ""),
                     status=str(row.status),
                     disposition=row.disposition,
